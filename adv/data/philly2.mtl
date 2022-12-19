@@ -1,0 +1,22 @@
+# Blender 3.3.1 MTL File: 'philly.blend'
+# www.blender.org
+
+newmtl asphalt
+Ns 810.000000
+Ka 1.000000 1.000000 1.000000
+Kd 0.014042 0.014042 0.014042
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.450000
+d 1.000000
+illum 2
+
+newmtl buildingfacade
+Ns 250.000000
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ke 0.078072 0.078072 0.078072
+Ni 1.450000
+d 1.000000
+illum 2
+map_Kd /home/meriel/Downloads/buildingfacade1.jpg

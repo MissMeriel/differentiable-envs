@@ -1,0 +1,12 @@
+newmtl absperrhut
+map_Kd absperrhut.png
+map_bump absperrhut_normal.png
+map_Ks absperrhut_metallic.png
+
+# Test colors
+
+Ka 1.000 1.000 1.000  # white
+Kd 1.000 1.000 1.000  # white
+Ks 0.000 0.000 0.000  # black
+Ns 10.0
+
