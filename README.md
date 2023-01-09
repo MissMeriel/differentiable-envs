@@ -7,3 +7,6 @@ Use the `requirements.txt` to finish your conda environment.
 
 If you've previously installed, run `conda activate pytorch3d`.
 
+## Rendering
+
+See [renderer getting started](https://pytorch3d.org/docs/renderer_getting_started)

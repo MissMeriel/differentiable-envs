@@ -58,8 +58,8 @@ device = torch.device("cuda:0")
 print(f"Using {device}")
 # Use an ico_sphere mesh and load a mesh from an .obj e.g. model.obj
 # cow_mesh = ico_sphere(level=3)
-# cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/cow_mesh/cow.obj"], device=device)
-cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/trafficcone_mesh/absperrhut2.obj"], device=device)
+cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/cow_mesh/cow.obj"], device=device)
+# cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/trafficcone_mesh/absperrhut.obj"], device=device)
 print(cow_mesh.textures._maps_list)
 verts = cow_mesh.verts_packed()
 verts = -2 * verts;
@@ -85,8 +85,9 @@ mesh = test_mesh
 #R, T = look_at_view_transform(2.7, 0, 180) R=R, T=T, K=K
 # cameras = FoVPerspectiveCameras(device=device, K=K)
 # R, T = look_at_view_transform(1.0, 0.0, 0.0)
-T = torch.Tensor([[32.5993, 82.1822, -311.538]])
-cameras = FoVPerspectiveCameras(device=device, fov=100, T=T)
+# T = torch.Tensor([[32.5993, 82.1822, -311.538]])
+# T = torch.Tensor([[1,1,1]])
+cameras = FoVPerspectiveCameras(device=device, fov=100) #, T=T)
 
 # Define the settings for rasterization and shading. Here we set the output image to be of size
 # 512x512. As we are rendering images for visualization purposes only we will set faces_per_pixel=1
@@ -189,8 +190,8 @@ for i in loop:
         cowTranslation = torch.stack([model.cowWorldTranslation[0],
           model.cowWorldTranslation[1]*model.yscale,
           model.cowWorldTranslation[1]*model.zscale])
-        cow_mesh = model.cow_mesh.clone().offset_verts(cowTranslation)
-        #cow_mesh = model.cow_mesh.clone().offset_verts_(model.cowTranslation)
+        # cow_mesh = model.cow_mesh.clone().offset_verts(cowTranslation)
+        # cow_mesh = model.cow_mesh.clone().offset_verts_(model.cowTranslation)
         mesh = join_meshes_as_scene([test_mesh,cow_mesh])
         image = model.renderer(meshes_world=mesh)
         image = image.detach().squeeze().cpu().numpy()

@@ -7,8 +7,13 @@ Based on our previous discussion, I am going to try to
 6. take the derivative of the loss, with respect to object position
 7. gradient ascent on loss, see if I can make the network do worse
 
-
 Mesh from [NREC ag project](https://www.nrec.ri.cmu.edu/solutions/agriculture/other-agriculture-projects/human-detection-and-tracking.html)
+
+from my first project at nrec, creating a big offroad person dataset
+
+this is a scene without any people, so I wanted to insert one
+
+Used a pretty slow structure from motion library to turn it into a mesh, hoping one day I could do something like this
 
 cruft
 
@@ -36,3 +41,9 @@ list of changes, so that I don't forget as I go through figuring out what matter
 2. set camera at the origin
 3. removed the normals from the faces
 4. removed the bump and Ks from the mtl file
+
+small update w.r.t rendering: RoadRunner meshes are not centered at the origin, and pytorch3d's `look_at_view_transform` assumes you are looking at the origin. There's a bug in the `dist` parameter that they [claim to have fixed](https://github.com/facebookresearch/pytorch3d/issues/191), but doesn't seem fixed. I don't think they fixed it because if it were fixed, we wouldn't need the following change. To view the non-origin-centered mesh you have to add parameters `at` and `up` similar to this:
+```R, T = look_at_view_transform(80, 0, 180, at=((10.741272, -357.137512, 0.1),), up=((0,1,0),), degrees=True)```
+I picked a random vertex from the roadrunnertest2.obj file for the `at` parameter. The default `up` parameter seems to hold for both pytorch3d and roadrunner.
+
+I've tried to render textures properly for meshes that use procedural textures (like the meshes produced by RoadRunner). That is a little more difficult to reason about.  But, at least we have a better idea of why the camera has been rendering the scene so weirdly.
