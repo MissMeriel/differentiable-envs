@@ -58,8 +58,8 @@ device = torch.device("cuda:0")
 print(f"Using {device}")
 # Use an ico_sphere mesh and load a mesh from an .obj e.g. model.obj
 # cow_mesh = ico_sphere(level=3)
-# cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/cow_mesh/cow.obj"], device=device)
-cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/trafficcone_mesh/absperrhut.obj"], device=device)
+cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/cow_mesh/cow.obj"], device=device)
+# cow_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/trafficcone_mesh/absperrhut.obj"], device=device)
 print(cow_mesh.textures._maps_list)
 verts = cow_mesh.verts_packed()
 verts = -2 * verts;
@@ -74,17 +74,13 @@ cow_mesh = cow_mesh.offset_verts_(offset)
 # test_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/trafficcone_mesh/absperrhut.obj"], device=device)
 # test_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/untitled/simple.obj"], device=device)
 test_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/roadrunnertest2.obj"], device=device)
-# test_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/cow_mesh/cow.obj"], device=device)
 print(test_mesh.verts_packed())
 print("successfully loaded meshes")
 
-from pytorch3d.io import IO
-IO().save_mesh(data=test_mesh, path="./test_save_scene_immediate.obj")
-
-test_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/Mega_City.obj"], device=device)
-mesh = join_meshes_as_scene([test_mesh,cow_mesh], include_textures=True)
-print("joined meshes as scene")
-# mesh = test_mesh
+# test_mesh = load_objs_as_meshes([f"{os.getcwd()}/data/Mega_City.obj"], device=device)
+# mesh = join_meshes_as_scene([test_mesh,cow_mesh], include_textures=True)
+# print("joined meshes as scene")
+mesh = test_mesh
 
 #R, T = look_at_view_transform(2.7, 0, 180) R=R, T=T, K=K
 # cameras = FoVPerspectiveCameras(device=device, K=K)
@@ -154,17 +150,7 @@ class Model(nn.Module):
           self.cowWorldTranslation[1]*self.zscale])
         cow_mesh = self.cow_mesh.clone().offset_verts(cowTranslation)
         mesh = join_meshes_as_scene([self.test_mesh.clone(),cow_mesh])
-
-        # from pytorch3d.io import IO
-        # IO().save_mesh(data=mesh, path="./test_save_cone_cow.obj")
-
-        # import pytorch3d 
-        # pytorch3d.io.save_obj(f="./test_save_obj_cow.obj", 
-        #     verts=cow_mesh.verts_packed(), 
-        #     faces=cow_mesh.faces_packed(),
-        #     texture_map=cow_mesh.textures
-        # )       
-
+        
         image = self.renderer(meshes_world=mesh)
         
         # calculate ammount of green in image

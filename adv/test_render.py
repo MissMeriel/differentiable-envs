@@ -96,6 +96,7 @@ renderer = MeshRenderer(
         cameras=cameras, 
         raster_settings=raster_settings
     ),
+    # HardPhongShader, HardGouraudShader, ...
     shader=SoftPhongShader(
         device=device, 
         cameras=cameras,

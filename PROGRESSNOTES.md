@@ -47,3 +47,44 @@ small update w.r.t rendering: RoadRunner meshes are not centered at the origin, 
 I picked a random vertex from the roadrunnertest2.obj file for the `at` parameter. The default `up` parameter seems to hold for both pytorch3d and roadrunner.
 
 I've tried to render textures properly for meshes that use procedural textures (like the meshes produced by RoadRunner). That is a little more difficult to reason about.  But, at least we have a better idea of why the camera has been rendering the scene so weirdly.
+
+
+## Useful documentation on .obj files
+
+http://paulbourke.net/dataformats/obj/
+
+http://paulbourke.net/dataformats/mtl/
+
+
+
+## Useful references for how pytorch3D interfaces with .obj files
+
+https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/io/obj_io.py#L667
+
+https://github.com/facebookresearch/pytorch3d/issues/1277
+
+https://github.com/facebookresearch/pytorch3d/issues/913
+
+https://pytorch3d.readthedocs.io/en/latest/modules/renderer/mesh/textures.html?highlight=TexturesUV#pytorch3d.renderer.mesh.textures.TexturesUV
+
+https://pytorch3d.readthedocs.io/en/v0.6.0/modules/io.html#pytorch3d.io.IO.save_mesh
+
+https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/structures/meshes.html#join_meshes_as_batch
+
+https://github.com/facebookresearch/pytorch3d/blob/main/pytorch3d/renderer/mesh/textures.py
+
+https://pytorch3d.readthedocs.io/en/latest/modules/structures.html#pytorch3d.structures.Meshes.submeshes
+
+https://discuss.pytorch.org/t/ptorch3d-loss-on-projected-image/82560
+
+https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/renderer/cameras.html#look_at_view_transform
+
+https://pytorch3d.readthedocs.io/en/latest/modules/renderer/cameras.html
+
+https://www.andrew.cmu.edu/user/chenhao2/
+
+https://github.com/facebookresearch/pytorch3d/blob/main/docs/tutorials/render_textured_meshes.ipynb
+
+## Useful resources on gradients
+
+https://pytorch.org/tutorials/beginner/introyt/autogradyt_tutorial.html
