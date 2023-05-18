@@ -37,13 +37,13 @@ from typing import List, NamedTuple, Tuple
 
 # Maybe subdivide faces and verts based on verts2D(faces2D) lengths
 # shift verts2D to fit into max size grid
-def splitAndOffsetOneFace(verts_3D_tensor_in, verts_2D_tensor_in, max_grid_size):
+def splitAndOffsetOneFace(verts_3D_tensor_in, verts_2D_tensor_in, verts_normals_tensor_in, max_grid_size):
     def findTextureGridSize(verts_2D):
         max_return = torch.max(torch.ceil(verts_2D),0)
         return max_return.values
 
     # split a single triangle on one side, return explicitly for 2 resulting triangles
-    def splitTriangle(verts_2D, verts_3D):
+    def splitTriangle(verts_2D, verts_3D, verts_normals):
         # remainder and roll work together, remainder should be negation of roll dist
         length_squared = torch.sum( torch.square( verts_2D - torch.roll(verts_2D,1,0) ) , 1)
         max_length_side_0 = torch.argmax(length_squared, 0)
@@ -52,6 +52,8 @@ def splitAndOffsetOneFace(verts_3D_tensor_in, verts_2D_tensor_in, max_grid_size)
         # midpoint of max length in 2D and 3D
         midpoint_2D = torch.mean(verts_2D[(max_length_side_0,max_length_side_1),:],0)
         midpoint_3D = torch.mean(verts_3D[(max_length_side_0,max_length_side_1),:],0)
+        midpoint_normal_unnorm = torch.mean(verts_normals_tensor_in[(max_length_side_0,max_length_side_1),:],0)
+        midpoint_normal = midpoint_normal_unnorm / torch.linalg.vector_norm(midpoint_normal_unnorm) # make unit length
 
         # new triangles
         verts_2D_0 = verts_2D.clone()
@@ -66,7 +68,13 @@ def splitAndOffsetOneFace(verts_3D_tensor_in, verts_2D_tensor_in, max_grid_size)
         verts_3D_0[max_length_side_0,:] = midpoint_3D
         verts_3D_1[max_length_side_1,:] = midpoint_3D
 
-        return verts_2D_0, verts_2D_1, verts_3D_0, verts_3D_1
+        verts_normals_0 = verts_normals.clone()
+        verts_normals_1 = verts_normals.clone()
+
+        verts_normals_0[max_length_side_0,:] = midpoint_normal
+        verts_normals_1[max_length_side_1,:] = midpoint_normal
+
+        return verts_2D_0, verts_2D_1, verts_3D_0, verts_3D_1, verts_normals_0, verts_normals_1
 
     # offset triangle and check grid size
     max_return = torch.min(torch.floor(verts_2D_tensor_in),0)
@@ -74,22 +82,28 @@ def splitAndOffsetOneFace(verts_3D_tensor_in, verts_2D_tensor_in, max_grid_size)
     curr_grid_size = findTextureGridSize(verts_2D_tensor)
 
     if (torch.any(torch.gt(curr_grid_size, max_grid_size)).data):
-        # split needed, so make two triangles and recurse
-        verts_2D_0, verts_2D_1, verts_3D_0, verts_3D_1 = splitTriangle(verts_2D_tensor, verts_3D_tensor_in)
-        verts_3D_0, verts_2D_0 = splitAndOffsetOneFace(verts_3D_0, verts_2D_0, max_grid_size)
-        verts_3D_1, verts_2D_1 = splitAndOffsetOneFace(verts_3D_1, verts_2D_1, max_grid_size)
+        # split needed, so make two triangles and we'll recursively check them
+        verts_2D_0, verts_2D_1, verts_3D_0, verts_3D_1, verts_normals_0, verts_normals_1 = splitTriangle(
+            verts_2D_tensor, verts_3D_tensor_in, verts_normals_tensor_in)
+        # recurse on each
+        verts_3D_0, verts_2D_0, verts_normals_0 = splitAndOffsetOneFace(
+            verts_3D_0, verts_2D_0, verts_normals_0, max_grid_size)
+        verts_3D_1, verts_2D_1, verts_normals_1 = splitAndOffsetOneFace(
+            verts_3D_1, verts_2D_1, verts_normals_1, max_grid_size)
         
         # collect resulting triangles
-        verts_2D_tensor = torch.cat((verts_2D_0,verts_2D_1),0)
-        verts_3D_tensor = torch.cat((verts_3D_0,verts_3D_1),0)
+        verts_2D_tensor = torch.cat((verts_2D_0,verts_2D_1), 0)
+        verts_3D_tensor = torch.cat((verts_3D_0,verts_3D_1), 0)
+        verts_normals_tensor = torch.cat((verts_normals_0, verts_normals_1),0)
     else:
         verts_3D_tensor = verts_3D_tensor_in
+        verts_normals_tensor = verts_normals_tensor_in
 
     #print("after recurse,", curr_grid_size, " became size: ", verts_2D_tensor.shape)
-    return verts_3D_tensor, verts_2D_tensor
+    return verts_3D_tensor, verts_2D_tensor, verts_normals_tensor
 
 
-def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, verts_2D_tensor_in,image_in):
+def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, verts_2D_tensor_in, verts_normals_tensor_in, image_in):
     max_grid_tuple = (1, 5, 5, 1)
     max_grid_tensor = torch.tensor([max_grid_tuple[1:2]])
     
@@ -97,6 +111,8 @@ def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, v
     verts_3D_tensor_list = []
     faces_2D_tensor_list = []
     verts_2D_tensor_list = []
+    faces_normals_tensor_list = []
+    verts_normals_tensor_list = []
     count_verts_so_Far = 0
 
     image_unwrapped = image_in.repeat(max_grid_tuple) # tensor with copies of image_in
@@ -106,11 +122,13 @@ def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, v
         faces_2D_local = faces_2D_tensor_in[faceIndex, :] # index into indices, wow!
         faces_3D_local = faces_3D_tensor_in[faceIndex, :]
 
+
         verts_2D_local = verts_2D_tensor_in[faces_2D_local, :] # unpack verts into 3(v)x3(uv) triangle
         verts_3D_local = verts_3D_tensor_in[faces_3D_local, :] # unpack verts into 3(v)x3(xyz) triangle
+        verts_normals_local = verts_normals_tensor_in[faces_3D_local, :] # unpack verts into 3(v)x3(xyz) triangle
 
         # this function always shifts to strictly positive. May also split if triangle outside grid
-        verts_3D_local, verts_2D_local = splitAndOffsetOneFace(verts_3D_local, verts_2D_local, max_grid_tensor) # assume triangle is dense
+        verts_3D_local, verts_2D_local, verts_normals_local = splitAndOffsetOneFace(verts_3D_local, verts_2D_local, verts_normals_local, max_grid_tensor) # assume triangle is dense
         
         # reindex naively, no duplication in this representation (dependent variables)
         # overwrite intermediate version, not needed anymore
@@ -128,14 +146,18 @@ def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, v
         verts_3D_tensor_list.append( verts_3D_local )
         faces_2D_tensor_list.append( faces_2D_local )
         verts_2D_tensor_list.append( verts_2D_local )
+        verts_normals_tensor_list.append( verts_normals_local )
+
+        
 
     faces_3D_tensor = torch.cat(faces_3D_tensor_list,0)
     verts_3D_tensor = torch.cat(verts_3D_tensor_list,0)
-    faces_2D_tensor = torch.cat(faces_2D_tensor_list,0)
+    faces_2D_tensor = torch.cat(faces_2D_tensor_list,0)  
     # scale to new dimensions
     verts_2D_tensor = torch.divide( torch.cat(verts_2D_tensor_list,0), max_grid_tensor) 
+    verts_normals_tensor = torch.cat(verts_normals_tensor_list)
 
-    return  faces_3D_tensor, verts_3D_tensor, faces_2D_tensor, verts_2D_tensor, image_unwrapped
+    return  faces_3D_tensor, verts_3D_tensor, faces_2D_tensor, verts_2D_tensor, verts_normals_tensor, image_unwrapped
 
 def load_objs_as_meshes_mine(
     files: list,
@@ -196,6 +218,7 @@ def load_objs_as_meshes_mine(
                 textures_per_mat = []
                 verts_tensor_list = []
                 faces_3D_tensor_list = []
+                verts_normals_tensor_list = []
                 
                 # copy to device
                 faces_3D_tensor_in = faces.verts_idx.to(device) # (F, 3)
@@ -208,17 +231,43 @@ def load_objs_as_meshes_mine(
                     # TODO, may be able to optimize more in this case
                     faces_2D_tensor_in = faces_3D_tensor_in
 
+                # if faces have different normal indices than xyz indices, grab them too. Otherwise copy
+                if hasattr(faces, 'normals_idx'):
+                    faces_normals_tensor_in = faces.normals_idx.to(device) # (F, 3)
+                else:
+                    
+                    faces_normals_tensor_in = faces_3D_tensor_in
+
+                if hasattr(aux, 'normals'):
+                    verts_normals_tensor_in = aux.normals
+                else:
+                    verts_normals_tensor_in = None
+
                 count_verts_3D = 0
                 for tex_map_index in range(len(tex_maps)):
-                    # TODO remove count_vertices
-                    def sample_single_material(faces_tensor_in, verts_tensor_in, faces_mask, count_vertices):
+                    # TODO merge into 1 function
+                    def sample_single_material(faces_tensor_in, verts_tensor_in, faces_mask):
                         faces_tensor_in = faces_tensor_in[faces_mask,:]
                         unique_return = torch.unique(faces_tensor_in,return_inverse=True)
                         verts_index_tensor = unique_return[0]
                         verts_tensor = torch.index_select(verts_tensor_in,0,verts_index_tensor) # slicing but preserved shape
-                        faces_tensor = torch.add(unique_return[1], count_vertices)
-                        count_vertices = count_vertices + verts_tensor.shape[0]
-                        return faces_tensor, verts_tensor, count_vertices
+                        faces_tensor = unique_return[1]
+                        return faces_tensor, verts_tensor
+
+
+                    def sample_single_material_shared_indexing(faces_tensor_0, verts_tensor_0, faces_tensor_1, verts_tensor_1,  faces_mask):
+                        combinedFaces = torch.cat([torch.unsqueeze(faces_tensor_0[faces_mask,:],2),
+                         torch.unsqueeze(faces_tensor_1[faces_mask],2)],2)
+                        unique_return = torch.unique(torch.reshape(combinedFaces,[-1,2]),dim=0,return_inverse=True)
+                        faces_tensor = torch.reshape(unique_return[1],[-1,3])
+                        
+                        verts_index_0_tensor = unique_return[0][:,0]
+                        verts_index_1_tensor = unique_return[0][:,1]
+                        verts_3D_tensor = torch.index_select(verts_tensor_0,0,verts_index_0_tensor) # slicing but preserved shape
+                        verts_norm_tensor = torch.index_select(verts_tensor_1,0,verts_index_1_tensor) # slicing but preserved shape
+                        
+                        return faces_tensor, verts_3D_tensor, verts_norm_tensor
+                                      
 
                     # TODO make indexing cleaner
                     # copy to device
@@ -227,35 +276,43 @@ def load_objs_as_meshes_mine(
                     # only some faces are in this material
                     faces_used_mask = (faces.materials_idx == tex_map_index).to(device)
 
-                    faces_3D_tensor, verts_3D_tensor, _ = sample_single_material(
-                        faces_3D_tensor_in, verts_tensor_in, faces_used_mask, 0)
+                    faces_3D_tensor, verts_3D_tensor, verts_normals_tensor = sample_single_material_shared_indexing(
+                        faces_3D_tensor_in, verts_tensor_in, faces_normals_tensor_in, verts_normals_tensor_in, faces_used_mask)
 
-                    faces_2D_tensor, verts_2D_tensor, _ = sample_single_material(
-                        faces_2D_tensor_in, verts_uvs_in, faces_used_mask, 0)
+                    faces_2D_tensor, verts_2D_tensor= sample_single_material(
+                        faces_2D_tensor_in, verts_uvs_in, faces_used_mask)
 
+
+
+                    print('nwrap verts 2D: ', verts_2D_tensor.shape)
+                    print("nwrap faces 3D:", faces_3D_tensor.shape)
+                    print('nwrap verts 3D: ', verts_3D_tensor.shape)
+                    print("nwrap faces 2D:", faces_2D_tensor.shape, flush=True)
+                    print('nwrap verts nm: ', verts_normals_tensor.shape)
                     
                     # Store original meshes to return for optimization, maybe not compatible with renderer.
                     mesh_list_raw.append(Meshes([verts_3D_tensor], [faces_3D_tensor],
-                    TexturesUV(
+                    textures=TexturesUV(
                         verts_uvs=[verts_2D_tensor], 
                         faces_uvs=[faces_2D_tensor], maps=image
-                    ) ))
+                    ), verts_normals=[verts_normals_tensor]))
                  
                     # do a bunch of recursive splitting until vts between 0 and 1
                     if torch.any(torch.gt(verts_2D_tensor, 1)).data or torch.any(torch.lt(verts_2D_tensor, 0)).data:
-                        faces_3D_tensor, verts_3D_tensor,faces_2D_tensor, verts_2D_tensor,image = unwrapTextureUV(
-                            faces_3D_tensor, verts_3D_tensor,faces_2D_tensor, verts_2D_tensor,image)
+                        faces_3D_tensor, verts_3D_tensor, faces_2D_tensor, verts_2D_tensor, verts_normals_tensor, image = unwrapTextureUV(
+                            faces_3D_tensor, verts_3D_tensor,faces_2D_tensor, verts_2D_tensor, verts_normals_tensor, image)
 
                     mesh_list_unwrapped.append(Meshes([verts_3D_tensor], [faces_3D_tensor],
-                    TexturesUV(
+                    textures=TexturesUV(
                         verts_uvs=[verts_2D_tensor], 
                         faces_uvs=[faces_2D_tensor], maps=image
-                    ) ))      
+                    ), verts_normals=[verts_normals_tensor] ))      
 
-                    print("inner verts 3D: ", verts_3D_tensor.shape)
-                    print("inner faces 3D:", faces_3D_tensor.shape)
-                    print("inner verts 2D: ", verts_2D_tensor.shape)
-                    print("inner faces 2D:", faces_2D_tensor.shape, flush=True)
+                    print("nwrap verts 3D: ", verts_3D_tensor.shape)
+                    print("nwrap faces 3D:", faces_3D_tensor.shape)
+                    print("nwrap verts 2D: ", verts_2D_tensor.shape)
+                    print("nwrap faces 2D:", faces_2D_tensor.shape, flush=True)
+                    print("nwrap verts nm: ", verts_normals_tensor.shape)
 
                     # verts_3D naively cat-ed, need to start faces index from last size
                     faces_3D_tensor +=  count_verts_3D
@@ -268,16 +325,19 @@ def load_objs_as_meshes_mine(
                     ) )
                     faces_3D_tensor_list.append(faces_3D_tensor)
                     verts_tensor_list.append(verts_3D_tensor)
+                    verts_normals_tensor_list.append(verts_normals_tensor)
 
                 if len(tex_maps) > 1:
                     tex = textures_per_mat[0].join_batch(textures_per_mat[1:])
-                    tex = join_scene_mine(tex)
+                    tex = join_scene_mine(tex) # TODO figure out how to include from pytorch3D
                     faces_tensor = torch.cat(faces_3D_tensor_list)
                     verts_tensor = torch.cat(verts_tensor_list)
+                    verts_normals_tensor = torch.cat(verts_tensor_list)
                 else:
                     tex = textures_per_mat[0]
                     faces_tensor = faces_3D_tensor_list[0]
                     verts_tensor = verts_tensor_list[0]
+                    verts_normals_tensor = verts_normals_tensor_list[0]
                 
         # TODO other aux properties lost: normals, material colors, 
         print("verts 3D: ", verts_tensor.shape)
@@ -288,7 +348,8 @@ def load_objs_as_meshes_mine(
         print("max 3d face index: ", torch.max(faces_tensor))
         print(tex)
         mesh = Meshes(
-            verts=verts_tensor.unsqueeze(0), faces=faces_tensor.unsqueeze(0), textures=tex
+            verts=verts_tensor.unsqueeze(0), faces=faces_tensor.unsqueeze(0), 
+            textures=tex, verts_normals=[verts_normals_tensor]
         )
         mesh_list.append(mesh)
     meshes_batch = join_meshes_as_batch(mesh_list)
@@ -478,7 +539,8 @@ device = torch.device("cpu")
 # test_mesh = load_objs_as_meshes(["/media/raid/Home/Data/HPSTA/adv/201408272252_09.obj"], device=device)
 
 print("entering load")
-test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/data/exportedOrig/roadrunnerScene.obj"], device=device)
+test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/differentiable-envs/adv/data/tinyhillroad/tinyhillroad.obj"], device=device)
+#test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/data/exportedOrig/roadrunnerScene.obj"], device=device)
 #test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/data/trianglegrasspatch_preproc/trianglegrasspatch_proc.obj"], device=device)
 
 print("entering save")
@@ -518,7 +580,7 @@ IO().save_mesh(mesh, "final_model.obj")
 
 
 #R, T = look_at_view_transform(2.7, 0, 180) R=R, T=T, K=K
-dist = 300
+dist = 20
 cameras = FoVPerspectiveCameras(device=device, 
 K=K, T=torch.tensor([[0, 0, dist ]]), zfar=torch.tensor([dist * 1.5]))
 #cameras = OpenGLPerspectiveCameras(device=device, T=torch.tensor([[32.5993, 82.1822, -198.781 ]]))
