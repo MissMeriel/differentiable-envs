@@ -34,6 +34,15 @@ import os
 from pytorch3d.renderer.mesh.utils import pack_unique_rectangles
 from typing import List, NamedTuple, Tuple
 
+import argparse
+
+def parse_cmdline_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-f", "--objfile", type=str, default="/media/raid/Home/Data/HPSTA/adv/data/exportedOrig/roadrunnerScene.obj")
+    args = parser.parse_args()
+    return args
+
+args = parse_cmdline_args()
 
 # Maybe subdivide faces and verts based on verts2D(faces2D) lengths
 # shift verts2D to fit into max size grid
@@ -478,13 +487,15 @@ device = torch.device("cpu")
 # test_mesh = load_objs_as_meshes(["/media/raid/Home/Data/HPSTA/adv/201408272252_09.obj"], device=device)
 
 print("entering load")
-test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/data/exportedOrig/roadrunnerScene.obj"], device=device)
+test_mesh = load_objs_as_meshes_mine([args.objfile], device=device)
 #test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/data/trianglegrasspatch_preproc/trianglegrasspatch_proc.obj"], device=device)
 
 print("entering save")
 mapsnumpy = np.squeeze(test_mesh.textures.maps_padded().cpu().numpy())
 print(mapsnumpy.shape)
-imageio.imwrite('maps1.png',mapsnumpy)
+from PIL import Image
+im = Image.fromarray((mapsnumpy * 255).astype(np.uint8))
+imageio.imwrite('maps1.png',im)
 
 
 
@@ -556,7 +567,9 @@ renderer = MeshRenderer(
 )
 
 images = renderer(mesh)
-imageio.imwrite("render1.png",images[0, ..., :3].cpu().numpy())
+im = images[0, ..., :3].cpu().numpy()
+im = Image.fromarray((im * 255).astype(np.uint8))
+imageio.imwrite("render1.png", im)
 
 sys.exit()
 
