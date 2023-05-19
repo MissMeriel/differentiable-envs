@@ -1,5 +1,5 @@
 from pytorch3d.utils import ico_sphere
-from pytorch3d.io import load_obj, load_objs_as_meshes, IO
+from pytorch3d.io import load_obj, load_objs_as_meshes, IO, save_obj
 from pytorch3d.structures import Meshes, join_meshes_as_scene, join_meshes_as_batch
 from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.loss import chamfer_distance
@@ -99,7 +99,6 @@ def splitAndOffsetOneFace(verts_3D_tensor_in, verts_2D_tensor_in, verts_normals_
         verts_3D_tensor = verts_3D_tensor_in
         verts_normals_tensor = verts_normals_tensor_in
 
-    #print("after recurse,", curr_grid_size, " became size: ", verts_2D_tensor.shape)
     return verts_3D_tensor, verts_2D_tensor, verts_normals_tensor
 
 
@@ -107,11 +106,11 @@ def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, v
     max_grid_tuple = (1, 5, 5, 1)
     max_grid_tensor = torch.tensor([max_grid_tuple[1:2]])
     
+    # initialize lists for later cat operation
     faces_3D_tensor_list = []
     verts_3D_tensor_list = []
     faces_2D_tensor_list = []
     verts_2D_tensor_list = []
-    faces_normals_tensor_list = []
     verts_normals_tensor_list = []
     count_verts_so_Far = 0
 
@@ -122,10 +121,10 @@ def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, v
         faces_2D_local = faces_2D_tensor_in[faceIndex, :] # index into indices, wow!
         faces_3D_local = faces_3D_tensor_in[faceIndex, :]
 
-
         verts_2D_local = verts_2D_tensor_in[faces_2D_local, :] # unpack verts into 3(v)x3(uv) triangle
         verts_3D_local = verts_3D_tensor_in[faces_3D_local, :] # unpack verts into 3(v)x3(xyz) triangle
-        verts_normals_local = verts_normals_tensor_in[faces_3D_local, :] # unpack verts into 3(v)x3(xyz) triangle
+        # normals are in meshes object and assume same face indices 
+        verts_normals_local = verts_normals_tensor_in[faces_3D_local, :] # unpack normals into 3(v)x3(xyz) triangle 
 
         # this function always shifts to strictly positive. May also split if triangle outside grid
         verts_3D_local, verts_2D_local, verts_normals_local = splitAndOffsetOneFace(verts_3D_local, verts_2D_local, verts_normals_local, max_grid_tensor) # assume triangle is dense
@@ -133,23 +132,22 @@ def unwrapTextureUV(faces_3D_tensor_in, verts_3D_tensor_in,faces_2D_tensor_in, v
         # reindex naively, no duplication in this representation (dependent variables)
         # overwrite intermediate version, not needed anymore
         faces_3D_local =  torch.reshape(
-            torch.arange( # TODO double check row major
+            torch.arange(
                 count_verts_so_Far, count_verts_so_Far + verts_3D_local.shape[0]),
                 [-1,3]) # -1 means "figure it out for me"
         faces_2D_local = faces_3D_local
 
-        # print("original face ", faceIndex, " became ", faces_3D_local.shape[0], " faces")
-        # print("verts", verts_2D_local_bak)
 
-        count_verts_so_Far += verts_3D_local.shape[0]
+        # add to lists for later cat
         faces_3D_tensor_list.append( faces_3D_local )
         verts_3D_tensor_list.append( verts_3D_local )
         faces_2D_tensor_list.append( faces_2D_local )
         verts_2D_tensor_list.append( verts_2D_local )
         verts_normals_tensor_list.append( verts_normals_local )
+        count_verts_so_Far += verts_3D_local.shape[0]
 
         
-
+    # cat all lists
     faces_3D_tensor = torch.cat(faces_3D_tensor_list,0)
     verts_3D_tensor = torch.cat(verts_3D_tensor_list,0)
     faces_2D_tensor = torch.cat(faces_2D_tensor_list,0)  
@@ -546,7 +544,7 @@ test_mesh = load_objs_as_meshes_mine(["/media/raid/Home/Data/HPSTA/adv/different
 print("entering save")
 mapsnumpy = np.squeeze(test_mesh.textures.maps_padded().cpu().numpy())
 print(mapsnumpy.shape)
-imageio.imwrite('maps1.png',mapsnumpy)
+imageio.imwrite('maps1.png',(mapsnumpy*255).astype(np.uint8))
 
 
 
@@ -575,7 +573,10 @@ K[:,3,2] =       1
 print(K)
 
 print(mesh);
-IO().save_mesh(mesh, "final_model.obj")
+#IO().save_mesh(mesh, "final_model.obj")
+save_obj("final_model.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0],
+    normals=mesh.verts_normals_list()[0], faces_normals_idx=mesh.faces_list()[0],
+    faces_uvs=mesh.textures.faces_uvs_list()[0], verts_uvs=mesh.textures.verts_uvs_list()[0], texture_map=mesh.textures.maps_list()[0])
 
 
 
@@ -618,7 +619,7 @@ renderer = MeshRenderer(
 )
 
 images = renderer(mesh)
-imageio.imwrite("render1.png",images[0, ..., :3].cpu().numpy())
+imageio.imwrite("render1.png",(images[0, ..., :3].cpu().numpy()*255).astype(np.uint8))
 
 sys.exit()
 
