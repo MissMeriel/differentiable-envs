@@ -1,0 +1,3 @@
+[submodule "deps/dex-net"]
+	path = deps/dex-net
+	url = https://github.com/hailie-mitchell/dex-net
