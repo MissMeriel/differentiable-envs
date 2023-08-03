@@ -11,6 +11,7 @@ from gqcnn_pytorch2 import KitModel
 import cv2
 import PIL.Image as PImage
 import skimage.transform as skt
+from skimage.util import compare_images
 
 
 from pytorch3d.io import load_obj
@@ -94,6 +95,7 @@ def get_input_tensors(depth_im, grasp_depth, grasp_angle, grasp_center_x, grasp_
 def process_depth_im(image, scale, grasp_angle, im_height, im_width, translation):
 	"""pre-process the depth image before input to model and return"""
 	# lots of code from autolab_core/image.py
+	# THIS FUNC DOESN'T WORK AT ALL RN
 	
 	center_x = image.shape[0] / 2
 	center_y = image.shape[1] / 2
@@ -224,16 +226,58 @@ def perturb(pose_tensor, param, model):
 
 # start adversarial attack on depth image
 # param = image_tensor
-optimizer = torch.optim.SGD([image_tensor], lr=1e-4, momentum=0.99)
 
-for i in range(2000):
+orig_tensor = image_tensor.clone().detach().squeeze().numpy()
+loss = calc_loss(pose_tensor, image_tensor, model)
+print("orig tensor:\n", orig_tensor, "\nshape:", orig_tensor.shape)
+
+
+image_tensor.requires_grad=True
+optimizer = torch.optim.SGD([image_tensor], lr=1e-5, momentum=0.99)
+
+num_plots = 6
+steps_per_plot = 5
+num_steps = num_plots * steps_per_plot
+_, arr = plt.subplots(2, num_plots)
+
+# plot original tensor before attack starts
+cmap='viridis'
+arr[0, 0].imshow(orig_tensor, cmap=cmap)
+arr[0, 0].axis("off")
+title = "step:0 conf:" + str(round(float(loss[0].data),3))
+arr[0, 0].set_title(title)
+arr[1, 0].imshow(compare_images(orig_tensor, orig_tensor), cmap=cmap)
+arr[1, 0].axis("off")
+
+# from scipy.io import savemat
+# mat_dict = {}
+
+for i in range(num_steps):
 	optimizer.zero_grad()
 	loss, image_tensor = perturb(pose_tensor, image_tensor, model)
 	loss.backward()
 	optimizer.step()
 	print("step:", i, "\tloss:", float(loss[0].data))
-	if i%100 == 0:
-		print("image tensor:\n", image_tensor)
+	if (i%steps_per_plot == 0) and (i != 0):
+	 	tensor = image_tensor.clone().detach().squeeze().numpy()
+	 	index = i // steps_per_plot
+	 	print("i:", i, "index:", index)
+	 	arr[0, index].imshow(tensor, cmap=cmap)
+	 	title = "step:" + str(i) + " conf:" + str(round(float(loss[0].data),3))
+	 	arr[0, index].set_title(title)
+	 	arr[0, index].axis("off")
+	 	arr[1, index].imshow(compare_images(orig_tensor, tensor), cmap=cmap)
+	 	arr[1, index].axis("off")
+	 	# mat_dict["step" + str(i)] = tensor
+	 	
 	
+# display new depth image
+final_depth_im = image_tensor.detach().squeeze().numpy()
+
+# arr[1].imshow(final_depth_im)
+plt.show()
+
+# savemat("advgrasps.mat", mat_dict)
+
 
 
