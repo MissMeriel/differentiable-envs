@@ -21,6 +21,12 @@ def load_weights(weight_file):
 def normalize_input(im_arr, pose_arr):
     """Normalize input before passing to the model"""
 
+    im = im_arr.detach().cpu().numpy()
+
+    print("image before normalization")
+    print("max val:", np.max(im))
+    print("min val:", np.min(im))
+
     # load in normalization files
     im_mean = torch.from_numpy(np.load('normalization/mean.npy')).float()
     im_std = torch.from_numpy(np.load('normalization/std.npy')).float()
@@ -29,6 +35,11 @@ def normalize_input(im_arr, pose_arr):
 
     im_arr = (im_arr - im_mean) / im_std
     pose_arr = (pose_arr - pose_mean) / pose_std
+
+    im2 = im_arr.detach().cpu().numpy()
+    print("image after normalization")
+    print("max val:", np.max(im2))
+    print("min val:", np.min(im2))
 
     return im_arr, pose_arr
 

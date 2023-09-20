@@ -126,7 +126,7 @@ server = Pyro4.Proxy("PYRO:Server@0.0.0.0:5000")
 # print(server.sample_grasps('bar_clamp.obj'))
 # print(server.depth_im("barclamp.npy"))
 
-print(server.gqcnn_sample_grasps("depth_0.npy", 100))
-
-
-
+# print(server.gqcnn_sample_grasps("depth_0.npy", 100))
+check, message = server.gqcnn_sample_grasps("barclamp.npy", 100)
+while not check:
+	check, message = server.gqcnn_sample_grasps("barclamp.npy", 100)
