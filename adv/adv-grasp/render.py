@@ -190,11 +190,12 @@ class Renderer:
 
 		return depth_im
 
-# render object
-renderer1 = Renderer()
-mesh, image = renderer1.render_object("bar_clamp.obj", display=True, title="render_object")
-depth_im = renderer1.mesh_to_depth_im(mesh, title="depth_im")
-renderer1.display(mesh, title="mesh")
-renderer1.display(image, title="image")
+if __name__ == "__main__":
+	# render object
+	renderer1 = Renderer()
+	mesh, image = renderer1.render_object("bar_clamp.obj", display=True, title="render_object")
+	depth_im = renderer1.mesh_to_depth_im(mesh, title="depth_im")
+	renderer1.display(mesh, title="mesh")
+	renderer1.display(image, title="image")
 
 
