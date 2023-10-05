@@ -18,9 +18,24 @@ def load_weights(weight_file):
 
     return weights_dict
 
+def normalize_input(im_arr, pose_arr):
+    """Normalize input before passing to the model"""
+
+    # load in normalization files
+    im_mean = torch.from_numpy(np.load('normalization/mean.npy')).float()
+    im_std = torch.from_numpy(np.load('normalization/std.npy')).float()
+    pose_mean = torch.from_numpy(np.load('normalization/pose_mean.npy')).float()
+    pose_std = torch.from_numpy(np.load('normalization/pose_std.npy')).float()
+
+    im_arr = (im_arr - im_mean) / im_std
+    pose_arr = (pose_arr - pose_mean) / pose_std
+
+    return im_arr, pose_arr
+
+
 class KitModel(nn.Module):
 
-
+    
     def __init__(self, weight_file):
         super(KitModel, self).__init__()
         global _weights_dict
@@ -44,10 +59,12 @@ class KitModel(nn.Module):
         self.Conv2D_2 = self.__conv(2, name='Conv2D_2', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same')
         self.Conv2D_3 = self.__conv(2, name='Conv2D_3', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same')
         self.pad = nn.ConstantPad2d(1, 0)
-
+       
         print("initalized!\n")
 
     def forward(self, x1, x2):
+        # x1 is pose_arr and x2 is im_arr
+        x2, x1 = normalize_input(x2, x1)
         MatMul_1        = torch.matmul(x1, _other_weights["pc1W"])      # x1 - step 0; input: 64 x 1
         add_5           = MatMul_1 + _other_weights["pc1b"]             # x1 - step 1; MatMul_1 + pc1b/read
         Relu_5          = F.relu(add_5)                                 # x1 - step 2
@@ -60,8 +77,8 @@ class KitModel(nn.Module):
         MaxPool, MaxPool_idx = F.max_pool2d(Relu, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)   # x2 - step 3
         # MirrorPad_3     = self.pad(MaxPool)
         # MirrorPad_4     = self.pad(MirrorPad_3)
-        Conv2D_1        = self.Conv2D_1(MaxPool)
-        Relu_1          = F.relu(Conv2D_1)
+        Conv2D_1        = self.Conv2D_1(MaxPool) 
+        Relu_1          = F.relu(Conv2D_1) 
         LRN             = F.local_response_norm(Relu_1, size=5, alpha=9.999999747378752e-05, beta=0.75, k=1.0)  # x2 - step 9
         MaxPool_1, MaxPool_1_idx = F.max_pool2d(LRN, kernel_size=(2, 2), stride=(2, 2), padding=0, ceil_mode=False, return_indices=True)    # x2 - step 9
         # MirrorPad_5     = self.pad(MaxPool_1)
@@ -70,11 +87,14 @@ class KitModel(nn.Module):
         MaxPool_2, MaxPool_2_idx = F.max_pool2d(Relu_2, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)
         # MirrorPad_6     = self.pad(MaxPool_2)
         Conv2D_3        = self.Conv2D_3(MaxPool_2)
-        Relu_3          = F.relu(Conv2D_3)
+        Relu_3          = F.relu(Conv2D_3) 
         LRN_1           = F.local_response_norm(Relu_3, size=5, alpha=9.999999747378752e-05, beta=0.75, k=1.0)
         MaxPool_3, MaxPool_3_idx = F.max_pool2d(LRN_1, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)
         MaxPool_3 = torch.permute(MaxPool_3, (0,2,3,1))
-        Reshape_3       = torch.reshape(input = MaxPool_3, shape = (64,16384))
+        if MaxPool_3.shape[0] == 1:
+            Reshape_3       = torch.reshape(input = MaxPool_3, shape=(1,16384)) #shape = (64,16384))
+        else:
+            Reshape_3       = torch.reshape(input = MaxPool_3, shape=(64,16384))
         MatMul          = torch.matmul(Reshape_3, _other_weights["fc3W"])       # Reshape_3 * fc3W/read
         add_4           = MatMul + _other_weights["fc3b"]                       # MatMul + fc3b/read
         Relu_4          = F.relu(add_4)
@@ -101,7 +121,7 @@ class KitModel(nn.Module):
         # print("weights:", torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).shape)
         # print(torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)))
         # print("conv1_1b:", _other_weights["conv1_1b"])
-
+            
         layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']))
         if 'bias' in _weights_dict[name]:
             layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
@@ -115,3 +135,4 @@ class KitModel(nn.Module):
         if 'bias' in _weights_dict[name]:
             layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
         return layer
+

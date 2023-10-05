@@ -6,7 +6,7 @@ import os
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
-from gqcnn_pytorch2 import KitModel
+from gqcnn_pytorch import KitModel
 
 import cv2
 import PIL.Image as PImage
@@ -177,9 +177,9 @@ renderer = MeshRenderer(
 )
 
 # render object
-# mesh, _ = render_object("bar_clamp.obj", renderer, cameras, lights, device, display=False)
+# mesh, _ = render_object("data/bar_clamp.obj", renderer, cameras, lights, device, display=False)
 # depth_im = mesh_to_depth_im(mesh, rasterizer)
-# np.save("bar_clamp.npy", depth_im)
+# np.save("data/bar_clamp.npy", depth_im)
 # print("depth_im shape:", depth_im.shape)
 # print("depth_im:")
 # print(depth_im)
@@ -187,7 +187,7 @@ renderer = MeshRenderer(
 # print("depth im max:", np.max(depth_im))
 
 # load in depth image
-depth_im = np.load("dex_shared_dir/depth_0.npy")
+depth_im = np.load("data/depth_0.npy")
 
 # get image and pose tensors from depth image or from grasp - manual values for depth_0.npy
 grasp_depth=0.607433762324266
@@ -201,16 +201,18 @@ pose_tensor, image_tensor = get_input_tensors(depth_im, grasp_depth, grasp_angle
 # print("image tensor max:", np.max(image_tensor.detach().numpy()))
 
 # initialize model
-model = KitModel("573931b36e8e4fdab6218f6c598e100d.npy")
+model = KitModel("weights.npy")	# ("573931b36e8e4fdab6218f6c598e100d.npy")
 model.eval()
 
 # test prediction
-# x1 = torch.from_numpy(np.load('input_pose.npy')).float()  # pose - 64x1
-# x2 = torch.from_numpy(np.load('input_im.npy')).float().permute(0,3,1,2)    # image - 64x32x32x1
+x1 = torch.from_numpy(np.load('data/pose_tensor1_raw.npy')).float()  # pose - 64x1
+x2 = torch.from_numpy(np.load('data/image_tensor1_raw.npy')).float().permute(0,3,1,2)    # image - 64x32x32x1
+# print("input pose shape", x1.shape)
+# print("input image shape", x2.shape)
 
-# output_arr = model(pose_tensor, image_tensor)
-# print("output:", output_arr.shape)
-# print(output_arr)
+output_arr = model(pose_tensor, image_tensor)
+print("output:", output_arr.shape)
+print(output_arr)
 
 def calc_loss(pose_tensor, image_tensor, model):
 	""" Minimize grasp quality prediction for an initially successful grasp """
@@ -226,7 +228,7 @@ def perturb(pose_tensor, param, model):
 
 # start adversarial attack on depth image
 # param = image_tensor
-
+"""
 orig_tensor = image_tensor.clone().detach().squeeze().numpy()
 loss = calc_loss(pose_tensor, image_tensor, model)
 print("orig tensor:\n", orig_tensor, "\nshape:", orig_tensor.shape)
@@ -277,7 +279,7 @@ final_depth_im = image_tensor.detach().squeeze().numpy()
 # arr[1].imshow(final_depth_im)
 plt.show()
 
-# savemat("advgrasps.mat", mat_dict)
-
+# savemat("data/advgrasps.mat", mat_dict)
+"""
 
 
