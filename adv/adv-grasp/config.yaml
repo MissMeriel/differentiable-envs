@@ -1,3 +1,5 @@
+# file from dex-net/test/config.yaml: https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/test/config.yaml
+
 # General params
 show_gripper: 1
 max_plot_gripper: 250
