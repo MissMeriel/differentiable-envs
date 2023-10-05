@@ -190,12 +190,20 @@ class Renderer:
 
 		return depth_im
 
-if __name__ == "__main__":
-	# render object
+def test_renderer():
+	# instantiate Renderer object with default parameters
 	renderer1 = Renderer()
-	mesh, image = renderer1.render_object("bar_clamp.obj", display=True, title="render_object")
-	depth_im = renderer1.mesh_to_depth_im(mesh, title="depth_im")
-	renderer1.display(mesh, title="mesh")
-	renderer1.display(image, title="image")
+
+	# test render_obj -> render_mesh -> display mesh
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="testing render_obj -> render_mesh")
+
+	# test mesh_to_depth_im -> display np.array
+	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="testing mesh_to_depth_im")
+
+	return "success"
+
+if __name__ == "__main__":
+	print(test_renderer())
+
 
 
