@@ -1,7 +1,9 @@
 import Pyro4
 import os
 import sys
+import math
 import torch
+from torchvision import transforms
 import numpy as np
 import matplotlib.pyplot as plt
 import skimage
@@ -105,6 +107,7 @@ def transform_im(d_im, cx, cy, translation, angle):
 	trans_mat_aff = np.r_[trans_mat, [[0, 0, 1]]]
 	rot_mat_aff = np.r_[rot_mat, [[0, 0, 1]]]
 	full_mat = rot_mat_aff.dot(trans_mat_aff)
+	# full_mat = trans_mat_aff.dot(rot_mat_aff)	
 	full_mat = full_mat[:2, :]
 
 	# apply transformation with cv2
@@ -174,24 +177,30 @@ def extract_tensors(d_im, grasp):
 	-------
 	torch.tensor: pose_tensor, torch.tensor: image_tensor
 		pose_tensor: 1 x 1 tensor of grasp pose
-		image_tensor: 1 x 32 x 32 x 1 tensor of depth image processed for grasp
+		image_tensor: 1 x 1 x 32 x 32 tensor of depth image processed for grasp
 	"""
-	
+
+	# check type of input_dim
+	if isinstance(d_im, np.ndarray):
+		torch_dim = torch.tensor(d_im, dtype=torch.float64).permute(2, 0, 1)
+
 	# construct pose tensor from grasp depth
-	pose_tensor = np.zeros([1, 1])
+	pose_tensor = torch.zeros([1, 1])
 	pose_tensor[0] = grasp[2]
 
-	# process depth image wrt grasp
+	# process depth image wrt grasp (steps 1-3) 
 	# 1 - resize image tensor
 	np_shape = np.asarray(d_im.shape).astype(np.float32)
-	np_shape[0:2] *= (1/3)	
+	np_shape[0:2] *= (1/3)		# using 1/3 based on gqcnn library - may need to change depending on input
 	output_shape = tuple(np_shape.astype(int))
 	image_tensor = skimage.transform.resize(d_im.astype(np.float64), output_shape, order=1, anti_aliasing=False, mode="constant")
+
+	torch_transform = transforms.Resize(output_shape[0:2], antialias=False) 
+	torch_image_tensor = torch_transform(torch_dim)
 
 	# 2 - translate wrt to grasp angle and grasp center 
 	dim_center_x = d_im.shape[1] // 2
 	dim_center_y = d_im.shape[0] // 2
-	# print("dim center:", dim_center_x, dim_center_y)	
 	translation = (1/3) * np.array([
 		[dim_center_y - grasp[0][1]],
 		[dim_center_x - grasp[0][0]]
@@ -201,7 +210,69 @@ def extract_tensors(d_im, grasp):
 	new_cy = image_tensor.shape[0] // 2
 	dim_rotated = transform_im(image_tensor.squeeze(), new_cx, new_cy, translation, grasp[1]) 
 
+	theta = -1 * math.degrees(grasp[1])
+	
+	dim_cx = torch_dim.shape[2] // 2
+	dim_cy = torch_dim.shape[1] // 2	
+	
+	translate = ((dim_cx - grasp[0][0]) / 3, (dim_cy - grasp[0][1]) / 3)
+
+	cx = torch_image_tensor.shape[2] // 2
+	cy = torch_image_tensor.shape[1] // 2
+
+	torch_translated = transforms.functional.affine(
+		torch_image_tensor,
+		0,		# angle of rotation in degrees clockwise, between -180 and 180 inclusive
+		translate,
+		scale=1,	# no scale
+		shear=0,	# no shear 
+		interpolation=transforms.InterpolationMode.NEAREST,
+		center=(cx, cy)	
+	)
+
+	torch_translated = transforms.functional.affine(
+		torch_translated,
+		theta,
+		translate=(0, 0),
+		scale=1,
+		shear=0,
+		interpolation=transforms.InterpolationMode.NEAREST,
+		center=(cx, cy)
+	)
+
+	"""
+	# CHECK PYTORCH EQUIVALENCE
+	test = torch.tensor(dim_rotated)
+	diff = test - torch_translated
+	print("\ncurrent translation:", test.shape, torch.max(test).item(), torch.min(test).item(), "\n", test)
+	print("\npytorch translation:", torch_translated.shape, torch.max(torch_translated).item(), torch.min(torch_translated).item(), "\n", torch_translated)
+	print("\ndiff:", torch.max(diff).item(), torch.min(diff).item(), diff)
+
+	r = Renderer()
+	torch_np = torch_translated.permute(1,2,0).numpy()
+	r.display(torch_np, title="pytorch")
+	r.display(dim_rotated, title="original")	
+	"""
+
+	# 3 - crop image to size (32, 32)
 	im_cropped = crop_im(dim_rotated, 32, 32)
+
+	print("torch translated", torch_translated.shape, cy-16, cx-16)
+	torch_cropped = transforms.functional.crop(torch_translated, cy-16, cx-16, 32, 32)
+
+	# CHECK PYTORCH EQUIVALENCE
+	t = torch_cropped.squeeze(0)
+	test = torch.tensor(im_cropped)
+	diff = test - torch_cropped
+	print("original:", test.shape, torch.max(test).item(), torch.min(test).item())
+	print("pytorch:", t.shape, torch.max(t).item(), torch.min(t).item())
+	print("diff:", torch.max(diff).item(), torch.min(diff).item(), diff)
+
+	r = Renderer()
+	t = torch_cropped.squeeze(0).numpy()
+	# r.display(torch_translated.squeeze(0).numpy())	
+	r.display(t, title="pytorch")
+	r.display(im_cropped, title="original")
 
 	return pose_tensor, im_cropped  
 	
@@ -219,8 +290,8 @@ if __name__ == "__main__":
 	grasp = [(416, 286), -2.896613990462929, 0.607433762324266]	
 
 	pose, image = extract_tensors(depth0, grasp)	
-	print("image tensor:", image)
-	print("pose tensor:", pose)
+	# print("image tensor:", image)
+	# print("pose tensor:", pose)
 
 
 	"""
