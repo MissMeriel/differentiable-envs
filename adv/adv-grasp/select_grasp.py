@@ -10,6 +10,7 @@ import skimage
 import cv2
 import PIL.Image as PImage
 from render import *
+from run_gqcnn import *
 
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
@@ -182,7 +183,7 @@ def extract_tensors(d_im, grasp):
 
 	# check type of input_dim
 	if isinstance(d_im, np.ndarray):
-		torch_dim = torch.tensor(d_im, dtype=torch.float64).permute(2, 0, 1)
+		torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1)
 
 	# construct pose tensor from grasp depth
 	pose_tensor = torch.zeros([1, 1])
@@ -256,10 +257,11 @@ def extract_tensors(d_im, grasp):
 
 	# 3 - crop image to size (32, 32)
 	im_cropped = crop_im(dim_rotated, 32, 32)
+	im_cropped = torch.from_numpy(im_cropped).float().unsqueeze(0).unsqueeze(0)
 
-	print("torch translated", torch_translated.shape, cy-16, cx-16)
 	torch_cropped = transforms.functional.crop(torch_translated, cy-16, cx-16, 32, 32)
 
+	"""
 	# CHECK PYTORCH EQUIVALENCE
 	t = torch_cropped.squeeze(0)
 	test = torch.tensor(im_cropped)
@@ -273,8 +275,9 @@ def extract_tensors(d_im, grasp):
 	# r.display(torch_translated.squeeze(0).numpy())	
 	r.display(t, title="pytorch")
 	r.display(im_cropped, title="original")
+	"""
 
-	return pose_tensor, im_cropped  
+	return pose_tensor, im_cropped, torch_cropped  
 	
 if __name__ == "__main__":
 	# renderer1 = Renderer()
@@ -289,10 +292,19 @@ if __name__ == "__main__":
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
 	grasp = [(416, 286), -2.896613990462929, 0.607433762324266]	
 
-	pose, image = extract_tensors(depth0, grasp)	
-	# print("image tensor:", image)
-	# print("pose tensor:", pose)
+	pose, image1, image2 = extract_tensors(depth0, grasp)
+	image2 = image2.unsqueeze(0)
+	
+	print("pose:", pose.shape)
+	print("gqcnn image:", image1.dtype, image1.shape)
+	print("pytorch image:", image2.dtype, image2.shape)	
 
+	# test gqcnn prediction on pytorch vs gqcnn processed depth images
+	model = KitModel("weights.npy")
+	model.eval()
+	run1 = Attack(model=model)
+	print("gqcnn:", run1.run(pose, image1))
+	print("pytorch:", run1.run(pose, image2))
 
 	"""
 	# testing by comparing output to saved output from gqcnn - SUCCESS 
