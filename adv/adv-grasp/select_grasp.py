@@ -238,7 +238,7 @@ def extract_tensors(d_im, grasp):
 		scale=1,
 		shear=0,
 		interpolation=transforms.InterpolationMode.NEAREST,
-		center=(cx, cy)
+		# center=(cx-translate[0], cy-translate[1])
 	)
 
 	"""
