@@ -6,7 +6,7 @@ from pytorch3d.io import load_obj
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
 	look_at_view_transform,
-	FoVPerspectiveCameras,
+	PerspectiveCameras,
 	MeshRenderer,
 	MeshRasterizer,
 	SoftPhongShader,
@@ -30,19 +30,26 @@ class Renderer:
 		if lights:
 			self.lights = lights
 		else:
-			self.lights = PointLights(device=self.device, location=[[0.0, 0.0, -3.0]])
+			self.lights = PointLights(device=self.device, location=[[0.0, 0.0, 3.0]])
 		
 		if camera:
 			self.camera = camera
 		else:
-			R, T = look_at_view_transform(dist=0.7, elev=90, azim=180)
-			self.camera = FoVPerspectiveCameras(device=self.device, R=R, T=T)
+			# R, T = look_at_view_transform(dist=0.7, elev=90, azim=180)
+			R, T = look_at_view_transform(dist=0.6, elev=90, azim=0)	# camera located above object, pointing down
+
+			# camera intrinsics
+			fl = torch.tensor([[525.0]])
+			pp = torch.tensor([[319.5, 239.5]]) 
+			im_size = torch.tensor([[480, 640]])
+ 
+			self.camera = PerspectiveCameras(focal_length=fl, principal_point=pp, in_ndc=False, image_size=im_size, device=self.device, R=R, T=T)[0]
 
 		if raster_settings:
 			self.raster_settings = raster_settings
 		else:
 			self.raster_settings = RasterizationSettings(
-				image_size=512,
+				image_size=(480, 640), 	# image size (H, W) in pixels 
 				blur_radius=0.0,
 				faces_per_pixel=1
 			)
@@ -160,7 +167,7 @@ class Renderer:
 
 	def mesh_to_depth_im(self, mesh, display=True, title=None):
 		"""
-		Converts a Mesh to a noramlized 512 x 512 numpy depth image (values between 0 and 1) and optionally displays it.
+		Converts a Mesh to a noramlized 480 x 640 numpy depth image (values between 0 and 1) and optionally displays it.
 		Parameters
 		----------
 		mesh: pytorch.structures.meshes.Meshes
@@ -172,7 +179,7 @@ class Renderer:
 		Returns
 		-------
 		numpy.ndarray
-			512 x 512 numpy array representing normalized depth image (values between 0 and 1 inclusive)
+			480 x 640 numpy array representing normalized depth image (values between 0 and 1 inclusive)
 		"""	
 
 		if not isinstance(mesh, Meshes):
@@ -204,6 +211,7 @@ def test_renderer():
 
 if __name__ == "__main__":
 	print(test_renderer())
+
 
 
 
