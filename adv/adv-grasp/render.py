@@ -167,7 +167,7 @@ class Renderer:
 
 	def mesh_to_depth_im(self, mesh, display=True, title=None):
 		"""
-		Converts a Mesh to a noramlized 480 x 640 numpy depth image (values between 0 and 1) and optionally displays it.
+		Converts a Mesh to a noramlized 480 x 640 numpy depth image and optionally displays it.
 		Parameters
 		----------
 		mesh: pytorch.structures.meshes.Meshes
@@ -190,8 +190,10 @@ class Renderer:
 		depth_im = depth_im.cpu().detach().numpy()
 
 		# normalize
-		depth_im = (depth_im-np.min(depth_im))/(np.max(depth_im)-np.min(depth_im))
-
+		# depth_im = (depth_im-np.min(depth_im))/(np.max(depth_im)-np.min(depth_im))
+		max_depth = np.max(depth_im)	
+		depth_im[depth_im == -1] = max_depth 	
+ 
 		if display:
 			self.display(depth_im, title=title)
 
@@ -202,10 +204,17 @@ def test_renderer():
 	renderer1 = Renderer()
 
 	# test render_obj -> render_mesh -> display mesh
-	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="testing render_obj -> render_mesh")
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="testing render_obj -> render_mesh")
 
 	# test mesh_to_depth_im -> display np.array
 	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="testing mesh_to_depth_im")
+	print("depth im values:", np.max(depth_im), np.min(depth_im))
+	print(depth_im)
+
+	depth_ex = np.load("data/depth_0.npy")
+	print("\ngqcnn depth im:", np.max(depth_ex), np.min(depth_ex))
+	print(depth_ex)
+	renderer1.display(depth_ex, title="gqcnn depth_0")
 
 	return "success"
 
