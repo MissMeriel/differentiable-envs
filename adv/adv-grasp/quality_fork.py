@@ -338,7 +338,7 @@ def test_quality():
 
 	# load Grasp2D 
 	# camera_intr = CameraIntrinsics.load("data/primesense.intr") 
-	grasp = Grasp2D(np.array([416, 286]), -2.896613990462929, 0.607433762324266, 0.05, 0) 
+	grasp = Grasp2D(np.array([290, 290]), 0, 0.55, 0.05, 0) 
 
 	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 	config_dict = {
