@@ -1,7 +1,3 @@
-# imports for gqcnn/autolab functions
-from gqcnn_grasp import Grasp2D
-
-# other imports
 import torch
 import numpy as np
 from pytorch3d.io import load_obj
@@ -16,6 +12,126 @@ from pytorch3d.renderer import (
         PointLights,
         TexturesVertex
 )
+
+
+# Grasp2D class copied from: https://github.com/BerkeleyAutomation/gqcnn/blob/master/gqcnn/grasping/grasp.py
+class Grasp2D(object):
+    """Parallel-jaw grasp in image space.
+
+    Attributes
+    ----------
+    center : :obj:`autolab_core.Point`
+        Point in image space.
+    angle : float
+        Grasp axis angle with the camera x-axis.
+    depth : float
+        Depth of the grasp center in 3D space.
+    width : float
+        Distance between the jaws in meters.
+    camera_intr : :obj:`autolab_core.CameraIntrinsics`
+        Frame of reference for camera that the grasp corresponds to.
+    contact_points : list of :obj:`numpy.ndarray`
+        Pair of contact points in image space.
+    contact_normals : list of :obj:`numpy.ndarray`
+        Pair of contact normals in image space.
+    """
+
+    def __init__(self,
+                 center,
+                 angle=0.0,
+                 depth=1.0,
+                 width=0.0,
+                 camera_intr=None,
+                 contact_points=None,
+                 contact_normals=None):
+        self.center = center
+        self.angle = angle
+        self.depth = depth
+        self.width = width
+
+        # If `camera_intr` is none use default primesense camera intrinsics.
+        """
+	# don't have CameraIntrinsics import, but can get info from PyTorch camera
+        if not camera_intr:
+            self.camera_intr = CameraIntrinsics("primesense_overhead",
+                                                fx=525,
+                                                fy=525,
+                                                cx=319.5,
+                                                cy=239.5,
+                                                width=640,
+                                                height=480)
+        else:
+            self.camera_intr = camera_intr
+	"""
+        self.camera_intr = camera_intr
+
+
+        self.contact_points = contact_points
+        self.contact_normals = contact_normals
+
+        """
+        frame = "image"
+        if camera_intr is not None:
+            frame = camera_intr.frame
+        if isinstance(center, np.ndarray):
+            self.center = Point(center, frame=frame)
+        """
+
+    @property
+    def axis(self):
+        """Returns the grasp axis."""
+        return np.array([np.cos(self.angle), np.sin(self.angle)])
+
+    @property
+    def approach_axis(self):
+        return np.array([0, 0, 1])
+
+    @property
+    def approach_angle(self):
+        """The angle between the grasp approach axis and camera optical axis.
+        """
+        return 0.0
+
+    @property
+    def frame(self):
+        """The name of the frame of reference for the grasp."""
+        if self.camera_intr is None:
+
+            raise ValueError("Must specify camera intrinsics")
+        return self.camera_intr.frame
+
+    @property
+    def width_px(self):
+        """Returns the width in pixels."""
+        if self.camera_intr is None:
+            missing_camera_intr_msg = ("Must specify camera intrinsics to"
+                                       " compute gripper width in 3D space.")
+            raise ValueError(missing_camera_intr_msg)
+        # Form the jaw locations in 3D space at the given depth.
+        p1 = Point(np.array([0, 0, self.depth]), frame=self.frame)
+        p2 = Point(np.array([self.width, 0, self.depth]), frame=self.frame)
+
+        # Project into pixel space.
+        u1 = self.camera_intr.project(p1)
+        u2 = self.camera_intr.project(p2)
+        return np.linalg.norm(u1.data - u2.data)
+
+    @property
+    def endpoints(self):
+        """Returns the grasp endpoints."""
+        p1 = self.center.data - (self.width_px / 2) * self.axis
+        p2 = self.center.data + (self.width_px / 2) * self.axis
+        return p1, p2
+
+    @property
+    def feature_vec(self):
+        """Returns the feature vector for the grasp.
+
+        `v = [p1, p2, depth]` where `p1` and `p2` are the jaw locations in
+        image space.
+        """
+        p1, p2 = self.endpoints
+        return np.r_[p1, p2, self.depth]
 
 
 class GraspQualityFunction():	#ABC):
