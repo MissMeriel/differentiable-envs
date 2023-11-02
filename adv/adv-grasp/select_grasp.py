@@ -9,6 +9,9 @@ import matplotlib.pyplot as plt
 import skimage
 import cv2
 import PIL.Image as PImage
+
+from pytorch3d.ops import sample_points_from_meshes
+
 from render import *
 from run_gqcnn import *
 
@@ -46,7 +49,7 @@ def preprocess_dim(d_im):
 
 	return None	
 
-def sample_grasps(dim_file, num_samples, min_qual=0.5, max_qual=1.0):
+def sample_grasps(mesh, num_samples, camera, min_qual=0.5, max_qual=1.0):
 	"""
 	Samples grasps using dexnet oracle and returns grasps with qualities between min_qual and max_qual
 	  inclusive. Contains RPC to oracle.py in running docker container.
@@ -60,12 +63,47 @@ def sample_grasps(dim_file, num_samples, min_qual=0.5, max_qual=1.0):
 		Float between 0.0 and 1.0, minimum quality for returned grasps, defaults to 0.5
 	max_qual: float
 		Float between 0.0 and 1.0, maximum quality for returned grasps, defaults to 1.0
+	camera: pytorch3d.renderer.cameras.CameraBase
+		Camera to convert grasp info to image space	
 	Returns
 	-------
 	List of lists containing grasps of the object with quality between min_qual and max_qual inclusive
 	[[float: grasp_quality, float: grasp_center, float: grasp_depth, float: grasp_angle, float:
 	   grasp_depth, float: gripper_width], ...]
 	"""
+
+	g = []
+
+	while len(g) < num_samples:
+
+		# randomly get two surface points to test for grasping
+		samples = sample_points_from_meshes(mesh, 2)[0] 
+		p0 = samples[0] 
+		p1 = samples[1]
+
+		v_norm = torch.linalg.vector_norm(p1 - p0)	
+		if v_norm.item() > 0.0 and v_norm.item() < 0.05: # does grasp fit in gripper?
+
+			print("samples:", samples)
+	
+			world_center = (p0 + p1) / 2
+			world_axis = (p1 - p0) / v_norm
+			print("world center:", world_center, "\nworld axis:", world_axis)	
+
+			# convert to camera space
+			im_coords = camera.transform_points(samples)
+			im_center = im_coords[0] 
+			im_axis = im_coords[1]  
+			print("image center:", im_center, "\nimage axis:", im_axis)
+
+			# can fingers close?
+
+			# create grasp
+			angle = 0
+			grasp = [(im_center[0].item(), im_center[1].item()), angle, im_center[2].item()]  
+			print("grasp:", grasp)
+
+			g.append([0])
 
 	return None
 
@@ -120,7 +158,7 @@ def transform_im(d_im, cx, cy, translation, angle):
 		flags=cv2.INTER_NEAREST
 	)
 
-	return image, trans_mat_aff  
+	return image  
 
 def crop_im(d_im, height, width):
 	"""
@@ -210,7 +248,7 @@ def extract_tensors(d_im, grasp):
 	
 	new_cx = image_tensor.shape[1] // 2
 	new_cy = image_tensor.shape[0] // 2
-	dim_rotated, cv_mat = transform_im(image_tensor.squeeze(), new_cx, new_cy, translation, grasp[1]) 
+	dim_rotated = transform_im(image_tensor.squeeze(), new_cx, new_cy, translation, grasp[1]) 
 
 	theta = -1 * math.degrees(grasp[1])
 	
@@ -242,17 +280,6 @@ def extract_tensors(d_im, grasp):
 		center=(cx, cy)
 	)
 
-
-	# check PyTorch rotation matrix
-	center = [cx, cy]	
-	_, height, width = transforms.functional.get_dimensions(torch_translated)
-	center_f = [1.0 * (c - s * 0.5) for c, s in zip(center, [width, height])]
-	check_rot = transforms.functional._get_inverse_affine_matrix(center_f, theta, (0, 0), 1, [0, 0], False) 
-	# print("\nPyTorch rotation matrix:", check_rot)
-
-	# test_full_mat = torch.matmul(torch.tensor([check_rot[0:3], check_rot[3:]]).float(), torch.from_numpy(cv_mat).float()).tolist()
-	# test_full_mat = test_full_mat[0] + test_full_mat[1] 
-	# torch_translated = transforms._functional_tensor.affine(torch_image_tensor, test_full_mat) 	
 
 	"""
 	# CHECK PYTORCH EQUIVALENCE
@@ -299,8 +326,8 @@ def extract_tensors(d_im, grasp):
 	return pose_tensor, im_cropped, torch_cropped  
 	
 if __name__ == "__main__":
-	# renderer1 = Renderer()
-	# mesh, image = renderer1.render_object("bar_clamp.obj", display=True, title="imported renderer")
+	renderer1 = Renderer()
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
 	# d_im = renderer1.mesh_to_depth_im(mesh, display=False)
 
 	# Pyro4.config.COMMTIMEOUT = None
@@ -308,6 +335,7 @@ if __name__ == "__main__":
 	# print(server.test_extraction("depth_0.npy"))
 	# print(server.gqcnn_sample_grasps("depth_0.npy", 100))
 
+	"""
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
 	grasp = [(416, 286), -2.896613990462929, 0.607433762324266]	
 
@@ -324,18 +352,8 @@ if __name__ == "__main__":
 	run1 = Attack(model=model)
 	print("gqcnn:", run1.run(pose, image1))
 	print("pytorch:", run1.run(pose, image2))
-
 	"""
-	# testing by comparing output to saved output from gqcnn - SUCCESS 
-	print("\nCOMPARISON")
-
-	test = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/cropped_test.npy", allow_pickle=True)
-	print("tensor difference")
-	tens_diff = test.squeeze() - image
-	print(tens_diff)
-	print(np.max(tens_diff))
-	print(np.min(tens_diff))
-	"""	
-
+	
+	sample_grasps(mesh, 1, camera=renderer1.camera)
 
 
