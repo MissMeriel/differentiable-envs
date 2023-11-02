@@ -1,17 +1,30 @@
 # imports for gqcnn/autolab functions
-from autolab_core import Point
-from perception import CameraIntrinsics
-from gqcnn.grasping import Grasp2D
+from gqcnn_grasp import Grasp2D
 
-# imports from our own code
-from render import *
+# other imports
+import torch
+import numpy as np
+from pytorch3d.io import load_obj
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (
+        look_at_view_transform,
+        PerspectiveCameras,
+        MeshRenderer,
+        MeshRasterizer,
+        SoftPhongShader,
+        RasterizationSettings,
+        PointLights,
+        TexturesVertex
+)
+
 
 class GraspQualityFunction():	#ABC):
     """Abstract grasp quality class."""
 
     def __init__(self):
-        # Set up logger.
-        self._logger = Logger.get_logger(self.__class__.__name__)
+        # Set up logger - can't because it's from autolab_core.
+        # self._logger = Logger.get_logger(self.__class__.__name__)
+        self._logger = 0
 
     def __call__(self, state, actions, params=None):
         """Evaluates grasp quality for a set of actions given a state."""
@@ -150,18 +163,74 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         return np.array(qualities)
 
 
+def pytorch_setup():
+        # set PyTorch device, use cuda if available
+        if torch.cuda.is_available():
+                device = torch.device("cuda:0")
+                torch.cuda.set_device(device)
+        else:
+                print("cuda not available")
+                device = torch.device("cpu")
+
+        lights = PointLights(device=device, location=[[0.0, 0.0, 3.0]])
+
+	# camera with info from gqcnn primesense
+        R, T = look_at_view_transform(dist=0.6, elev=90, azim=0)        # camera located above object, pointing down
+        fl = torch.tensor([[525.0]])
+        pp = torch.tensor([[319.5, 239.5]])
+        im_size = torch.tensor([[480, 640]])
+
+        camera = PerspectiveCameras(focal_length=fl, principal_point=pp, in_ndc=False, image_size=im_size, device=device, R=R, T=T)[0]
+
+        raster_settings = RasterizationSettings(
+                 image_size=(480, 640),  # image size (H, W) in pixels
+                 blur_radius=0.0,
+                 faces_per_pixel=1
+        )
+
+        rasterizer = MeshRasterizer(
+                 cameras = camera,
+                 raster_settings = raster_settings
+        )
+
+        renderer = MeshRenderer(
+                 rasterizer = rasterizer,
+                 shader = SoftPhongShader(
+                          device = device,
+                          cameras = camera,
+                          lights = lights
+                 )
+        )
+	
+        return renderer, device	
+	
 def test_quality():
 	# load PyTorch3D mesh from .obj file
-	renderer1 = Renderer()
-	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False)
+	renderer, device = pytorch_setup()
+
+	verts, faces_idx, _ = load_obj("data/bar_clamp.obj")
+	faces = faces_idx.verts_idx
+	verts_rgb = torch.ones_like(verts)[None]
+	textures = TexturesVertex(verts_features=verts_rgb.to(device))
+
+	mesh = Meshes(
+		verts=[verts.to(device)],
+		faces=[faces.to(device)],
+		textures=textures
+	)
+
 
 	# load Grasp2D 
-	camera_intr = CameraIntrinsics.load("data/primesense.intr") 
-	grasp = Grasp2D(Point(np.array([416, 286])), -2.896613990462929, 0.607433762324266, 0.05, camera_intr) 
+	# camera_intr = CameraIntrinsics.load("data/primesense.intr") 
+	grasp = Grasp2D(np.array([416, 286]), -2.896613990462929, 0.607433762324266, 0.05, 0) 
 
-	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn
-	config = YamlConfig("data/dexnet-21-cfg.yaml") 		# file from gqcnn/cfg/examples/replication/dex-net_2.1.yaml	
-	com_qual_func = ComForceClosureParallelQualityFunction(config["policy"]["metric"])
+	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
+	config_dict = {
+		"friction_coef": 0.8,
+		"antipodality_pctile": 1.0 
+	}
+	
+	com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
 
 	# Call quality with the Grasp2D and mesh
 	com_qual_func.quality(mesh, grasp)
