@@ -104,11 +104,12 @@ def transform_im(d_im, cx, cy, translation, angle):
 		(cx, cy), theta, 1
 	)
 
+	# print("OpenCV rotation matrix:", rot_mat)
+
 	# convert to 3x3 matrices and combine transformations w/ matrix multiplication then revert to 2x3 
 	trans_mat_aff = np.r_[trans_mat, [[0, 0, 1]]]
 	rot_mat_aff = np.r_[rot_mat, [[0, 0, 1]]]
 	full_mat = rot_mat_aff.dot(trans_mat_aff)
-	# full_mat = trans_mat_aff.dot(rot_mat_aff)	
 	full_mat = full_mat[:2, :]
 
 	# apply transformation with cv2
@@ -119,7 +120,7 @@ def transform_im(d_im, cx, cy, translation, angle):
 		flags=cv2.INTER_NEAREST
 	)
 
-	return image 
+	return image, trans_mat_aff  
 
 def crop_im(d_im, height, width):
 	"""
@@ -209,7 +210,7 @@ def extract_tensors(d_im, grasp):
 	
 	new_cx = image_tensor.shape[1] // 2
 	new_cy = image_tensor.shape[0] // 2
-	dim_rotated = transform_im(image_tensor.squeeze(), new_cx, new_cy, translation, grasp[1]) 
+	dim_rotated, cv_mat = transform_im(image_tensor.squeeze(), new_cx, new_cy, translation, grasp[1]) 
 
 	theta = -1 * math.degrees(grasp[1])
 	
@@ -230,7 +231,7 @@ def extract_tensors(d_im, grasp):
 		interpolation=transforms.InterpolationMode.NEAREST,
 		center=(cx, cy)	
 	)
-
+	
 	torch_translated = transforms.functional.affine(
 		torch_translated,
 		theta,
@@ -238,8 +239,20 @@ def extract_tensors(d_im, grasp):
 		scale=1,
 		shear=0,
 		interpolation=transforms.InterpolationMode.NEAREST,
-		# center=(cx-translate[0], cy-translate[1])
+		center=(cx, cy)
 	)
+
+
+	# check PyTorch rotation matrix
+	center = [cx, cy]	
+	_, height, width = transforms.functional.get_dimensions(torch_translated)
+	center_f = [1.0 * (c - s * 0.5) for c, s in zip(center, [width, height])]
+	check_rot = transforms.functional._get_inverse_affine_matrix(center_f, theta, (0, 0), 1, [0, 0], False) 
+	# print("\nPyTorch rotation matrix:", check_rot)
+
+	# test_full_mat = torch.matmul(torch.tensor([check_rot[0:3], check_rot[3:]]).float(), torch.from_numpy(cv_mat).float()).tolist()
+	# test_full_mat = test_full_mat[0] + test_full_mat[1] 
+	# torch_translated = transforms._functional_tensor.affine(torch_image_tensor, test_full_mat) 	
 
 	"""
 	# CHECK PYTORCH EQUIVALENCE
@@ -247,19 +260,24 @@ def extract_tensors(d_im, grasp):
 	diff = test - torch_translated
 	print("\ncurrent translation:", test.shape, torch.max(test).item(), torch.min(test).item(), "\n", test)
 	print("\npytorch translation:", torch_translated.shape, torch.max(torch_translated).item(), torch.min(torch_translated).item(), "\n", torch_translated)
-	print("\ndiff:", torch.max(diff).item(), torch.min(diff).item(), diff)
+	print("\ndiff:", torch.max(diff).item(), torch.min(diff).item())
+	print("\nnon-zero elements:", torch.count_nonzero(diff).item())
 
-	r = Renderer()
 	torch_np = torch_translated.permute(1,2,0).numpy()
-	r.display(torch_np, title="pytorch")
-	r.display(dim_rotated, title="original")	
+	diff_np = diff.permute(1,2,0).numpy() 	
+	import matplotlib.pyplot as plt
+	_, arr = plt.subplots(1, 3)
+	arr[0].imshow(torch_np)
+	arr[1].imshow(dim_rotated)	
+	arr[2].imshow(diff_np)
+	plt.show()
 	"""
 
 	# 3 - crop image to size (32, 32)
 	im_cropped = crop_im(dim_rotated, 32, 32)
 	im_cropped = torch.from_numpy(im_cropped).float().unsqueeze(0).unsqueeze(0)
 
-	torch_cropped = transforms.functional.crop(torch_translated, cy-16, cx-16, 32, 32)
+	torch_cropped = transforms.functional.crop(torch_translated, cy-17, cx-17, 32, 32)
 
 	"""
 	# CHECK PYTORCH EQUIVALENCE
@@ -270,11 +288,12 @@ def extract_tensors(d_im, grasp):
 	print("pytorch:", t.shape, torch.max(t).item(), torch.min(t).item())
 	print("diff:", torch.max(diff).item(), torch.min(diff).item(), diff)
 
-	r = Renderer()
 	t = torch_cropped.squeeze(0).numpy()
-	# r.display(torch_translated.squeeze(0).numpy())	
-	r.display(t, title="pytorch")
-	r.display(im_cropped, title="original")
+	_, arr = plt.subplots(1, 3)
+	arr[0].imshow(t)
+	arr[1].imshow(im_cropped.squeeze())
+	arr[2].imshow(diff.squeeze(0).permute(1,2,0).numpy())
+	plt.show()	
 	"""
 
 	return pose_tensor, im_cropped, torch_cropped  
@@ -295,9 +314,9 @@ if __name__ == "__main__":
 	pose, image1, image2 = extract_tensors(depth0, grasp)
 	image2 = image2.unsqueeze(0)
 	
-	print("pose:", pose.shape)
-	print("gqcnn image:", image1.dtype, image1.shape)
-	print("pytorch image:", image2.dtype, image2.shape)	
+	# print("pose:", pose.shape)
+	# print("gqcnn image:", image1.dtype, image1.shape)
+	# print("pytorch image:", image2.dtype, image2.shape)	
 
 	# test gqcnn prediction on pytorch vs gqcnn processed depth images
 	model = KitModel("weights.npy")
