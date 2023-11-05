@@ -88,20 +88,36 @@ def sample_grasps(mesh, num_samples, camera, min_qual=0.5, max_qual=1.0):
 	
 			world_center = (p0 + p1) / 2
 			world_axis = (p1 - p0) / v_norm
-			print("world center:", world_center, "\nworld axis:", world_axis)	
+			world_points = torch.stack((world_center, world_axis))
+			# print("\nworld points:\n", world_points)
 
 			# convert to camera space
-			im_coords = camera.transform_points(samples)
-			im_center = im_coords[0] 
-			im_axis = im_coords[1]  
-			print("image center:", im_center, "\nimage axis:", im_axis)
-
-			# can fingers close?
+			im_points = camera.transform_points(world_points)
+			for i in range(im_points.shape[0]):		# fix depth value
+				im_points[i][2] = 1/im_points[i][2]
+			im_center = im_points[0]
+			im_axis = im_points[1]
+			
+			"""
+			# ORIGIN TEST FOR DEBUGGING
+			origin_test = camera.transform_points(torch.zeros([2,3]).to(camera.device))[0]
+			origin_test[2] = 1/origin_test[2]
+			# print("\norigin test:", origin_test)  
+			# print(camera.get_full_projection_transform().get_matrix())
+			# print("transform  points:", camera.get_full_projection_transform().transform_points(torch.zeros([2,3]).to(camera.device)))
+			# tens = torch.tensor([[0.0], [0.0], [0.0], [1.0]]).to(camera.device)
+			# print(torch.matmul(camera.get_full_projection_transform().get_matrix(), tens))
+			# print("world to view transform:", camera.get_world_to_view_transform().transform_points(torch.zeros([2,3]).to(camera.device)))
+			"""
 
 			# create grasp
 			angle = 0
 			grasp = [(im_center[0].item(), im_center[1].item()), angle, im_center[2].item()]  
 			print("grasp:", grasp)
+
+			# can fingers close?
+			# 1) create lines of action (two total - one for each gripper finger) 
+			# 2) find contacts along lines of action - approx method from gqcnn or implement exact method with COM 
 
 			g.append([0])
 
@@ -328,7 +344,7 @@ def extract_tensors(d_im, grasp):
 if __name__ == "__main__":
 	renderer1 = Renderer()
 	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
-	# d_im = renderer1.mesh_to_depth_im(mesh, display=False)
+	d_im = renderer1.mesh_to_depth_im(mesh, display=False)
 
 	# Pyro4.config.COMMTIMEOUT = None
 	# server = Pyro4.Proxy("PYRO:Server@localhost:5000")
@@ -353,7 +369,7 @@ if __name__ == "__main__":
 	print("gqcnn:", run1.run(pose, image1))
 	print("pytorch:", run1.run(pose, image2))
 	"""
-	
+
 	sample_grasps(mesh, 1, camera=renderer1.camera)
 
 
