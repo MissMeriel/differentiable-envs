@@ -65,8 +65,7 @@ def sample_grasps(mesh, num_samples, camera, min_qual=0.5, max_qual=1.0):
 	Returns
 	-------
 	List of lists containing grasps of the object with quality between min_qual and max_qual inclusive
-	[[float: grasp_quality, float: grasp_center, float: grasp_depth, float: grasp_angle, float:
-	   grasp_depth, float: gripper_width], ...]
+	[[float: grasp_quality, float: grasp_center, float: grasp_axis, float: grasp_depth], ...]
 	"""
 
 	g = []
@@ -80,43 +79,48 @@ def sample_grasps(mesh, num_samples, camera, min_qual=0.5, max_qual=1.0):
 
 		v_norm = torch.linalg.vector_norm(p1 - p0)	
 		if v_norm.item() > 0.0 and v_norm.item() < 0.05: # does grasp fit in gripper?
-
-			print("samples:", samples)
 	
+			# computer grasp center and axis
 			world_center = (p0 + p1) / 2
 			world_axis = (p1 - p0) / v_norm
 			world_points = torch.stack((world_center, world_axis))
-			# print("\nworld points:\n", world_points)
 
-			# convert to camera space
-			im_points = camera.transform_points(world_points)
-			for i in range(im_points.shape[0]):		# fix depth value
-				im_points[i][2] = 1/im_points[i][2]
-			im_center = im_points[0]
-			im_axis = im_points[1]
-			
-			"""
-			# ORIGIN TEST FOR DEBUGGING
-			origin_test = camera.transform_points(torch.zeros([2,3]).to(camera.device))[0]
-			origin_test[2] = 1/origin_test[2]
-			# print("\norigin test:", origin_test)  
-			# print(camera.get_full_projection_transform().get_matrix())
-			# print("transform  points:", camera.get_full_projection_transform().transform_points(torch.zeros([2,3]).to(camera.device)))
-			# tens = torch.tensor([[0.0], [0.0], [0.0], [1.0]]).to(camera.device)
-			# print(torch.matmul(camera.get_full_projection_transform().get_matrix(), tens))
-			# print("world to view transform:", camera.get_world_to_view_transform().transform_points(torch.zeros([2,3]).to(camera.device)))
-			"""
+			# get close_fingers result and quality from gqcnn
+			Pyro4.config.COMMTIMEOUT = None
+			server = Pyro4.Proxy("PYRO:Server@localhost:5000")
+			save_nparr(world_center.detach().cpu().numpy(), "temp_center.npy")
+			save_nparr(world_axis.detach().cpu().numpy(), "temp_axis.npy")
+			success, quality = server.close_fingers("temp_center.npy", "temp_axis.npy")
 
-			# create grasp
-			angle = 0
-			grasp = [(im_center[0].item(), im_center[1].item()), angle, im_center[2].item()]  
-			print("grasp:", grasp)
+			if success and quality >= min_qual:
+				print("\n\nsamples:", samples)
+				print("world depth:", world_center[2])
+
+				# convert to camera space
+				im_points = camera.transform_points(world_points)
+				for i in range(im_points.shape[0]):		# fix depth value
+					im_points[i][2] = 1/im_points[i][2]
+				im_center = im_points[0]
+				im_axis = im_points[1]
+				depth = im_center[2].item()
+
+				# grasp in world coordinates
+				world_g = [quality, world_center, world_axis, depth]
+
+				# grasp in image coordinates
+				im_g = [quality, im_center, im_axis, depth]
+				print("\nworld grasp:\n", world_g, "\nimage grasp:\n", im_g)
+
+				g.append([0])
+
+			# create grasp object
+			# angle = 0
+			# grasp = [(im_center[0].item(), im_center[1].item()), angle, im_center[2].item()]  
+			# print("grasp:", grasp)
 
 			# can fingers close?
 			# 1) create lines of action (two total - one for each gripper finger) 
 			# 2) find contacts along lines of action - approx method from gqcnn or implement exact method with COM 
-
-			g.append([0])
 
 	return None 
 
@@ -152,7 +156,7 @@ def extract_tensors(d_im, grasp):
 	
 	# 1 - resize image tensor
 	out_shape = torch.tensor([torch_dim.shape], dtype=torch.float32)
-	out_shape *= (1/3)
+	out_shape *= (1/3)		# using 1/3 based on gqcnn library - may need to change depending on input
 	out_shape = tuple(out_shape.type(torch.int)[0][1:].numpy())
 
 	torch_transform = transforms.Resize(out_shape, antialias=False) 
@@ -170,6 +174,7 @@ def extract_tensors(d_im, grasp):
 	cx = torch_image_tensor.shape[2] // 2
 	cy = torch_image_tensor.shape[1] // 2
 
+	# keep as two separate transformations so translation is performed before rotation
 	torch_translated = transforms.functional.affine(
 		torch_image_tensor,
 		0,		# angle of rotation in degrees clockwise, between -180 and 180 inclusive
@@ -198,15 +203,25 @@ def extract_tensors(d_im, grasp):
 	return pose_tensor, image_tensor  
 	
 if __name__ == "__main__":
-	renderer1 = Renderer()
-	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
-	d_im = renderer1.mesh_to_depth_im(mesh, display=False)
-
 	# Pyro4.config.COMMTIMEOUT = None
 	# server = Pyro4.Proxy("PYRO:Server@localhost:5000")
 	# print(server.test_extraction("depth_0.npy"))
 	# print(server.gqcnn_sample_grasps("depth_0.npy", 100))
+	# print(server.add(3,4))
+	# print("meshpy principal dims:\n", server.close_fingers(0))
 
+	renderer1 = Renderer()
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
+	
+	# bboxes = mesh.get_bounding_boxes()[0]
+	# print("\nPyTorch bboxes:")
+	# for i in range(3):
+	#	box = tuple(bboxes[i])
+	#	print(box[1] - box[0])
+
+	# d_im = renderer1.mesh_to_depth_im(mesh, display=False)
+
+	"""
 	# testing tensor extraction and gqcnn prediction
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
 	grasp = [(416, 286), -2.896613990462929, 0.607433762324266]	
@@ -215,7 +230,8 @@ if __name__ == "__main__":
 	model.eval()
 	run1 = Attack(model=model)
 	print("prediction:", run1.run(pose, image))		# gqcnn prediction
+	"""
 	
-	# sample_grasps(mesh, 1, camera=renderer1.camera)
+	sample_grasps(mesh, 2, camera=renderer1.camera)
 
 
