@@ -1,6 +1,7 @@
 import numpy as np
 from render import *
 from gqcnn_pytorch import KitModel
+from select_grasp import *
 
 class Attack: 
 
@@ -25,7 +26,7 @@ class Attack:
 		torch.tensor: {batch_size} where entries indicate grasp quality prediction by model
 		"""
 
-		return self.model(pose_tensor, image_tensor)[:, -1] 
+		return self.model(pose_tensor, image_tensor)[0] 
 
 	def calc_loss(self, pose_tensor, image_tensor, oracle_pred):
 		"""
@@ -82,7 +83,19 @@ def test_run():
 	# load input tensors for prediction
 	input_pose = torch.from_numpy(np.load("data/pose_tensor1_raw.npy")).float()
 	input_image = torch.from_numpy(np.load("data/image_tensor1_raw.npy")).float().permute(0,3,1,2)
-	print("image shape:", input_image.shape)	
+	# input_pose2 = torch.from_numpy(np.load("data/pose_tensor_ex.npy")).float()
+	# input_image2 = torch.from_numpy(np.load("data/image_tensor_ex.npy")).float().permute(0,3,1,2)
+	# print("check image sizes match:", input_image.shape, input_image2.shape)
+	# print("check pose sizes match:", input_pose.shape, input_pose2.shape)
+
+	# DEBUGGING
+	# print("pose type and shape:", type(input_pose), input_pose.shape)
+	# print("image type and shape:", type(input_image), input_image.shape)
+
+	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
+	grasp = [(416, 286), -2.896613990462929, 0.607433762324266]
+
+	pose, image, _ = extract_tensors(depth0, grasp)
 
 	# instantiate GQCNN PyTorch model
 	model = KitModel("weights.npy")
@@ -90,9 +103,12 @@ def test_run():
 
 	# instantiate Attack class
 	run1 = Attack(model=model)
-	return run1.run(input_pose, input_image)	
+	print(run1.run(input_pose, input_image))
+	# print(run1.run(input_pose2, input_image2))	
+	print(run1.run(pose, image))
+	
+	return "success"
 	# return run1.run(input_pose[0], input_image[0].unsqueeze(0))
-
 
 if __name__ == "__main__":
 	print(test_run())

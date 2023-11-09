@@ -152,7 +152,10 @@ class Renderer:
 		if isinstance(obj, Meshes):
 			image = self.render_mesh(obj, display=False)	
 			image = image[0, ..., :3].cpu().detach().numpy()
+		elif isinstance(obj, torch.Tensor):
+			image = obj.squeeze().cpu().detach().numpy()
 		elif isinstance(obj, np.ndarray):
+			print("DISPLAYED IMAGE SHAPE:", obj.shape)
 			image = obj
 		else:
 			print("display_im only takes Meshes object or numpy array")
