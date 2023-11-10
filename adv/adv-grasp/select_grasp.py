@@ -73,11 +73,15 @@ def sample_grasps(mesh, num_samples, camera, min_qual=0.002, max_qual=1.0):
 	logger.info("sampling grasps")
 	cands = []
 
+	# adding renderer for grasp visualization
+	renderer = Renderer()
+	grasp_obj, _ = renderer.render_object("data/bar_clamp.obj", display=False)
+
 	while len(cands) < num_samples:
 
 		# randomly sample 10000 surface points for 5000 possible grasps
-		samples_c0 = sample_points_from_meshes(mesh, 1000)[0]
-		samples_c1 = sample_points_from_meshes(mesh, 1000)[0]
+		samples_c0 = sample_points_from_meshes(mesh, 2000)[0]
+		samples_c1 = sample_points_from_meshes(mesh, 2000)[0]
 		norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
 
 		# mask to eliminate grasps that don't fit in the gripper
@@ -105,11 +109,16 @@ def sample_grasps(mesh, num_samples, camera, min_qual=0.002, max_qual=1.0):
 
 	# transform successful grasps to image space
 	ret_grasps = []
-	for g in cands:
+	for i in range(len(cands)):
+		g = cands[i]
 		quality = g[1:]
 		world_center = world_centers[g[0]]
 		world_axis = world_axes[g[0]]
 		world_points = torch.stack((world_center, world_axis))
+
+		# save object to visualize grasp
+		f_name = "vis_grasps/grasp_" + str(i) +".obj"
+		renderer1.grasp_sphere(world_center, grasp_obj, f_name)
 
 		# convert to camera space
 		im_points = camera.transform_points(world_points)
@@ -269,15 +278,16 @@ if __name__ == "__main__":
 	run1 = Attack(model=model)
 
 	# [quality, (im_center[0].item(), im_center[1].item()), angle, depth]
-	grasps = sample_grasps(mesh, 1, camera=renderer1.camera)
-	for g in grasps:
+	grasps = sample_grasps(mesh, 5, camera=renderer1.camera)
+	for i in range(len(grasps)):
+		g = grasps[i]
 		qual = g[0]
 		grasp = g[1:]
 		pose, image = extract_tensors(d_im, grasp)
 		logger.debug("pose shape: %s", pose.shape)
 		logger.debug("image shape: %s", image.shape)
 		prediction = run1.run(pose, image)
-		t = "oracle:" + str(qual) + "\nprediction:" + str(prediction) + "\ncenter: " + str(grasp[0]) + "\nangle: " + str(grasp[1].item()) + "\ndepth: " + str(grasp[2])
+		t = "id: " + str(i) + " oracle:" + str(qual) + "\nprediction:" + str(prediction) + "\ncenter: " + str(grasp[0]) + "\nangle: " + str(grasp[1].item()) + "\ndepth: " + str(grasp[2])
 		renderer1.display(image, title=t)
 
 

@@ -233,7 +233,7 @@ class Renderer:
 		# join grasping oject and grasp sphere
 		mesh = join_meshes_as_scene([grasp_obj, grasp_sphere])
 
-		save_obj("data/grasp.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+		save_obj(fname, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		
 		return mesh
 
@@ -258,12 +258,12 @@ def test_renderer():
 
 if __name__ == "__main__":
 	# print(test_renderer())
-	
+
 	renderer1 = Renderer()
 	grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
 	center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
 	print("center:", center)
-	sphere = renderer1.grasp_sphere(center, grasp_obj)
+	sphere = renderer1.grasp_sphere(center, grasp_obj, "data/grasp.obj")
 
 
 
