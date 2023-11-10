@@ -129,7 +129,7 @@ def sample_grasps(mesh, num_samples, camera, min_qual=0.002, max_qual=1.0):
 		depth = im_center[2].item()
 
 		# calculate angle between im_axis and camera x-axis for Grasp2D
-		x_axis = torch.tensor([1.0, 0.0, 0.0]).to(camera.device)
+		x_axis = torch.tensor([-1.0, 0.0, 0.0]).to(camera.device)
 		dotp = torch.dot(im_axis, x_axis)
 		axis_norm = torch.linalg.vector_norm(im_axis)
 		logger.debug("image axis norm: %s", axis_norm.item())
@@ -278,7 +278,7 @@ if __name__ == "__main__":
 	run1 = Attack(model=model)
 
 	# [quality, (im_center[0].item(), im_center[1].item()), angle, depth]
-	grasps = sample_grasps(mesh, 5, camera=renderer1.camera)
+	grasps = sample_grasps(mesh, 3, camera=renderer1.camera)
 	for i in range(len(grasps)):
 		g = grasps[i]
 		qual = g[0]
