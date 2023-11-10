@@ -2,8 +2,10 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 
-from pytorch3d.io import load_obj
-from pytorch3d.structures import Meshes
+from pytorch3d.utils import ico_sphere
+from pytorch3d.io import load_obj, save_obj
+from pytorch3d.transforms import Translate
+from pytorch3d.structures import Meshes, join_meshes_as_scene
 from pytorch3d.renderer import (
 	look_at_view_transform,
 	PerspectiveCameras,
@@ -202,6 +204,39 @@ class Renderer:
 
 		return depth_im
 
+	def grasp_sphere(self, center, grasp_obj, fname):
+		"""Generate an ico_sphere mesh to visualize a particular grasp
+		Parameters
+		----------
+		center: torch.Tensor of size 3
+			3D coordinates of the grasp to display
+		grasp_obj: torch.structures.Meshes
+			Mesh object being grasped
+		fname: String
+			filepath to save the visualized grasp object
+		Returns
+		-------
+		torch.structures.Meshes
+			mesh including both the grasping object and a sphere visualizing the grasp
+		"""
+
+		# instantiate sphere
+		grasp_sphere = ico_sphere(4, self.device)
+		vertex_colors = torch.full(grasp_sphere.verts_packed().shape, 0.5) 
+		vertex_colors = vertex_colors.to(device=torch.device(self.device))
+		grasp_sphere.textures = TexturesVertex(verts_features=vertex_colors.unsqueeze(0))
+		grasp_sphere = grasp_sphere.scale_verts(0.025)
+
+		# translate sphere to match grasp
+		grasp_sphere.offset_verts_(center)
+
+		# join grasping oject and grasp sphere
+		mesh = join_meshes_as_scene([grasp_obj, grasp_sphere])
+
+		save_obj("data/grasp.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+		
+		return mesh
+
 def test_renderer():
 	# instantiate Renderer object with default parameters
 	renderer1 = Renderer()
@@ -222,7 +257,13 @@ def test_renderer():
 	return "success"
 
 if __name__ == "__main__":
-	print(test_renderer())
+	# print(test_renderer())
+	
+	renderer1 = Renderer()
+	grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
+	center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
+	print("center:", center)
+	sphere = renderer1.grasp_sphere(center, grasp_obj)
 
 
 
