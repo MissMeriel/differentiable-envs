@@ -203,15 +203,54 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         # TODO combine each triangle with innerPoint in loop
         # to form pyramids (tetrahedrons)
         #https://forums.cgsociety.org/t/how-to-calculate-center-of-mass-for-triangular-mesh/1309966
+        mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
+        # B, F, 3, 3
+        # assume Faces, verts, coords
+        totalCoords = torch.sum(mesh_unwrapped, 0)
+        meanVert = torch.sum(totalCoords,0) / (totalCoords.shape[0] * totalCoords.shape[1])
 
-    def solveForIntersection(self, state, action): 
-        """Compute where grasp contacts a mesh"""
+        totalCoords = totalCoords + meanVert
+        com_per_triangle = totalCoords / 4
+
+        meanVert_expand = meanVert.expand([totalCoords.shape[0], 1, 1])
+
+        mesh_tetra = torch.cat([mesh_unwrapped, meanVert_expand], 1)
+        # det([[x1,y1,z1,1],[x2,y2,z2,1],[x3,y3,z3,1],[x4,y4,z4,1]]) / 6 
+        # does det on last 2 dims, considers at least first 1 to be batch dim
+        vol_per_triangle = torch.linalg.det(mesh_tetra)
+
+        com = com_per_triangle * vol_per_triangle / torch.sum(vol_per_triangle)
+
+        return com
+        
+
+
+    def solveForIntersection(self, state, grasp): 
+        """Compute where grasp contacts a mesh, state is meshes, action is grasp2d"""
         # TODO
-        # for action in actions 
+        # for grasp in grasp 
         # for each ray (2)
         # for each triangle (vectorize for parallel)
         #  compute intersection
         #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
+        mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
+        
+        finger1_o = grasp.center - grasp.axis * grasp.jaw_width / 2
+        ray_o = grasp.center + (torch.cat([-grasp.axis, grasp.axis], 0) * grasp.jaw_width / 2)
+        ray_d = torch.cat([grasp.axis, -grasp.axis], 0)
+        # ray is n, 3
+        u, v, t = moller_trumbore(ray_o, ray_d, mesh_unwrapped, eps=1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # correct dir, not too far, actually hits triangle
+        inside1 = ((t >= 0.0) * (t < grasp.jaw_width/2) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
+        t(torch.not(inside1)) = float('Inf')
+        # (n_rays, n_faces)
+        min_out = min(t, 1)
+
+        intersectionPoints = ray_o + ray_d * min_out.values
+        faces_index = min_out.indices
+        contactFound = torch.not(torch.or(torch.isinf(t)))
+
+
         # find intersection
         # 1. Inside triangle
         # 2. In direction for ray
@@ -234,9 +273,8 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         ----------
         state : :obj:`Pytorch3D Meshes object `
             A Meshes object of size 1 containing a watertight mesh
-        action: :obj:`Grasp2D`
-            A suction grasp in image space that encapsulates center, approach
-            direction, depth, camera_intr.
+        action: :obj:`Grasp`
+            A suction grasp in image space that encapsulates center and axis
         params: dict
             Stores params used in computing quality.
 
@@ -278,6 +316,114 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
 
         return np.array(qualities)
 
+// taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
+
+def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
+    shape = list(shape)
+    back_pad = len(shape) - index.ndim
+    for _ in range(back_pad):
+        index = index.unsqueeze(-1)
+    expand_shape = shape
+    expand_shape[dim] = -1
+    return index.expand(*expand_shape)
+
+
+def multi_gather(values: torch.Tensor, index: torch.Tensor, dim=-2):
+    # take care of batch dimension of, and acts like a linear indexing in the target dimention
+    # we assume that the index's last dimension is the dimension to be indexed on
+    return values.gather(dim, multi_indexing(index, values.shape, dim))
+
+
+def multi_gather_tris(v: torch.Tensor, f: torch.Tensor, dim=-2) -> torch.Tensor:
+    # compute faces normals w.r.t the vertices (considering batch dimension)
+    if v.ndim == (f.ndim + 1):
+        f = f[None].expand(v.shape[0], *f.shape)
+    # assert verts.shape[0] == faces.shape[0]
+    shape = torch.tensor(v.shape)
+    remainder = shape.flip(0)[:(len(shape) - dim - 1) % len(shape)]
+    return multi_gather(v, f.view(*f.shape[:-2], -1), dim=dim).view(*f.shape, *remainder)  # B, F, 3, 3
+
+
+def linear_indexing(index: torch.Tensor, shape: torch.Size, dim=0):
+    assert index.ndim == 1
+    shape = list(shape)
+    dim = dim if dim >= 0 else len(shape) + dim
+    front_pad = dim
+    back_pad = len(shape) - dim - 1
+    for _ in range(front_pad):
+        index = index.unsqueeze(0)
+    for _ in range(back_pad):
+        index = index.unsqueeze(-1)
+    expand_shape = shape
+    expand_shape[dim] = -1
+    return index.expand(*expand_shape)
+
+
+def linear_gather(values: torch.Tensor, index: torch.Tensor, dim=0):
+    # only taking linea indices as input
+    return values.gather(dim, linear_indexing(index, values.shape, dim))
+
+
+def linear_scatter(target: torch.Tensor, index: torch.Tensor, values: torch.Tensor, dim=0):
+    return target.scatter(dim, linear_indexing(index, values.shape, dim), values)
+
+
+def linear_scatter_(target: torch.Tensor, index: torch.Tensor, values: torch.Tensor, dim=0):
+    return target.scatter_(dim, linear_indexing(index, values.shape, dim), values)
+
+def ray_stabbing(pts: torch.Tensor, verts: torch.Tensor, faces: torch.Tensor, multiplier: int = 1):
+    """
+    Check whether a bunch of points is inside the mesh defined by verts and faces
+    effectively calculating their occupancy values
+    Parameters
+    ----------
+    ray_o : torch.Tensor(float), (n_rays, 3)
+    verts : torch.Tensor(float), (n_verts, 3)
+    faces : torch.Tensor(long), (n_faces, 3)
+    """
+    n_rays = pts.shape[0]
+    pts = pts[None].expand(multiplier, n_rays, -1)
+    pts = pts.reshape(-1, 3)
+    ray_d = torch.rand_like(pts)  # (n_rays, 3)
+    ray_d = normalize(ray_d)  # (n_rays, 3)
+    u, v, t = moller_trumbore(pts, ray_d, multi_gather_tris(verts, faces))  # (n_rays, n_faces, 3)
+    inside = ((t >= 0.0) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
+    inside = (inside.count_nonzero(dim=-1) % 2).bool()  # if mod 2 is 0, even, outside, inside is odd
+    inside = inside.view(multiplier, n_rays, -1)
+    inside = inside.sum(dim=0) / multiplier  # any show inside mesh
+    return inside
+
+
+def moller_trumbore(ray_o: torch.Tensor, ray_d: torch.Tensor, tris: torch.Tensor, eps=1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    The Moller Trumbore algorithm for fast ray triangle intersection
+    Naive batch implementation (m rays and n triangles at the same time)
+    O(n_rays * n_faces) memory usage, parallelized execution
+    Parameters
+    ----------
+    ray_o : torch.Tensor, (n_rays, 3)
+    ray_d : torch.Tensor, (n_rays, 3)
+    tris  : torch.Tensor, (n_faces, 3, 3)
+    """
+    E1 = tris[:, 1] - tris[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
+    E2 = tris[:, 2] - tris[:, 0]  # vector of edge 2 on triangle (n_faces, 3)
+
+    # batch cross product
+    N = torch.cross(E1, E2)  # normal to E1 and E2, automatically batched to (n_faces, 3)
+
+    invdet = 1. / -(torch.einsum('md,nd->mn', ray_d, N) + eps)  # inverse determinant (n_faces, 3)
+
+    A0 = ray_o[:, None] - tris[None, :, 0]  # (n_rays, 3) - (n_faces, 3) -> (n_rays, n_faces, 3) automatic broadcast
+    DA0 = torch.cross(A0, ray_d[:, None].expand(*A0.shape))  # (n_rays, n_faces, 3) x (n_rays, 3) -> (n_rays, n_faces, 3) no automatic broadcast
+
+    u = torch.einsum('mnd,nd->mn', DA0, E2) * invdet
+    v = -torch.einsum('mnd,nd->mn', DA0, E1) * invdet
+    t = torch.einsum('mnd,nd->mn', A0, N) * invdet  # t >= 0.0 means this is a ray
+
+    return u, v, t
+
+
+// Our code
 
 def pytorch_setup():
         # set PyTorch device, use cuda if available
