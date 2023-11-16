@@ -157,13 +157,12 @@ class Renderer:
 		elif isinstance(obj, torch.Tensor):
 			image = obj.squeeze().cpu().detach().numpy()
 		elif isinstance(obj, np.ndarray):
-			print("DISPLAYED IMAGE SHAPE:", obj.shape)
 			image = obj
 		else:
 			print("display_im only takes Meshes object or numpy array")
 			return None
 
-		plt.figure(figsize=(6,6))
+		plt.figure(figsize=(8,8))
 		plt.imshow(image)
 		plt.axis("off")
 		if title:
@@ -195,7 +194,6 @@ class Renderer:
 		depth_im = depth_im.cpu().detach().numpy()
 
 		# normalize
-		# depth_im = (depth_im-np.min(depth_im))/(np.max(depth_im)-np.min(depth_im))
 		max_depth = np.max(depth_im)	
 		depth_im[depth_im == -1] = max_depth 	
  
@@ -210,13 +208,13 @@ class Renderer:
 		----------
 		center: torch.Tensor of size 3
 			3D coordinates of the grasp to display
-		grasp_obj: torch.structures.Meshes
+		grasp_obj: torch.structures.meshes.Meshes
 			Mesh object being grasped
 		fname: String
 			filepath to save the visualized grasp object
 		Returns
 		-------
-		torch.structures.Meshes
+		torch.structures.meshes.Meshes
 			mesh including both the grasping object and a sphere visualizing the grasp
 		"""
 
@@ -261,9 +259,9 @@ if __name__ == "__main__":
 
 	renderer1 = Renderer()
 	grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
-	center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
-	print("center:", center)
-	sphere = renderer1.grasp_sphere(center, grasp_obj, "data/grasp.obj")
+	# center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
+	center = torch.tensor([0.04, 0.04, 0.04]).to(renderer1.device)
+	sphere = renderer1.grasp_sphere(center, grasp_obj, "vis_grasps/test.obj")
 
 
 
