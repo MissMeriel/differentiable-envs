@@ -1,0 +1,109 @@
+# text file containing server.py from external docker container to run gqcnn - used by select_grasp.py
+
+import Pyro4
+import os
+import logging
+import numpy as np
+from pysdfgen import mesh2sdf
+from meshpy.obj_file import ObjFile
+from meshpy.sdf_file import SdfFile
+from meshpy import mesh 
+from dexnet.grasping import GraspableObject3D, RobotGripper, UniformGraspSampler, GraspQualityConfigFactory, GraspQualityFunctionFactory, ParallelJawPtGrasp3D
+from autolab_core import YamlConfig, Point
+from perception import DepthImage, CameraIntrinsics, ColorImage, RgbdImage
+from gqcnn.grasping import AntipodalDepthImageGraspSampler, GQCnnQualityFunction, Grasp2D
+from gqcnn.grasping.policy import RgbdImageState
+
+Pyro4.config.COMMTIMEOUT = None
+
+CONFIG = YamlConfig('dex_shared_dir/config.yaml')
+GRASP_CONFIG = YamlConfig('/deps/gqcnn/cfg/examples/antipodal_grasp_sampling.yaml')
+GQCNN_CONFIG = YamlConfig('/deps/gqcnn/cfg/examples/replication/dex-net_2.1.yaml')
+SHARED_DIR = "dex_shared_dir"
+
+
+@Pyro4.expose
+class Server(object):
+	
+	def add(self, a, b):
+		"""add function just for testing"""
+		return a + b
+
+	def quality(self, grasp, obj):
+		quality_config = GraspQualityConfigFactory.create_config(CONFIG['metrics']['robust_ferrari_canny'])
+		quality_fn = GraspQualityFunctionFactory.create_quality_function(obj, quality_config)
+		quality_config2 = GraspQualityConfigFactory.create_config(CONFIG['metrics']['force_closure'])
+		quality_fn2 = GraspQualityFunctionFactory.create_quality_function(obj, quality_config2)
+		ret = quality_fn(grasp).quality
+		ret2 = quality_fn2(grasp).quality
+		# print "quality_config:", type(quality_config), quality_config 
+		# print "quality_fn:", type(quality_fn), quality_fn
+		# print type(quality_fn(grasp).quality)
+		# print "ret:", type(ret), ret
+		return [ret, ret2]
+
+
+	def close_fingers(self, centerfile, axisfile, objfile="bar_clamp.obj"):
+
+		# list to store return values
+		ret = []
+	
+		# create GraspableObject3D
+		obj_path = os.path.join(SHARED_DIR, objfile)
+		of = ObjFile(obj_path)
+		mesh = of.read()
+		sdf_file = objfile.split(".")[0] + ".sdf"
+		sdf_path = os.path.join(SHARED_DIR, sdf_file)
+		if not os.path.isfile(sdf_path):
+			mesh2sdf(obj_path)
+		sf = SdfFile(sdf_path)
+		sdf = sf.read()
+		obj = GraspableObject3D(sdf, mesh)
+
+		# confirmed meshpy mesh has same world coordinates as pytorch mesh
+		# print(mesh.principal_dims())
+		# print(mesh.bb_center)
+
+		# create ParallelJawPtGrasp3D object from grasp list
+		centers = np.load(os.path.join(SHARED_DIR, centerfile))
+		axes = np.load(os.path.join(SHARED_DIR, axisfile))	
+		logger.info("%d grasps to check", centers.shape[0])
+		for i in range(centers.shape[0]):
+			if i % 100 == 0:
+				logger.info("checking grasp %d/%d", i, centers.shape[0])
+			center = centers[i]
+			axis = axes[i]
+			g = ParallelJawPtGrasp3D(ParallelJawPtGrasp3D.configuration_from_params(center, axis, 0.05))
+			success, contacts = g.close_fingers(obj)
+			q = 0.0
+
+			if success:
+				q = self.quality(g, obj)
+				if q[0] > 0 or q[1] > 0:
+					logger.debug("contact points: %s, %s\tquality: %s", contacts[0].point, contacts[1].point, q)
+				if q[0] >= 0.002 or q[1] == 1:
+					ret.append([i, success, q[0]])
+					logger.info("SUCCESS - contact points: %s, %s\tquality: %s", contacts[0].point, contacts[1].point, q)
+					print contacts[0].point, contacts[1].point
+					print q
+					print "-----------------------------------------"  
+
+		return ret 
+
+# set up logger
+logger = logging.getLogger("dexnet_server")
+logger.setLevel(logging.DEBUG)
+# ch = logging.StreamHandler()
+# ch.setLevel(logging.DEBUG)
+# formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# ch.setFormatter(formatter)
+# logger.addHandler(ch)
+
+logger.info("info message 1")
+
+daemon = Pyro4.Daemon(host='0.0.0.0', port=5000)
+uri = daemon.register(Server, "Server")
+
+print "Ready. Object uri = ", uri
+daemon.requestLoop()
+
