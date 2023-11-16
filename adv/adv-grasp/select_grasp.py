@@ -79,7 +79,7 @@ class Grasp:
 		"""
 
 		if (self.world_center) == None or (self.world_axis == None):
-			logger.ERROR("Grasp does not have world points to transform to image points")
+			logger.error("Grasp does not have world points to transform to image points")
 			return None
 
 		# convert to camera space
@@ -202,9 +202,9 @@ def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, sa
 
 		if save_grasp:
 			# save object to visualize grasp
-			logger.DEBUG("saving new grasp visualization object")
+			logger.debug("saving new grasp visualization object")
 			f_name = save_grasp + "/grasp_" + str(i) +".obj"
-			renderer.grasp_sphere(world_center, grasp_obj, f_name)
+			renderer.grasp_sphere(world_center, mesh, f_name)
 
 		grasp = Grasp(depth=world_center[:-1], world_center=world_center, world_axis=world_axis, quality=quality)
 		grasp.trans_world_to_im(renderer.camera)
@@ -344,7 +344,7 @@ if __name__ == "__main__":
 	# renderer1.display(image)
 
 	# TESTING SAMPLE GRASPS METHOD AND VISUALIZING
-	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="") #save_grasp="vis_grasps")
+	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="vis_grasps")
 	# VISUALIZE SAMPLED GRASPS
 	for i in range(len(grasps)):
 		grasp = grasps[i]
