@@ -107,10 +107,6 @@ class Grasp:
 		axis_norm = torch.linalg.vector_norm(self.im_axis)
 		self.im_angle = torch.acos(dotp / axis_norm)
 
-		print("im axis:", im_axis)
-		print("im angle radians:", self.im_angle)
-		print("im angle degrees:", math.degrees(self.im_angle))
-
 def save_nparr(image, filename):
 	""" 
 	Save numpy.ndarray image in the shared dir
@@ -206,7 +202,6 @@ def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, sa
 		logger.info("%d successful grasps returned", len(results))
 
 		cands = cands + results
-		break
 
 	# transform successful grasps to image space
 	ret_grasps = []
@@ -375,10 +370,12 @@ if __name__ == "__main__":
 		c0=fg2['c0'], 
 		c1=fg2['c1'])
 
+	"""
 	grasp.trans_world_to_im(renderer1.camera)
 	# renderer1.grasp_sphere((grasp.c0, grasp.c1), mesh, "vis_grasps/axis_test.obj")
 	_, image = extract_tensors(d_im, grasp, logger)
 	renderer1.display(image, title="axis_test")
+	"""
 
 	# DEBUGGING WORLD TO IMAGE COORD TRANSFORMATION
 	# world_points = torch.stack((fixed_grasp["world_center"], fixed_grasp["world_axis"]))
@@ -457,13 +454,13 @@ if __name__ == "__main__":
 	# print("\nstacked -> transformed:\n", renderer1.camera.transform_points(world_points))
 	# print("\nstacked -> transformed:\n", )
 
-	# # TESTING SAMPLE GRASPS METHOD AND VISUALIZING
-	# grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
-	# # VISUALIZE SAMPLED GRASPS
-	# for i in range(len(grasps)):
-	# 	grasp = grasps[i]
-	# 	qual = grasp.rfc_quality
-	# 	pose, image = extract_tensors(d_im, grasp, logger)
-	# 	prediction = run1.run(pose, image)
-	# 	t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
-	# 	renderer1.display(image, title=t)
+	# TESTING SAMPLE GRASPS METHOD AND VISUALIZING
+	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
+	# VISUALIZE SAMPLED GRASPS
+	for i in range(len(grasps)):
+		grasp = grasps[i]
+		qual = grasp.rfc_quality
+		pose, image = extract_tensors(d_im, grasp, logger)
+		prediction = run1.run(pose, image)
+		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
+		renderer1.display(image, title=t)
