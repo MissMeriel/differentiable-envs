@@ -17,7 +17,7 @@ SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
 class Grasp:
 
-	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, quality=None):
+	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None):
 		"""
 		Initialize a Grasp object
 		Paramters
@@ -34,6 +34,10 @@ class Grasp:
 			Grasp center in world/mesh coordinates
 		world_axis: torch.tensor of size 3
 			Grasp axis in world/mesh coordinates
+		c0: torch.tensor of size 3
+			First contact point of grasp in world coordinates
+		c1: torch.tensor of size 3
+			Second contact point of grasp in world coordinates
 		quality: List of 2 oracle qualities of grasp
 			quality[0]: Boolean quality from force_closure
 			quality[1]: float quality value from robust_ferrari_canny
@@ -55,10 +59,12 @@ class Grasp:
 		self.im_angle = im_angle
 		self.world_center = world_center
 		self.world_axis = world_axis
+		self.c0 = c0
+		self.c1 = c1
 
 	def __str__(self):
 		"""Returns a string with grasp information in image coordinates"""
-		p_str = "quality: " + str(self.rfc_quality) + "\n\timage center: " + str(self.im_center) + "\n\timage angle: " + str(self.im_angle) + "\n\tdepth: " + str(self.depth)
+		p_str = "quality: " + str(self.rfc_quality) + "\n\timage center: " + str(self.im_center) + "\n\timage angle: " + str(self.im_angle) + "\n\tdepth: " + str(self.depth) + "\n\tworld center: " + str(self.world_center) + "\n\tworld axis: " + str(self.world_axis)
 		return p_str
 
 	def title_str(self):
@@ -78,24 +84,32 @@ class Grasp:
 		None
 		"""
 
-		if (self.world_center) == None or (self.world_axis == None):
+		if (self.world_center == None) or (self.world_axis == None):
 			logger.error("Grasp does not have world points to transform to image points")
 			return None
 
-		# convert to camera space
-		world_points = -1 * torch.stack((self.world_center, self.world_axis))
+		# convert grasp center (3D point) to camera space
+		world_points = torch.stack((self.world_center, self.world_center))
 		im_points = camera.transform_points(world_points)
 		for i in range(im_points.shape[0]):		# fix depth value
 			im_points[i][2] = 1/im_points[i][2]
 		self.im_center = im_points[0]
-		self.im_axis = im_points[1]
 		self.depth = self.im_center[2].item()
+
+		# convert grasp axis (direction vector) to camera space
+		R = camera.get_world_to_view_transform().get_matrix()[:, :3, :3]	# rotation matrix
+		im_axis = torch.matmul(R, self.world_axis.unsqueeze(-1)).squeeze(-1).squeeze()	# apply only rotation, not translation
+		self.im_axis = im_axis
 
 		# calculate angle between im_axis and camera x-axis for im_angle
 		x_axis = torch.tensor([-1.0, 0.0, 0.0]).to(camera.device)
 		dotp = torch.dot(self.im_axis, x_axis)
 		axis_norm = torch.linalg.vector_norm(self.im_axis)
 		self.im_angle = torch.acos(dotp / axis_norm)
+
+		print("im axis:", im_axis)
+		print("im angle radians:", self.im_angle)
+		print("im angle degrees:", math.degrees(self.im_angle))
 
 def save_nparr(image, filename):
 	""" 
@@ -188,15 +202,19 @@ def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, sa
 		save_nparr(world_centers.detach().cpu().numpy(), "temp_centers.npy")
 		save_nparr(world_axes.detach().cpu().numpy(), "temp_axes.npy")
 		results = server.close_fingers("temp_centers.npy", "temp_axes.npy")
+		#	results returns list of lists of form [[int: index, Bool: force closure quality, float: rfc quality, (array, array): contact points], ...]
 		logger.info("%d successful grasps returned", len(results))
 
 		cands = cands + results
+		break
 
 	# transform successful grasps to image space
 	ret_grasps = []
 	for i in range(len(cands)):
 		g = cands[i]
-		quality = g[1:]
+		quality = g[1:-1]
+		contact0 = torch.tensor(g[-1][0]).to(renderer.device)
+		contact1 = torch.tensor(g[-1][1]).to(renderer.device)
 		world_center = world_centers[g[0]]
 		world_axis = world_axes[g[0]]
 
@@ -204,19 +222,21 @@ def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, sa
 			# save object to visualize grasp
 			logger.debug("saving new grasp visualization object")
 			f_name = save_grasp + "/grasp_" + str(i) +".obj"
-			renderer.grasp_sphere(world_center, mesh, f_name)
+			renderer.grasp_sphere((contact0, contact1), mesh, f_name)
 
-		grasp = Grasp(depth=world_center[:-1], world_center=world_center, world_axis=world_axis, quality=quality)
+		grasp = Grasp(depth=world_center[:-1], world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality)
 		grasp.trans_world_to_im(renderer.camera)
 
 		logger.info("image grasp: %s", str(grasp))
+		print("\tcontact0:", grasp.c0)
+		print("\tcontact1:", grasp.c1)
 
 		ret_grasps.append(grasp)
 
 	return ret_grasps 
 
 
-def extract_tensors(d_im, grasp):
+def extract_tensors(d_im, grasp, logger):
 	"""
 	Use grasp information and depth image to get image and pose tensors in form of GQCNN input
 	Parameters
@@ -261,7 +281,7 @@ def extract_tensors(d_im, grasp):
 	dim_cx = torch_dim.shape[2] // 2
 	dim_cy = torch_dim.shape[1] // 2	
 	
-	translate = ((dim_cx - grasp.im_center[0]) / 3, (dim_cy - grasp.im_center[1]) / 3)
+	translate = ((grasp.im_center[0] - dim_cx) / 3, (grasp.im_center[1]- dim_cy) / 3)
 
 	cx = torch_image_tensor.shape[2] // 2
 	cy = torch_image_tensor.shape[1] // 2
@@ -323,33 +343,127 @@ if __name__ == "__main__":
 	
 
 	# FIXED GRASP FOR TESTING
-	# fixed_grasp = {
-	# 	'force_closure_q': 1,
-	# 	'robust_ferrari_canny_q': 0.00017405830492609492,
-	# 	'world_center': torch.tensor([ 0.0157,  0.0167, -0.0599], device='cuda:0'), 
-	# 	'world_axis': torch.tensor([ 0.6087, -0.0807, -0.7893], device='cuda:0'), 
-	# 	'im_center': torch.tensor([333.6413, 185.6289,   0.5833], device='cuda:0'), 
-	# 	'im_axis': torch.tensor([ 7.8896e+02, -3.6920e+02,  6.8074e-01], device='cuda:0'), 
-	# 	'im_angle': torch.tensor(2.7039, device='cuda:0'),
-	# 	'depth': 0.5792605876922607
-	# }
+	fixed_grasp = {
+		'force_closure_q': 1,
+		'robust_ferrari_canny_q': 0.00017405830492609492,
+		'world_center': torch.tensor([ 0.0157,  0.0167, -0.0599], device='cuda:0'), 
+		'world_axis': torch.tensor([ 0.6087, -0.0807, -0.7893], device='cuda:0'), 
+		'im_center': torch.tensor([333.6413, 185.6289,   0.5833], device='cuda:0'), 
+		'im_axis': torch.tensor([ 7.8896e+02, -3.6920e+02,  6.8074e-01], device='cuda:0'), 
+		'im_angle': torch.tensor(2.7039, device='cuda:0'),
+		'depth': 0.5792605876922607
+	}
+
+	fg2 = {
+		'fc_q': 1,
+		'rfc_q': 0.00039880830039262474,
+        # image center: tensor([344.3808, 239.4164,   0.5824], device='cuda:0')
+        # image angle: 0.0
+		'depth': 0.5824155807495117,
+		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
+		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
+		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
+		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
+	}
+
+	# DEBUGGING WORLD TO IMAGE AXIS TRANSFORMATION W fg2
+	grasp = Grasp(
+		quality=(fg2['fc_q'], fg2['rfc_q']), 
+		depth=fg2['depth'], 
+		world_center=fg2['world_center'], 
+		world_axis=fg2['world_axis'], 
+		c0=fg2['c0'], 
+		c1=fg2['c1'])
+
+	grasp.trans_world_to_im(renderer1.camera)
+	# renderer1.grasp_sphere((grasp.c0, grasp.c1), mesh, "vis_grasps/axis_test.obj")
+	_, image = extract_tensors(d_im, grasp, logger)
+	renderer1.display(image, title="axis_test")
 
 	# DEBUGGING WORLD TO IMAGE COORD TRANSFORMATION
 	# world_points = torch.stack((fixed_grasp["world_center"], fixed_grasp["world_axis"]))
-	# world_points = torch.tensor([[-0.04, -0.04, -0.04], [-0.04, -0.04, -0.04]], device = renderer1.device)
-	# image_grasp = world_to_im_grasp(world_points, 0, renderer1.camera)
-	# im_center = image_grasp[1]
-	# im_depth = image_grasp[2]
-	# pose, image = extract_tensors(d_im, [im_center, 0, im_depth])
+	# world_points = torch.tensor([[0.0, 0.0, 0.0], [-0.05, -0.05, -0.05]], device = renderer1.device)
+	# grasp = Grasp(depth=0, world_center=world_points[1], world_axis=world_points[0])
+	# image_grasp = grasp.trans_world_to_im(renderer1.camera)
+
+	# print("object bboxes:\n", mesh.get_bounding_boxes())
+	# print("\ninput points:\n", world_points)
+	# print("\npytorch camera project points:")
+	# print(renderer1.camera.transform_points(world_points))
+	# print("\noutput points:\n", grasp.im_center, "\n", grasp.im_axis, "\n")
+	# print(renderer1.camera.get_world_to_view_transform().get_matrix())
+
+	# pose, image = extract_tensors(d_im, grasp, logger)
 	# renderer1.display(image)
 
-	# TESTING SAMPLE GRASPS METHOD AND VISUALIZING
-	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="vis_grasps")
-	# VISUALIZE SAMPLED GRASPS
-	for i in range(len(grasps)):
-		grasp = grasps[i]
-		qual = grasp.rfc_quality
-		pose, image = extract_tensors(d_im, grasp)
-		prediction = run1.run(pose, image)
-		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
-		renderer1.display(image, title=t)
+	"""
+	# Find max and min vertices for each axis
+	verts = mesh.verts_list()[0]
+	max_index_x = torch.argmax(verts[:, 0])	# index of max value on x-axis
+	max_vertex_x = verts[max_index_x] 		# vertex w max value on x-axis
+	min_index_x = torch.argmin(verts[:, 0])	# index of min value on x-axis
+	min_vertex_x = verts[min_index_x] 		# vertex w the min value on x-axis
+	# same for y-axis
+	max_index_y = torch.argmax(verts[:, 1])	# index of max value on x-axis
+	max_vertex_y = verts[max_index_y]		# vertex w max value on x-axis
+	min_index_y = torch.argmin(verts[:, 1])	# index of min value on x-axis
+	min_vertex_y = verts[min_index_y]		# vertex w the min value on x-axis
+	# same for z-axis
+	max_index_z = torch.argmax(verts[:, 2])	# index of max value on x-axis
+	max_vertex_z = verts[max_index_z]		# vertex w max value on x-axis
+	min_index_z = torch.argmin(verts[:, 2])	# index of min value on x-axis
+	min_vertex_z = verts[min_index_z]		# vertex w the min value on x-axis
+
+	min_maxes = [min_vertex_x, max_vertex_x, min_vertex_y, max_vertex_y, min_vertex_z, max_vertex_z]
+	labels = ["min_x", "max_x", "min_y", "max_y", "min_z", "max_z"]
+	axis = torch.tensor([-1.0, 0.0, 0.0]).to(renderer1.camera.device)
+
+	# transform points, and visualize points
+	for label, mm in zip(labels, min_maxes):
+		if label[-1] == "x":
+			mm[1] = 0.0
+			mm[2] = 0.0
+		elif label[-1] == "y":
+			mm[0] = 0.0
+			mm[2] = 0.0
+		elif label[-1] == "z":
+			mm[0] = 0.0
+			mm[1] = 0.0
+		else:
+			print("PROBLEM W LABEL!!")
+			break
+
+		grasp = Grasp(depth=mm[2].item(), world_center = mm, world_axis=axis)
+		grasp.trans_world_to_im(renderer1.camera)
+		grasp.im_angle = 0.0
+		print("\n\n", label)
+		print("original point:", mm)
+		print("transformed point:", grasp.im_center)
+		# cam_trans = renderer1.camera.transform_points(torch.stack((mm, mm)))
+		# print("camera transform:", cam_trans[0])
+
+		# view processed depth image
+		_, image = extract_tensors(d_im, grasp, logger)
+		renderer1.display(image, title=label)
+
+		# # save new grasp object for visualization
+		# fname = "vis_grasps/" + label + "2.obj"
+		# renderer1.grasp_sphere(mm, mesh, fname)
+		# print("saved new grasp object to ./" + fname)
+	"""
+
+	# world_points = torch.stack((min_vertex_x, max_vertex_x, min_vertex_y, max_vertex_y, min_vertex_z, max_vertex_z))
+	# print("\nmin/max stacked:\n", world_points)
+	# print("\nstacked -> transformed:\n", renderer1.camera.transform_points(world_points))
+	# print("\nstacked -> transformed:\n", )
+
+	# # TESTING SAMPLE GRASPS METHOD AND VISUALIZING
+	# grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
+	# # VISUALIZE SAMPLED GRASPS
+	# for i in range(len(grasps)):
+	# 	grasp = grasps[i]
+	# 	qual = grasp.rfc_quality
+	# 	pose, image = extract_tensors(d_im, grasp, logger)
+	# 	prediction = run1.run(pose, image)
+	# 	t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
+	# 	renderer1.display(image, title=t)

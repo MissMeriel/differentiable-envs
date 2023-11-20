@@ -206,8 +206,8 @@ class Renderer:
 		"""Generate an ico_sphere mesh to visualize a particular grasp
 		Parameters
 		----------
-		center: torch.Tensor of size 3
-			3D coordinates of the grasp to display
+		center: torch.Tensor of size 3 or tuple of two torch.Tensors of size 3
+			3D coordinates of center of the grasp to display or the two contact points of the grasp
 		grasp_obj: torch.structures.meshes.Meshes
 			Mesh object being grasped
 		fname: String
@@ -223,13 +223,20 @@ class Renderer:
 		vertex_colors = torch.full(grasp_sphere.verts_packed().shape, 0.5) 
 		vertex_colors = vertex_colors.to(device=torch.device(self.device))
 		grasp_sphere.textures = TexturesVertex(verts_features=vertex_colors.unsqueeze(0))
-		grasp_sphere = grasp_sphere.scale_verts(0.025)
 
-		# translate sphere to match grasp
-		grasp_sphere.offset_verts_(center)
-
-		# join grasping oject and grasp sphere
-		mesh = join_meshes_as_scene([grasp_obj, grasp_sphere])
+		# translate sphere(s) to match grasp and join grasping object with sphere(s)
+		if isinstance(center, torch.Tensor):
+			grasp_sphere = grasp_sphere.scale_verts(0.025)
+			grasp_sphere.offset_verts_(center)
+			mesh = join_meshes_as_scene([grasp_obj, grasp_sphere])
+		else:
+			grasp_sphere = grasp_sphere.scale_verts(0.010)
+			c0 = grasp_sphere
+			c1 = c0.clone()
+			c0.offset_verts_(center[0])
+			c1.offset_verts_(center[1])
+			mesh = join_meshes_as_scene([grasp_obj, c0, c1])
+		
 
 		save_obj(fname, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		
