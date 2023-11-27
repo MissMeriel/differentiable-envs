@@ -1,5 +1,6 @@
 import logging
 import numpy as np
+from torchviz import make_dot
 from render import *
 from gqcnn_pytorch import KitModel
 from select_grasp import *
@@ -45,15 +46,24 @@ class Attack:
 		float: calculated loss
 		"""
 
-		# check current model prediction
-		dim = self.renderer.mesh_to_depth_im(adv_mesh, display=False)
-		dim = dim[:, :, np.newaxis]
+		# CHECK CURRENT MODEL PREDICTION
+		adv_mesh_clone = adv_mesh.clone()
+		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
 		pose, image = extract_tensors(dim, grasp, logger)
-		cur_pred = self.run(pose, image)[0][0].item()
+		# print("pose:\n\tshape:\t", pose.shape, "\n\trequires_grad:\t", pose.requires_grad, "\n\tdevice:\t", pose.device, "\n\tdtype:\t", pose.dtype, "\n\tvalue:\t", pose)
+		out = self.run(pose, image)
+		cur_pred = out[0][0] # pose[0][0].requires_grad_()
+		cur_pred = cur_pred.to(adv_mesh.device)
+		print("cur_pred:\n\tshape:\t", cur_pred.shape, "\n\trequires_grad:\t", cur_pred.requires_grad, "\n\tdevice:\t", cur_pred.device, "\n\tdtype:\t", cur_pred.dtype, "\n\tvalue:\t", cur_pred)
+		oracle_pred = torch.tensor([float(grasp.fc_quality)], requires_grad=False, device=adv_mesh.device)
 
-		# maximize difference between cur_pred and oracle prediction
-		loss = 1 - abs(cur_pred - grasp.fc_quality)
-		loss = torch.tensor([loss], requires_grad=True)
+		# MODEL VISUALIZATION
+		# make_dot(out, params=dict(list(self.model.named_parameters()))).render("out_torchviz", format="png")
+
+		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
+		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
+
+		print("loss:\n\tshape:\t", loss.shape, "\n\trequires_grad:\t", loss.requires_grad, "\n\tdevice:\t", loss.device, "\n\tdtype:\t", loss.dtype, "\n\tvalue:\t", loss)
 
 		return loss
 
@@ -73,7 +83,7 @@ class Attack:
 			adv_mesh: perturbed mesh structure
 		"""
 
-		# perturb vertices
+		# PERTURB VERTICES
 		# current_faces = mesh.faces_packed()
 		# adv_mesh = Meshes(verts=[param], faces=[current_faces])
 		adv_mesh = mesh.offset_verts(param)
@@ -98,16 +108,22 @@ class Attack:
 
 		# param = mesh.verts_packed().clone().detach().requires_grad_(True)
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
+		print("param before:", param)
+		print("param grad before:", param.grad)
+		print("\n\n")
 		optimizer = torch.optim.SGD([param], lr=1e-4, momentum=0.99)
 
-		adv_mesh = mesh
+		adv_mesh = mesh.clone()
 
 		for i in range(self.num_steps):
 			optimizer.zero_grad()
 			loss, adv_mesh = self.perturb(adv_mesh, param, grasp)
 			loss.backward()
 			optimizer.step()
+			print("\n")
 			print(f"step {i}\t{loss.item()=:.4f}")
+			print("param:", param)
+			print("param grad:", param.grad)
 
 			# if i % self.steps_per_plot == 0:
 			# 	title="step " + str(i) + " loss " + str(loss.item())
@@ -116,12 +132,19 @@ class Attack:
 def test_run(logger):
 	"""Test prediction of gqcnn_pytorch model"""
 
+	if torch.cuda.is_available():
+		device = torch.device("cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
 	grasp = Grasp(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929)
 
 	# load input tensors from gqcnn library for prediction
-	pose0 = torch.from_numpy(np.load("data/pose_tensor1_raw.npy")).float()
-	image0 = torch.from_numpy(np.load("data/image_tensor1_raw.npy")).float().permute(0,3,1,2)
+	pose0 = torch.from_numpy(np.load("data/pose_tensor1_raw.npy")).float().to(device)
+	image0 = torch.from_numpy(np.load("data/image_tensor1_raw.npy")).float().permute(0,3,1,2).to(device)
 
 	# tensors from pytorch extraction
 	pose1, image1 = extract_tensors(depth0, grasp, logger)
@@ -130,7 +153,6 @@ def test_run(logger):
 	renderer = Renderer()
 	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
-	dim = dim[:, :, np.newaxis]
 	pose2, image2 = extract_tensors(dim, grasp, logger)
 
 	# instantiate GQCNN PyTorch model
@@ -148,13 +170,13 @@ def test_run(logger):
 def test_attack(logger):
 	"""Test attack on gqcnn_pytorch model"""
 
-	# render mesh and depth image
+	# RENDER MESH AND DEPTH IMAGE
 	renderer = Renderer()
 	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
-	dim = dim[:, :, np.newaxis]
+	# dim = dim[:, :, np.newaxis]
 
-	# fixed grasp to attack
+	# FIXED GRASP TO ATTACK
 	grasp = Grasp(
 		quality=(1, 0.00039880830039262474), 
 		depth=0.5824155807495117, 
@@ -168,11 +190,18 @@ def test_attack(logger):
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=3, steps_per_plot=100, model=model, renderer=renderer)
+	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=renderer)
 
-	print("oracle rfc value:", grasp.rfc_quality)
-	print("oracle fc value:", grasp.fc_quality)
-	print("prediction:", run1.run(pose, image)[0][0].item())
+	# MODEL VISUALIZATIONS
+	print("model print:")
+	print(model)
+
+	# yhat = model(pose, image)
+	# make_dot(yhat, params=dict(list(model.named_parameters()))).render("rnn_torchviz", format="png")
+
+	# print("oracle rfc value:", grasp.rfc_quality)
+	# print("oracle fc value:", grasp.fc_quality)
+	# print("prediction:", run1.run(pose, image)[0][0].item())
 
 	print("\nattack")
 	run1.attack(mesh, grasp)

@@ -48,16 +48,23 @@ class KitModel(nn.Module):
             variables_to_load = pickle.load(file)
         _other_weights = {name: torch.from_numpy(var) for name, var in zip(names, variables_to_load)}
 
-        # make sizes compatible with PyTorch
-        _other_weights["conv1_1b"] = _other_weights["conv1_1b"].unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        _other_weights["conv1_2b"] = _other_weights["conv1_2b"].unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        _other_weights["conv2_1b"] = _other_weights["conv2_1b"].unsqueeze(0).unsqueeze(2).unsqueeze(3)
-        _other_weights["conv2_2b"] = _other_weights["conv2_2b"].unsqueeze(0).unsqueeze(2).unsqueeze(3)
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+            torch.cuda.set_device(device)
+        else:
+            print("cuda not available")
+            device = torch.device("cpu")
 
-        self.Conv2D = self.__conv(2, name='Conv2D', in_channels=1, out_channels=64, kernel_size=(7, 7), stride=(1, 1), groups=1, bias=True, padding='same')
-        self.Conv2D_1 = self.__conv(2, name='Conv2D_1', in_channels=64, out_channels=64, kernel_size=(5, 5), stride=(1, 1), groups=1, bias=True, padding='same')
-        self.Conv2D_2 = self.__conv(2, name='Conv2D_2', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same')
-        self.Conv2D_3 = self.__conv(2, name='Conv2D_3', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same')
+        # make sizes compatible with PyTorch
+        _other_weights["conv1_1b"] = _other_weights["conv1_1b"].unsqueeze(0).unsqueeze(2).unsqueeze(3).to(device)
+        _other_weights["conv1_2b"] = _other_weights["conv1_2b"].unsqueeze(0).unsqueeze(2).unsqueeze(3).to(device)
+        _other_weights["conv2_1b"] = _other_weights["conv2_1b"].unsqueeze(0).unsqueeze(2).unsqueeze(3).to(device)
+        _other_weights["conv2_2b"] = _other_weights["conv2_2b"].unsqueeze(0).unsqueeze(2).unsqueeze(3).to(device)
+
+        self.Conv2D = self.__conv(2, name='Conv2D', in_channels=1, out_channels=64, kernel_size=(7, 7), stride=(1, 1), groups=1, bias=True, padding='same', device=device)
+        self.Conv2D_1 = self.__conv(2, name='Conv2D_1', in_channels=64, out_channels=64, kernel_size=(5, 5), stride=(1, 1), groups=1, bias=True, padding='same', device=device)
+        self.Conv2D_2 = self.__conv(2, name='Conv2D_2', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same', device=device)
+        self.Conv2D_3 = self.__conv(2, name='Conv2D_3', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same', device=device)
         self.pad = nn.ConstantPad2d(1, 0)
        
         print("initalized!\n")
@@ -65,14 +72,14 @@ class KitModel(nn.Module):
     def forward(self, x1, x2):
         # x1 is pose_arr and x2 is im_arr
         x2, x1 = normalize_input(x2, x1)
-        MatMul_1        = torch.matmul(x1, _other_weights["pc1W"])      # x1 - step 0; input: 64 x 1
-        add_5           = MatMul_1 + _other_weights["pc1b"]             # x1 - step 1; MatMul_1 + pc1b/read
+        MatMul_1        = torch.matmul(x1, _other_weights["pc1W"].to(x1.device))      # x1 - step 0; input: 64 x 1
+        add_5           = MatMul_1 + _other_weights["pc1b"] .to(x1.device)            # x1 - step 1; MatMul_1 + pc1b/read
         Relu_5          = F.relu(add_5)                                 # x1 - step 2
         # MirrorPad       = self.pad(x2)                                  # x2 - step 0; input: 64 x 32 x 32 x 1
         # MirrorPad_1     = self.pad(MirrorPad)
         # MirrorPad_2     = self.pad(MirrorPad_1)
         Conv2D          = self.Conv2D(x2)                                    # x2 - step 1
-        MatMul_3        = torch.matmul(Relu_5, _other_weights["fc4W_pose"])  # x1 - step 3; Relu_5 * fc4W_pose/read
+        MatMul_3        = torch.matmul(Relu_5, _other_weights["fc4W_pose"].to(x1.device))  # x1 - step 3; Relu_5 * fc4W_pose/read
         Relu            = F.relu(Conv2D)                                        # x2 - step 2
         MaxPool, MaxPool_idx = F.max_pool2d(Relu, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)   # x2 - step 3
         # MirrorPad_3     = self.pad(MaxPool)
@@ -95,16 +102,16 @@ class KitModel(nn.Module):
             Reshape_3       = torch.reshape(input = MaxPool_3, shape=(1,16384)) #shape = (64,16384))
         else:
             Reshape_3       = torch.reshape(input = MaxPool_3, shape=(64,16384))
-        MatMul          = torch.matmul(Reshape_3, _other_weights["fc3W"])       # Reshape_3 * fc3W/read
-        add_4           = MatMul + _other_weights["fc3b"]                       # MatMul + fc3b/read
+        MatMul          = torch.matmul(Reshape_3, _other_weights["fc3W"].to(x2.device))       # Reshape_3 * fc3W/read
+        add_4           = MatMul + _other_weights["fc3b"].to(x2.device)                     # MatMul + fc3b/read
         Relu_4          = F.relu(add_4)
-        temp = Relu_4.detach().numpy()
-        MatMul_2        = torch.matmul(Relu_4, _other_weights["fc4W_im"])       # Relu_4 * fc4W_im/read
+        # temp = Relu_4.detach().numpy()
+        MatMul_2        = torch.matmul(Relu_4, _other_weights["fc4W_im"].to(x2.device))       # Relu_4 * fc4W_im/read
         add_6           = MatMul_2 + MatMul_3                                   # combines x1 and x2
-        add_7           = add_6 + _other_weights["fc4b"]                        # add_6 + fc4b/read
+        add_7           = add_6 + _other_weights["fc4b"].to(x2.device)                        # add_6 + fc4b/read
         Relu_6          = F.relu(add_7)
-        MatMul_4        = torch.matmul(Relu_6, _other_weights["fc5W"])          # Relu_6 * fc5W/read
-        add_8           = MatMul_4 + _other_weights["fc5b"]                     # MatMul_4 + fc5b/read
+        MatMul_4        = torch.matmul(Relu_6, _other_weights["fc5W"].to(x2.device))          # Relu_6 * fc5W/read
+        add_8           = MatMul_4 + _other_weights["fc5b"].to(x2.device)                     # MatMul_4 + fc5b/read
         Softmax         = F.softmax(add_8, dim=1)
         return Softmax
 
@@ -116,15 +123,15 @@ class KitModel(nn.Module):
         elif dim == 3:  layer = nn.Conv3d(**kwargs)
         else:           raise NotImplementedError()
 
-        temp = torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0))
+        temp = torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).to(kwargs.get("device"))
         # print("\nname:", name)
         # print("weights:", torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).shape)
         # print(torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)))
         # print("conv1_1b:", _other_weights["conv1_1b"])
             
-        layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']))
+        layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']).to(kwargs.get("device")))
         if 'bias' in _weights_dict[name]:
-            layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
+            layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']).to(kwargs.get("device")))
             # print("bias:", torch.from_numpy(_weights_dict[name]['bias']))
         return layer
 
