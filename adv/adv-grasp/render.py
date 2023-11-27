@@ -108,7 +108,7 @@ class Renderer:
 		image = self.render_mesh(mesh, display=display, title=title)
 		dis_image = image[0, ..., :3].cpu().detach().numpy()
 
-		return mesh, dis_image
+		return mesh, image
 
 	def render_mesh(self, mesh, display=True, title=None):
 		"""
@@ -159,7 +159,7 @@ class Renderer:
 		elif isinstance(obj, np.ndarray):
 			image = obj
 		else:
-			print("display_im only takes Meshes object or numpy array")
+			print("display_im only takes Meshes object, pytorch tensor, or numpy array")
 			return None
 
 		plt.figure(figsize=(8,8))
@@ -171,7 +171,7 @@ class Renderer:
 
 	def mesh_to_depth_im(self, mesh, display=True, title=None):
 		"""
-		Converts a Mesh to a noramlized 480 x 640 numpy depth image and optionally displays it.
+		Converts a Mesh to a noramlized 480 x 640 depth image and optionally displays it.
 		Parameters
 		----------
 		mesh: pytorch.structures.meshes.Meshes
@@ -183,20 +183,22 @@ class Renderer:
 		Returns
 		-------
 		numpy.ndarray
-			480 x 640 numpy array representing normalized depth image (values between 0 and 1 inclusive)
+			480 x 640 torch.tensor representing depth image
 		"""	
 
 		if not isinstance(mesh, Meshes):
 			print("mesh_to_depth_im: input not a mesh.")
 			return None
 	
-		depth_im = self.rasterizer(mesh).zbuf.squeeze(-1).squeeze(0)
-		depth_im = depth_im.cpu().detach().numpy()
+		depth_im = self.rasterizer(mesh).zbuf.squeeze(-1)#.squeeze(0)
+		# depth_im = depth_im.cpu().detach().numpy()
 
-		# normalize
-		max_depth = np.max(depth_im)	
-		depth_im[depth_im == -1] = max_depth 	
- 
+		# ADD TABLE
+		# max_depth = np.max(depth_im)
+		# depth_im[depth_im == -1] = max_depth 
+		max_depth = torch.max(depth_im)	
+		depth_im = torch.where(depth_im == -1, max_depth, depth_im)
+
 		if display:
 			self.display(depth_im, title=title)
 
@@ -247,28 +249,29 @@ def test_renderer():
 	renderer1 = Renderer()
 
 	# test render_obj -> render_mesh -> display mesh
-	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="testing render_obj -> render_mesh")
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="testing render_obj -> render_mesh")
+
+	# test render_mesh
+	tens = renderer1.render_mesh(mesh, display=True, title="testing mesh -> render_mesh")
+
+	# test display with all possible input types
+	renderer1.display(mesh, title="testing mesh -> display")
+	renderer1.display(image, title="testing torch.tensor -> display")
+	renderer1.display(np.load("data/depth_0.npy"), title="testing np.ndarray -> display")
 
 	# test mesh_to_depth_im -> display np.array
 	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="testing mesh_to_depth_im")
-	print("depth im values:", np.max(depth_im), np.min(depth_im))
-	print(depth_im)
-
-	depth_ex = np.load("data/depth_0.npy")
-	print("\ngqcnn depth im:", np.max(depth_ex), np.min(depth_ex))
-	print(depth_ex)
-	renderer1.display(depth_ex, title="gqcnn depth_0")
 
 	return "success"
 
 if __name__ == "__main__":
-	# print(test_renderer())
+	print(test_renderer())
 
-	renderer1 = Renderer()
-	grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
-	# center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
-	center = torch.tensor([0.04, 0.04, 0.04]).to(renderer1.device)
-	sphere = renderer1.grasp_sphere(center, grasp_obj, "vis_grasps/test.obj")
+	# renderer1 = Renderer()
+	# grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
+	# # center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
+	# center = torch.tensor([0.04, 0.04, 0.04]).to(renderer1.device)
+	# sphere = renderer1.grasp_sphere(center, grasp_obj, "vis_grasps/test.obj")
 
 
 

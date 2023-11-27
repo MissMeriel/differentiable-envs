@@ -15,6 +15,13 @@ from run_gqcnn import *
 
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
+if torch.cuda.is_available():
+	device = torch.device("cuda:0")
+	torch.cuda.set_device(device)
+else:
+	print("cuda not available")
+	device = torch.device("cpu")
+
 class Grasp:
 
 	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None):
@@ -124,20 +131,6 @@ def save_nparr(image, filename):
 	filepath = os.path.join(SHARED_DIR, filename)
 	np.save(filepath, image)
 
-def preprocess_dim(d_im):
-	"""
-	Pre-processes a numpy depth image before grasp selection (if necessary?)
-	Parameters
-	----------
-	d_im: numpy.ndarray
-		Depth image to be pre-processed before grasp selection (particular size??)
-	Returns
-	-------
-	numpy.ndarray
-		Processed depth image
-	"""
-
-	return None	
 
 def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, save_grasp=""):
 	"""
@@ -213,7 +206,7 @@ def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, sa
 		world_center = world_centers[g[0]]
 		world_axis = world_axes[g[0]]
 
-		if save_grasp:
+		if save_grasp and i<num_samples:
 			# save object to visualize grasp
 			logger.debug("saving new grasp visualization object")
 			f_name = save_grasp + "/grasp_" + str(i) +".obj"
@@ -228,7 +221,7 @@ def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, sa
 
 		ret_grasps.append(grasp)
 
-	return ret_grasps 
+	return ret_grasps[:num_samples]
 
 
 def extract_tensors(d_im, grasp, logger):
@@ -249,12 +242,13 @@ def extract_tensors(d_im, grasp, logger):
 
 	# check type of input_dim
 	if isinstance(d_im, np.ndarray):
-		torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1)
+		torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1).to(device)
 	else:
 		torch_dim = d_im
 
 	# construct pose tensor from grasp depth
 	pose_tensor = torch.zeros([1, 1])
+	pose_tensor = pose_tensor.to(torch_dim.device)
 	pose_tensor[0] = grasp.depth
 
 	# process depth image wrt grasp (steps 1-3) 
@@ -307,7 +301,40 @@ def extract_tensors(d_im, grasp, logger):
 	torch_cropped = transforms.functional.crop(torch_translated, cy-17, cx-17, 32, 32)
 	image_tensor = torch_cropped.unsqueeze(0)
 
-	return pose_tensor, image_tensor  
+	return pose_tensor, image_tensor 
+
+def test_select_grasp(logger):
+	model = KitModel("weights.npy")
+	model.eval()
+	run1 = Attack(model=model)
+
+	# TESTING TENSOR EXTRACTION AND VISUALIZATION
+	renderer1 = Renderer()
+	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
+	grasp = Grasp(
+		depth=0.607433762324266, 
+		im_center=(416, 286), 
+		im_angle=-2.896613990462929, 
+	)
+	pose, image = extract_tensors(depth0, grasp, logger)	# tensor extraction
+	print("prediction:", run1.run(pose, image))		# gqcnn prediction
+	renderer1.display(image)
+
+	# TESTING GRASP SAMPLING
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
+	d_im = renderer1.mesh_to_depth_im(mesh, display=True)
+
+	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="vis_grasps")
+	for i in range(len(grasps)):
+		grasp = grasps[i]
+		qual = grasp.rfc_quality
+		pose, image = extract_tensors(d_im, grasp, logger)
+		prediction = run1.run(pose, image)
+		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
+		renderer1.display(image, title=t)
+
+	return "success"
+
 	
 if __name__ == "__main__":
 
@@ -320,23 +347,17 @@ if __name__ == "__main__":
 	ch.setFormatter(formatter)
 	logger.addHandler(ch)
 
+	# print(test_select_grasp(logger))
+
+
 	renderer1 = Renderer()
 	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
 	d_im = renderer1.mesh_to_depth_im(mesh, display=True)
-	d_im = d_im[:, :, np.newaxis]
 
 	model = KitModel("weights.npy")
 	model.eval()
 	run1 = Attack(model=model)
 	
-	# TESTING TENSOR EXTRACTION AND GQCNN PREDICTION
-	# depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
-	# grasp = Grasp(0.607433762324266, (416, 286), -2.896613990462929)
-	# pose, image = extract_tensors(depth0, grasp)	# tensor extraction
-	# print("prediction:", run1.run(pose, image))		# gqcnn prediction
-	# renderer1.display(image)
-	
-
 	# FIXED GRASP FOR TESTING
 	fixed_grasp = {
 		'force_closure_q': 1,
@@ -375,25 +396,23 @@ if __name__ == "__main__":
 	# renderer1.grasp_sphere((grasp.c0, grasp.c1), mesh, "vis_grasps/axis_test.obj")
 	_, image = extract_tensors(d_im, grasp, logger)
 	renderer1.display(image, title="axis_test")
-	"""
 
 	# DEBUGGING WORLD TO IMAGE COORD TRANSFORMATION
-	# world_points = torch.stack((fixed_grasp["world_center"], fixed_grasp["world_axis"]))
-	# world_points = torch.tensor([[0.0, 0.0, 0.0], [-0.05, -0.05, -0.05]], device = renderer1.device)
-	# grasp = Grasp(depth=0, world_center=world_points[1], world_axis=world_points[0])
-	# image_grasp = grasp.trans_world_to_im(renderer1.camera)
+	world_points = torch.stack((fixed_grasp["world_center"], fixed_grasp["world_axis"]))
+	world_points = torch.tensor([[0.0, 0.0, 0.0], [-0.05, -0.05, -0.05]], device = renderer1.device)
+	grasp = Grasp(depth=0, world_center=world_points[1], world_axis=world_points[0])
+	image_grasp = grasp.trans_world_to_im(renderer1.camera)
 
-	# print("object bboxes:\n", mesh.get_bounding_boxes())
-	# print("\ninput points:\n", world_points)
-	# print("\npytorch camera project points:")
-	# print(renderer1.camera.transform_points(world_points))
-	# print("\noutput points:\n", grasp.im_center, "\n", grasp.im_axis, "\n")
-	# print(renderer1.camera.get_world_to_view_transform().get_matrix())
+	print("object bboxes:\n", mesh.get_bounding_boxes())
+	print("\ninput points:\n", world_points)
+	print("\npytorch camera project points:")
+	print(renderer1.camera.transform_points(world_points))
+	print("\noutput points:\n", grasp.im_center, "\n", grasp.im_axis, "\n")
+	print(renderer1.camera.get_world_to_view_transform().get_matrix())
 
-	# pose, image = extract_tensors(d_im, grasp, logger)
-	# renderer1.display(image)
+	pose, image = extract_tensors(d_im, grasp, logger)
+	renderer1.display(image)
 
-	"""
 	# Find max and min vertices for each axis
 	verts = mesh.verts_list()[0]
 	max_index_x = torch.argmax(verts[:, 0])	# index of max value on x-axis
@@ -447,12 +466,13 @@ if __name__ == "__main__":
 		# fname = "vis_grasps/" + label + "2.obj"
 		# renderer1.grasp_sphere(mm, mesh, fname)
 		# print("saved new grasp object to ./" + fname)
-	"""
+	
 
 	# world_points = torch.stack((min_vertex_x, max_vertex_x, min_vertex_y, max_vertex_y, min_vertex_z, max_vertex_z))
 	# print("\nmin/max stacked:\n", world_points)
 	# print("\nstacked -> transformed:\n", renderer1.camera.transform_points(world_points))
 	# print("\nstacked -> transformed:\n", )
+	"""
 
 	# TESTING SAMPLE GRASPS METHOD AND VISUALIZING
 	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
