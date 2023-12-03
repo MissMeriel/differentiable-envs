@@ -3,6 +3,7 @@ import os
 import sys
 import math
 import logging
+import json
 import torch
 from torchvision import transforms
 import numpy as np
@@ -69,15 +70,75 @@ class Grasp:
 		self.c0 = c0
 		self.c1 = c1
 
+	@classmethod
+	def init_from_dict(cls, dict):
+		"""Initialize grasp object from a dictionary"""
+		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"])
+
+	@classmethod
+	def read(cls, fname):
+		"""Reads a JSON file fname with saved grasp information and initializes"""
+
+		# read file
+		with open(fname) as f:
+			dictionary = json.load(f)
+
+		# convert lists to tensors
+		if dictionary["im_center"] and dictionary["im_axis"]:
+			dictionary["im_center"] = torch.from_numpy(np.array(dictionary["im_center"])).to(device)
+			dictionary["im_axis"] = torch.from_numpy(np.array(dictionary["im_axis"])).to(device)
+		if dictionary["world_center"] and dictionary["world_axis"]:
+			dictionary["world_center"] = torch.from_numpy(np.array(dictionary["world_center"])).to(device)
+			dictionary["world_axis"] = torch.from_numpy(np.array(dictionary["world_axis"])).to(device)
+		if dictionary["c0"] and dictionary["c1"]:
+			dictionary["c0"] = torch.from_numpy(np.array(dictionary["c0"])).to(device)
+			dictionary["c1"] = torch.from_numpy(np.array(dictionary["c1"])).to(device)
+
+		return cls.init_from_dict(dictionary)
+
 	def __str__(self):
 		"""Returns a string with grasp information in image coordinates"""
-		p_str = "quality: " + str(self.rfc_quality) + "\n\timage center: " + str(self.im_center) + "\n\timage angle: " + str(self.im_angle) + "\n\tdepth: " + str(self.depth) + "\n\tworld center: " + str(self.world_center) + "\n\tworld axis: " + str(self.world_axis)
+		p_str = "quality: " + str(self.fc_quality) + " , " + str(self.rfc_quality) + "\n\timage center: " + str(self.im_center) + "\n\timage angle: " + str(self.im_angle) + "\n\tdepth: " + str(self.depth) + "\n\tworld center: " + str(self.world_center) + "\n\tworld axis: " + str(self.world_axis)
 		return p_str
 
 	def title_str(self):
 		"""Retruns a string like __str__, but without tabs"""
 		p_str = "quality: " + str(self.rfc_quality) + "\nimage center: " + str(self.im_center) + "\nimage angle: " + str(self.im_angle) + "\ndepth: " + str(self.depth)
 		return p_str
+
+	def save(self, fname):
+		"""Saves a JSON file with grasp information in file fname"""
+
+		# convert tensors to lists to save
+		imc_list, imax_list, wc_list, was_list, c0_list, c1_list = None, None, None, None, None, None
+		if (self.im_center is not None) and (self.im_axis is not None):
+			imc_list = self.im_center.clone().detach().cpu().numpy().tolist()
+			imax_list = self.im_axis.clone().detach().cpu().numpy().tolist()
+		if (self.world_center is not None) and (self.world_axis is not None):
+			wc_list = self.world_center.clone().detach().cpu().numpy().tolist()
+			was_list = self.world_axis.clone().detach().cpu().numpy().tolist()
+		if (self.c0 is not None) and (self.c1 is not None):
+			c0_list = self.c0.clone().detach().cpu().numpy().tolist()
+			c1_list = self.c1.clone().detach().cpu().numpy().tolist()
+
+		grasp_data = {
+			"depth": self.depth,
+			"im_center": imc_list,
+			"im_axis": imax_list,
+			"im_angle": self.im_angle,
+			"world_center": wc_list,
+			"world_axis": was_list,
+			"c0": c0_list,
+			"c1": c1_list
+		}
+
+		if self.fc_quality and self.rfc_quality:
+			grasp_data["quality"] = [self.fc_quality, self.rfc_quality]
+		else:
+			grasp_data["quality"] = None
+
+		with open(fname, "w") as f:
+			json.dump(grasp_data, f, indent=4)
 
 	def trans_world_to_im(self, camera):
 		"""
@@ -112,7 +173,7 @@ class Grasp:
 		x_axis = torch.tensor([-1.0, 0.0, 0.0]).to(camera.device)
 		dotp = torch.dot(self.im_axis, x_axis)
 		axis_norm = torch.linalg.vector_norm(self.im_axis)
-		self.im_angle = torch.acos(dotp / axis_norm)
+		self.im_angle = torch.acos(dotp / axis_norm).item()
 
 def save_nparr(image, filename):
 	""" 
@@ -335,6 +396,47 @@ def test_select_grasp(logger):
 
 	return "success"
 
+def test_save_and_load_grasps(logger):
+
+	renderer1 = Renderer()
+
+	fg = {
+		'fc_q': 1,
+		'rfc_q': 0.00039880830039262474,
+        # image center: tensor([344.3808, 239.4164,   0.5824], device='cuda:0')
+        # image angle: 0.0
+		'depth': 0.5824155807495117,
+		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
+		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
+		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
+		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
+	}
+
+	# DEBUGGING WORLD TO IMAGE AXIS TRANSFORMATION W fg2
+	grasp = Grasp(
+		quality=(fg['fc_q'], fg['rfc_q']), 
+		depth=fg['depth'], 
+		world_center=fg['world_center'], 
+		world_axis=fg['world_axis'], 
+		c0=fg['c0'], 
+		c1=fg['c1'])
+
+	print("before saving...")
+	print(grasp)
+	grasp.save("test-grasp.json")
+	print("\nreading after saving...")
+	g2 = Grasp.read("test-grasp.json")
+	print(g2)
+	
+	grasp.trans_world_to_im(renderer1.camera)
+	print("\nafter transforming before saving...")
+	print(grasp)
+	grasp.save('test-grasp2.json')
+	print("\nreading after transforming and saving...")
+	g2 = Grasp.read("test-grasp2.json")
+	print(g2)
+
+	return "success"
 	
 if __name__ == "__main__":
 
@@ -348,11 +450,12 @@ if __name__ == "__main__":
 	logger.addHandler(ch)
 
 	# print(test_select_grasp(logger))
+	print(test_save_and_load_grasps(logger))
 
-
+	"""
 	renderer1 = Renderer()
 	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
-	d_im = renderer1.mesh_to_depth_im(mesh, display=True)
+	d_im = renderer1.mesh_to_depth_im(mesh, display=False)
 
 	model = KitModel("weights.npy")
 	model.eval()
@@ -391,12 +494,15 @@ if __name__ == "__main__":
 		c0=fg2['c0'], 
 		c1=fg2['c1'])
 
-	"""
 	grasp.trans_world_to_im(renderer1.camera)
 	# renderer1.grasp_sphere((grasp.c0, grasp.c1), mesh, "vis_grasps/axis_test.obj")
-	_, image = extract_tensors(d_im, grasp, logger)
+	pose, image = extract_tensors(d_im, grasp, logger)
 	renderer1.display(image, title="axis_test")
+	model_out = model(pose, image)[0][0].item()
+	print("model prediction:", model_out)
+	"""
 
+	"""
 	# DEBUGGING WORLD TO IMAGE COORD TRANSFORMATION
 	world_points = torch.stack((fixed_grasp["world_center"], fixed_grasp["world_axis"]))
 	world_points = torch.tensor([[0.0, 0.0, 0.0], [-0.05, -0.05, -0.05]], device = renderer1.device)
@@ -474,6 +580,7 @@ if __name__ == "__main__":
 	# print("\nstacked -> transformed:\n", )
 	"""
 
+	"""
 	# TESTING SAMPLE GRASPS METHOD AND VISUALIZING
 	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
 	# VISUALIZE SAMPLED GRASPS
@@ -484,3 +591,4 @@ if __name__ == "__main__":
 		prediction = run1.run(pose, image)
 		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
 		renderer1.display(image, title=t)
+	"""

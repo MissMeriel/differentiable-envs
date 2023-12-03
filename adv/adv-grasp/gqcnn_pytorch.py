@@ -75,24 +75,17 @@ class KitModel(nn.Module):
         MatMul_1        = torch.matmul(x1, _other_weights["pc1W"].to(x1.device))      # x1 - step 0; input: 64 x 1
         add_5           = MatMul_1 + _other_weights["pc1b"] .to(x1.device)            # x1 - step 1; MatMul_1 + pc1b/read
         Relu_5          = F.relu(add_5)                                 # x1 - step 2
-        # MirrorPad       = self.pad(x2)                                  # x2 - step 0; input: 64 x 32 x 32 x 1
-        # MirrorPad_1     = self.pad(MirrorPad)
-        # MirrorPad_2     = self.pad(MirrorPad_1)
-        Conv2D          = self.Conv2D(x2)                                    # x2 - step 1
+        Conv2D          = self.Conv2D(x2)                                    # x2 - step 1; input: 64 x 32 x 32 x 1
         MatMul_3        = torch.matmul(Relu_5, _other_weights["fc4W_pose"].to(x1.device))  # x1 - step 3; Relu_5 * fc4W_pose/read
         Relu            = F.relu(Conv2D)                                        # x2 - step 2
         MaxPool, MaxPool_idx = F.max_pool2d(Relu, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)   # x2 - step 3
-        # MirrorPad_3     = self.pad(MaxPool)
-        # MirrorPad_4     = self.pad(MirrorPad_3)
         Conv2D_1        = self.Conv2D_1(MaxPool) 
         Relu_1          = F.relu(Conv2D_1) 
         LRN             = F.local_response_norm(Relu_1, size=5, alpha=9.999999747378752e-05, beta=0.75, k=1.0)  # x2 - step 9
         MaxPool_1, MaxPool_1_idx = F.max_pool2d(LRN, kernel_size=(2, 2), stride=(2, 2), padding=0, ceil_mode=False, return_indices=True)    # x2 - step 9
-        # MirrorPad_5     = self.pad(MaxPool_1)
         Conv2D_2        = self.Conv2D_2(MaxPool_1)
         Relu_2          = F.relu(Conv2D_2)
         MaxPool_2, MaxPool_2_idx = F.max_pool2d(Relu_2, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)
-        # MirrorPad_6     = self.pad(MaxPool_2)
         Conv2D_3        = self.Conv2D_3(MaxPool_2)
         Relu_3          = F.relu(Conv2D_3) 
         LRN_1           = F.local_response_norm(Relu_3, size=5, alpha=9.999999747378752e-05, beta=0.75, k=1.0)
@@ -105,7 +98,6 @@ class KitModel(nn.Module):
         MatMul          = torch.matmul(Reshape_3, _other_weights["fc3W"].to(x2.device))       # Reshape_3 * fc3W/read
         add_4           = MatMul + _other_weights["fc3b"].to(x2.device)                     # MatMul + fc3b/read
         Relu_4          = F.relu(add_4)
-        # temp = Relu_4.detach().numpy()
         MatMul_2        = torch.matmul(Relu_4, _other_weights["fc4W_im"].to(x2.device))       # Relu_4 * fc4W_im/read
         add_6           = MatMul_2 + MatMul_3                                   # combines x1 and x2
         add_7           = add_6 + _other_weights["fc4b"].to(x2.device)                        # add_6 + fc4b/read
