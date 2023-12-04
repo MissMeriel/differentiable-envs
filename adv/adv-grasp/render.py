@@ -137,7 +137,7 @@ class Renderer:
 
 		return ret_tens 
 
-	def display(self, obj, title=None):
+	def display(self, obj, title=None, save=False, fname=None):
 		"""
 		Displays a mesh or image, optionally with a title.
 		Parameters
@@ -169,7 +169,10 @@ class Renderer:
 			plt.title(title)
 		plt.show()
 
-	def mesh_to_depth_im(self, mesh, display=True, title=None):
+		if save and fname:
+			plt.imsave(fname, image)
+
+	def mesh_to_depth_im(self, mesh, display=True, title=None, save=False, fname=None):
 		"""
 		Converts a Mesh to a noramlized 480 x 640 depth image and optionally displays it.
 		Parameters
@@ -200,7 +203,7 @@ class Renderer:
 		depth_im = torch.where(depth_im == -1, max_depth, depth_im)
 
 		if display:
-			self.display(depth_im, title=title)
+			self.display(depth_im, title=title, save=save, fname=fname)
 
 		return depth_im
 
@@ -245,12 +248,13 @@ class Renderer:
 		return mesh
 
 def test_renderer():
-	# instantiate Renderer object with default parameters
-	renderer1 = Renderer()
+    # instantiate Renderer object with default parameters
+    renderer1 = Renderer()
 
-	# test render_obj -> render_mesh -> display mesh
-	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="testing render_obj -> render_mesh")
+    # test render_obj -> render_mesh -> display mesh
+    mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="testing render_obj -> render_mesh")
 
+    """
 	# test render_mesh
 	tens = renderer1.render_mesh(mesh, display=True, title="testing mesh -> render_mesh")
 
@@ -261,8 +265,9 @@ def test_renderer():
 
 	# test mesh_to_depth_im -> display np.array
 	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="testing mesh_to_depth_im")
+    """
 
-	return "success"
+    return "success"
 
 if __name__ == "__main__":
 	print(test_renderer())

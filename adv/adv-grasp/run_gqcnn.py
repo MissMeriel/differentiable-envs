@@ -1,6 +1,8 @@
 import logging
 import numpy as np
 from torchviz import make_dot
+from pytorch3d.io import save_obj
+
 from render import *
 from gqcnn_pytorch import KitModel
 from select_grasp import *
@@ -52,18 +54,15 @@ class Attack:
 		pose, image = extract_tensors(dim, grasp, logger)
 		# print("pose:\n\tshape:\t", pose.shape, "\n\trequires_grad:\t", pose.requires_grad, "\n\tdevice:\t", pose.device, "\n\tdtype:\t", pose.dtype, "\n\tvalue:\t", pose)
 		out = self.run(pose, image)
-		cur_pred = out[0][0] # pose[0][0].requires_grad_()
+		cur_pred = out[0][0]
 		cur_pred = cur_pred.to(adv_mesh.device)
-		print("cur_pred:\n\tshape:\t", cur_pred.shape, "\n\trequires_grad:\t", cur_pred.requires_grad, "\n\tdevice:\t", cur_pred.device, "\n\tdtype:\t", cur_pred.dtype, "\n\tvalue:\t", cur_pred)
+		# print("cur_pred:\n\tshape:\t", cur_pred.shape, "\n\trequires_grad:\t", cur_pred.requires_grad, "\n\tdevice:\t", cur_pred.device, "\n\tdtype:\t", cur_pred.dtype, "\n\tvalue:\t", cur_pred)
 		oracle_pred = torch.tensor([float(grasp.fc_quality)], requires_grad=False, device=adv_mesh.device)
-
-		# MODEL VISUALIZATION
-		# make_dot(out, params=dict(list(self.model.named_parameters()))).render("out_torchviz", format="png")
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
 
-		print("loss:\n\tshape:\t", loss.shape, "\n\trequires_grad:\t", loss.requires_grad, "\n\tdevice:\t", loss.device, "\n\tdtype:\t", loss.dtype, "\n\tvalue:\t", loss)
+		# print("loss:\n\tshape:\t", loss.shape, "\n\trequires_grad:\t", loss.requires_grad, "\n\tdevice:\t", loss.device, "\n\tdtype:\t", loss.dtype, "\n\tvalue:\t", loss)
 
 		return loss
 
@@ -92,7 +91,7 @@ class Attack:
 
 		return loss, adv_mesh
 
-	def attack(self, mesh, grasp):
+	def attack(self, mesh, grasp, dir):
 		"""
 		Run an attack on the model for number of steps specified in self.num_steps
 
@@ -106,6 +105,12 @@ class Attack:
 			Final adversarial mesh
 		"""
 
+		# start by saving attack information
+		if dir[-1] != "/":
+			dir = dir+"/"
+		save_obj(dir+"initial-mesh.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+		grasp.save(dir+"grasp.json")
+
 		# param = mesh.verts_packed().clone().detach().requires_grad_(True)
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
 		print("param before:", param)
@@ -117,17 +122,24 @@ class Attack:
 
 		for i in range(self.num_steps):
 			optimizer.zero_grad()
-			loss, adv_mesh = self.perturb(adv_mesh, param, grasp)
+			loss, adv_mesh = self.perturb(mesh, param, grasp)
 			loss.backward()
 			optimizer.step()
-			print("\n")
+			# print("\n")
 			print(f"step {i}\t{loss.item()=:.4f}")
-			print("param:", param)
-			print("param grad:", param.grad)
+			# print("param:", param)
+			# print("param grad:", param.grad)
 
-			# if i % self.steps_per_plot == 0:
-			# 	title="step " + str(i) + " loss " + str(loss.item())
-			# 	dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title)
+			if i % self.steps_per_plot == 0:
+				title="step " + str(i) + " loss " + str(loss.item())
+				filename = dir + "step" + str(i) + ".png"
+				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
+
+		# save final image and object
+		final_mesh = mesh.offset_verts(param)
+		title = "step" + str(self.num_steps) + " loss " + str(loss.item())
+		filename = dir + "step" + str(self.num_steps) + ".png"
+		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
 
 def test_run(logger):
 	"""Test prediction of gqcnn_pytorch model"""
@@ -204,7 +216,7 @@ def test_attack(logger):
 	# print("prediction:", run1.run(pose, image)[0][0].item())
 
 	print("\nattack")
-	run1.attack(mesh, grasp)
+	run1.attack(mesh, grasp, "experiment-results/ex01/")
 
 	return "success"
 
