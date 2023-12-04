@@ -91,7 +91,7 @@ class Attack:
 		self.losses["normal"].append(normal_loss.item())
 		self.losses["smoothing"].append(smooth_loss.item())
 
-		return weighted_loss
+		return weighted_loss, cur_pred
 
 	def perturb(self, mesh, param, grasp):
 		"""
@@ -114,9 +114,9 @@ class Attack:
 		# adv_mesh = Meshes(verts=[param], faces=[current_faces])
 		adv_mesh = mesh.offset_verts(param)
 
-		loss = self.calc_loss(adv_mesh, grasp)
+		loss, model_pred = self.calc_loss(adv_mesh, grasp)
 
-		return loss, adv_mesh
+		return loss, adv_mesh, model_pred
 
 	def attack(self, mesh, grasp, dir, lr, momentum):
 		"""
@@ -165,7 +165,7 @@ class Attack:
 
 		for i in range(self.num_steps):
 			optimizer.zero_grad()
-			loss, adv_mesh = self.perturb(mesh, param, grasp)
+			loss, adv_mesh, model_pred = self.perturb(mesh, param, grasp)
 			loss.backward()
 			optimizer.step()
 			# print("\n")
@@ -174,17 +174,20 @@ class Attack:
 			# print("param grad:", param.grad)
 
 			if i % self.steps_per_plot == 0:
-				title="step " + str(i) + " loss " + str(loss.item())
+				title="step " + str(i) + " loss: " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item())
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
 
 		# save final image and object and plot losses
 		final_mesh = mesh.offset_verts(param)
 		save_obj(dir+"final-mesh.obj", verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
-		title = "step" + str(self.num_steps) + " loss " + str(loss.item())
+		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item())
 		filename = dir + "step" + str(self.num_steps) + ".png"
 		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
 		Attack.plot_losses(self.losses, dir)
+
+		_, image = extract_tensors(dim, grasp, logger)
+		return final_mesh, image
 
 def test_run(logger):
 	"""Test prediction of gqcnn_pytorch model"""
@@ -261,7 +264,8 @@ def test_attack(logger):
 	# print("prediction:", run1.run(pose, image)[0][0].item())
 
 	print("\nattack")
-	run1.attack(mesh, grasp, "experiment-results/ex02/", lr=1e-5, momentum=0.99)
+	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex03/", lr=1e-5, momentum=0.9)
+	renderer.display(final_pic, title="final_grasp", save=True, fname="experiment-results/ex03/final-grasp.png")
 
 	return "success"
 

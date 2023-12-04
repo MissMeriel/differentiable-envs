@@ -167,10 +167,10 @@ class Renderer:
 		plt.axis("off")
 		if title:
 			plt.title(title)
-		plt.show()
+		#plt.show()
 
 		if save and fname:
-			plt.imsave(fname, image)
+			plt.savefig(fname)
 
 	def mesh_to_depth_im(self, mesh, display=True, title=None, save=False, fname=None):
 		"""
