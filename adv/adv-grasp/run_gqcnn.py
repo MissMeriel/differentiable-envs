@@ -2,6 +2,7 @@ import logging
 import numpy as np
 from torchviz import make_dot
 from pytorch3d.io import save_obj
+from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
 
 from render import *
 from gqcnn_pytorch import KitModel
@@ -52,19 +53,22 @@ class Attack:
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
 		pose, image = extract_tensors(dim, grasp, logger)
-		# print("pose:\n\tshape:\t", pose.shape, "\n\trequires_grad:\t", pose.requires_grad, "\n\tdevice:\t", pose.device, "\n\tdtype:\t", pose.dtype, "\n\tvalue:\t", pose)
 		out = self.run(pose, image)
 		cur_pred = out[0][0]
 		cur_pred = cur_pred.to(adv_mesh.device)
-		# print("cur_pred:\n\tshape:\t", cur_pred.shape, "\n\trequires_grad:\t", cur_pred.requires_grad, "\n\tdevice:\t", cur_pred.device, "\n\tdtype:\t", cur_pred.dtype, "\n\tvalue:\t", cur_pred)
 		oracle_pred = torch.tensor([float(grasp.fc_quality)], requires_grad=False, device=adv_mesh.device)
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
 
-		# print("loss:\n\tshape:\t", loss.shape, "\n\trequires_grad:\t", loss.requires_grad, "\n\tdevice:\t", loss.device, "\n\tdtype:\t", loss.dtype, "\n\tvalue:\t", loss)
+		# WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
+		edge_loss = mesh_edge_loss(adv_mesh)
+		normal_loss = mesh_normal_consistency(adv_mesh)
+		smooth_loss = mesh_laplacian_smoothing(adv_mesh)
+		#print("\nedge_loss:", edge_loss.item(), "\nnormal_loss:", normal_loss.item(), "\nsmooth_loss", smooth_loss.item())
+		weighted_loss = loss + 10*edge_loss + 10*normal_loss + 10*smooth_loss
 
-		return loss
+		return weighted_loss
 
 	def perturb(self, mesh, param, grasp):
 		"""
@@ -116,7 +120,7 @@ class Attack:
 		print("param before:", param)
 		print("param grad before:", param.grad)
 		print("\n\n")
-		optimizer = torch.optim.SGD([param], lr=1e-4, momentum=0.99)
+		optimizer = torch.optim.SGD([param], lr=1e-5, momentum=0.99)
 
 		adv_mesh = mesh.clone()
 
@@ -137,6 +141,7 @@ class Attack:
 
 		# save final image and object
 		final_mesh = mesh.offset_verts(param)
+		save_obj(dir+"final-mesh.obj", verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
 		title = "step" + str(self.num_steps) + " loss " + str(loss.item())
 		filename = dir + "step" + str(self.num_steps) + ".png"
 		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
@@ -202,7 +207,7 @@ def test_attack(logger):
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=renderer)
+	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=renderer)
 
 	# MODEL VISUALIZATIONS
 	print("model print:")
@@ -216,7 +221,7 @@ def test_attack(logger):
 	# print("prediction:", run1.run(pose, image)[0][0].item())
 
 	print("\nattack")
-	run1.attack(mesh, grasp, "experiment-results/ex01/")
+	run1.attack(mesh, grasp, "experiment-results/ex02/")
 
 	return "success"
 
