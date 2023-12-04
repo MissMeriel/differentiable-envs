@@ -1,0 +1,19 @@
+{
+    "lr": 1e-05,
+    "momentum": 0.99,
+    "optimizer": "SGD",
+    "loss weights": [
+        [
+            "edge",
+            10
+        ],
+        [
+            "normal",
+            10
+        ],
+        [
+            "smooth",
+            10
+        ]
+    ]
+}

@@ -16,6 +16,12 @@ class Attack:
 		self.num_steps = num_plots * steps_per_plot
 		self.model = model
 		self.renderer = renderer
+		self.loss_weights = {
+			"edge": 10,
+			"normal": 10,
+			"smooth": 10
+		}
+		self.losses = None
 
 	def run(self, pose_tensor, image_tensor):
 		"""
@@ -33,6 +39,19 @@ class Attack:
 		"""
 
 		return self.model(pose_tensor, image_tensor)
+
+	@staticmethod
+	def plot_losses(losses, dir):
+		fig = plt.figure(figsize=(13, 5))
+		ax = fig.gca()
+		for k, l in losses.items():
+			ax.plot(l, label=k + " loss")
+		ax.legend(fontsize="16")
+		ax.set_xlabel("Iteration", fontsize="16")
+		ax.set_ylabel("Loss", fontsize="16")
+		ax.set_title("Loss vs iterations", fontsize="18")
+		plt.show()
+		plt.savefig(dir+"losses.png")
 
 	def calc_loss(self, adv_mesh, grasp):
 		"""
@@ -62,11 +81,15 @@ class Attack:
 		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
 
 		# WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
-		edge_loss = mesh_edge_loss(adv_mesh)
-		normal_loss = mesh_normal_consistency(adv_mesh)
-		smooth_loss = mesh_laplacian_smoothing(adv_mesh)
+		edge_loss = mesh_edge_loss(adv_mesh) * self.loss_weights["edge"]
+		normal_loss = mesh_normal_consistency(adv_mesh) * self.loss_weights["normal"]
+		smooth_loss = mesh_laplacian_smoothing(adv_mesh) * self.loss_weights["smooth"]
 		#print("\nedge_loss:", edge_loss.item(), "\nnormal_loss:", normal_loss.item(), "\nsmooth_loss", smooth_loss.item())
-		weighted_loss = loss + 10*edge_loss + 10*normal_loss + 10*smooth_loss
+		weighted_loss = loss + edge_loss + normal_loss + smooth_loss
+		self.losses["prediction"].append(loss.item())
+		self.losses["edge"].append(edge_loss.item())
+		self.losses["normal"].append(normal_loss.item())
+		self.losses["smoothing"].append(smooth_loss.item())
 
 		return weighted_loss
 
@@ -95,7 +118,7 @@ class Attack:
 
 		return loss, adv_mesh
 
-	def attack(self, mesh, grasp, dir):
+	def attack(self, mesh, grasp, dir, lr, momentum):
 		"""
 		Run an attack on the model for number of steps specified in self.num_steps
 
@@ -114,13 +137,29 @@ class Attack:
 			dir = dir+"/"
 		save_obj(dir+"initial-mesh.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		grasp.save(dir+"grasp.json")
+		data = {
+			"lr": lr,
+			"momentum": momentum,
+			"optimizer": "SGD",
+			"loss weights": list(self.loss_weights.items())
+		}
+		with open(dir+"setup.txt", "w") as f:
+			json.dump(data, f, indent=4)
+
+		# reset loss tracking to plot at the end
+		self.losses = {
+			"prediction": [],
+			"edge": [],
+			"normal": [],
+			"smoothing": []
+		}
 
 		# param = mesh.verts_packed().clone().detach().requires_grad_(True)
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
 		print("param before:", param)
 		print("param grad before:", param.grad)
 		print("\n\n")
-		optimizer = torch.optim.SGD([param], lr=1e-5, momentum=0.99)
+		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
 		adv_mesh = mesh.clone()
 
@@ -139,12 +178,13 @@ class Attack:
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
 
-		# save final image and object
+		# save final image and object and plot losses
 		final_mesh = mesh.offset_verts(param)
 		save_obj(dir+"final-mesh.obj", verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
 		title = "step" + str(self.num_steps) + " loss " + str(loss.item())
 		filename = dir + "step" + str(self.num_steps) + ".png"
 		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
+		Attack.plot_losses(self.losses, dir)
 
 def test_run(logger):
 	"""Test prediction of gqcnn_pytorch model"""
@@ -221,7 +261,7 @@ def test_attack(logger):
 	# print("prediction:", run1.run(pose, image)[0][0].item())
 
 	print("\nattack")
-	run1.attack(mesh, grasp, "experiment-results/ex02/")
+	run1.attack(mesh, grasp, "experiment-results/ex02/", lr=1e-5, momentum=0.99)
 
 	return "success"
 
