@@ -25,6 +25,16 @@ else:
 
 class Grasp:
 
+	# SET UP LOGGING
+	logger = logging.getLogger('select_grasp')
+	logger.setLevel(logging.INFO)
+	if not logger.handlers:
+		ch = logging.StreamHandler()
+		ch.setLevel(logging.INFO)
+		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+		ch.setFormatter(formatter)
+		logger.addHandler(ch)
+
 	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None):
 		"""
 		Initialize a Grasp object
@@ -153,7 +163,7 @@ class Grasp:
 		"""
 
 		if (self.world_center == None) or (self.world_axis == None):
-			logger.error("Grasp does not have world points to transform to image points")
+			Grasp.logger.error("Grasp does not have world points to transform to image points")
 			return None
 
 		# convert grasp center (3D point) to camera space
@@ -175,6 +185,173 @@ class Grasp:
 		axis_norm = torch.linalg.vector_norm(self.im_axis)
 		self.im_angle = torch.acos(dotp / axis_norm).item()
 
+	@classmethod
+	def sample_grasps(cls, obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, save_grasp=""):
+		"""
+		Samples grasps using dexnet oracle and returns grasps with qualities between min_qual and max_qual
+		inclusive. Contains RPC to oracle.py in running docker container. Saves new grasp object with an 
+		added sphere to visualize grasp if desired (default: does not save new grasp object)
+		Parameters
+		----------
+		obj_f: String
+			path to the .obj file of the mesh to be grasped
+		num_samples: int
+			Total number of grasps to evaluate (lower bound for number of grasps returned)
+		renderer: Renderer object
+			Renderer to use to render mesh object with camera to convert grasp info to image space	
+		min_qual: float
+			Float between 0.0 and 1.0, minimum quality for returned grasps, defaults to 0.002 according to robust ferrari canny method
+			NOTE: Currently returns a grasp if force_closure metric returns 1 or robust ferrari canny quality is above min_qual
+		max_qual: float
+			Float between 0.0 and 1.0, maximum quality for returned grasps, defaults to 1.0
+		save_grasp: String
+			If empty string, no new grasp objects are saved
+			If not empty, this is the path to the directory where to save new grasp objects that have a sphere added to visualize the grasp
+		Returns
+		-------
+		List of Grasp objects with quality between min_qual and max_qual inclusive
+		"""
+
+		# test logging
+		cls.logger.info("Sampling grasps...")
+		cands = []
+
+		# renderer mesh
+		mesh, _ = renderer.render_object(obj_f, display=False)
+
+		while len(cands) < num_samples:
+
+			# randomly sample surface points for possible grasps
+			samples_c0 = sample_points_from_meshes(mesh, num_samples*1500)[0]
+			samples_c1 = sample_points_from_meshes(mesh, num_samples*1500)[0]
+			norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
+
+			# mask to eliminate grasps that don't fit in the gripper
+			mask = (norms > 0.0) & (norms <= 0.05)
+			mask = mask.squeeze()
+			norms = norms[mask]
+			c0 = samples_c0[mask, :]
+			c1 = samples_c1[mask, :]
+		
+			# computer grasp center and axis
+			world_centers = (c0 + c1) / 2
+			world_axes = (c1 - c0) / norms.unsqueeze(1)
+
+			# get close_fingers result and quality from gqcnn
+			cls.logger.info("sending %d grasps to server", world_centers.shape[0])
+
+			Pyro4.config.COMMTIMEOUT = None
+			server = Pyro4.Proxy("PYRO:Server@localhost:5000")
+			save_nparr(world_centers.detach().cpu().numpy(), "temp_centers.npy")
+			save_nparr(world_axes.detach().cpu().numpy(), "temp_axes.npy")
+			results = server.close_fingers("temp_centers.npy", "temp_axes.npy")
+			#	results returns list of lists of form [[int: index, Bool: force closure quality, float: rfc quality, (array, array): contact points], ...]
+			cls.logger.info("%d successful grasps returned", len(results))
+
+			cands = cands + results
+
+		# transform successful grasps to image space
+		ret_grasps = []
+		for i in range(len(cands)):
+			g = cands[i]
+			quality = g[1:-1]
+			contact0 = torch.tensor(g[-1][0]).to(renderer.device)
+			contact1 = torch.tensor(g[-1][1]).to(renderer.device)
+			world_center = world_centers[g[0]]
+			world_axis = world_axes[g[0]]
+
+			if save_grasp and i<num_samples:
+				# save object to visualize grasp
+				cls.logger.debug("saving new grasp visualization object")
+				f_name = save_grasp + "/grasp_" + str(i) +".obj"
+				renderer.grasp_sphere((contact0, contact1), mesh, f_name)
+
+			grasp = Grasp(depth=world_center[:-1], world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality)
+			grasp.trans_world_to_im(renderer.camera)
+
+			cls.logger.info("image grasp: %s", str(grasp))
+			print("\tcontact0:", grasp.c0)
+			print("\tcontact1:", grasp.c1)
+
+			ret_grasps.append(grasp)
+
+		return ret_grasps[:num_samples]
+
+
+	def extract_tensors(self, d_im):
+		"""
+		Use grasp information and depth image to get image and pose tensors in form of GQCNN input
+		Parameters
+		----------
+		d_im: numpy.ndarray
+			Numpy array depth image of object being grasped
+		Returns
+		-------
+		torch.tensor: pose_tensor, torch.tensor: image_tensor
+			pose_tensor: 1 x 1 tensor of grasp pose
+			image_tensor: 1 x 1 x 32 x 32 tensor of depth image processed for grasp
+		"""
+
+		# check type of input_dim
+		if isinstance(d_im, np.ndarray):
+			torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1).to(device)
+		else:
+			torch_dim = d_im
+
+		# construct pose tensor from grasp depth
+		pose_tensor = torch.zeros([1, 1])
+		pose_tensor = pose_tensor.to(torch_dim.device)
+		pose_tensor[0] = self.depth
+
+		# process depth image wrt grasp (steps 1-3) 
+		
+		# 1 - resize image tensor
+		out_shape = torch.tensor([torch_dim.shape], dtype=torch.float32)
+		out_shape *= (1/3)		# using 1/3 based on gqcnn library - may need to change depending on input
+		out_shape = tuple(out_shape.type(torch.int)[0][1:].numpy())
+
+		torch_transform = transforms.Resize(out_shape, antialias=False) 
+		torch_image_tensor = torch_transform(torch_dim)
+
+
+		# 2 - translate wrt to grasp angle and grasp center 
+		theta = -1 * math.degrees(self.im_angle)
+		 
+		dim_cx = torch_dim.shape[2] // 2
+		dim_cy = torch_dim.shape[1] // 2	
+		
+		translate = ((self.im_center[0] - dim_cx) / 3, (self.im_center[1]- dim_cy) / 3)
+
+		cx = torch_image_tensor.shape[2] // 2
+		cy = torch_image_tensor.shape[1] // 2
+
+		# keep as two separate transformations so translation is performed before rotation
+		torch_translated = transforms.functional.affine(
+			torch_image_tensor,
+			0,		# angle of rotation in degrees clockwise, between -180 and 180 inclusive
+			translate,
+			scale=1,	# no scale
+			shear=0,	# no shear 
+			interpolation=transforms.InterpolationMode.BILINEAR,
+			center=(cx, cy)	
+		)
+		
+		torch_translated = transforms.functional.affine(
+			torch_translated,
+			theta,
+			translate=(0, 0),
+			scale=1,
+			shear=0,
+			interpolation=transforms.InterpolationMode.BILINEAR,
+			center=(cx, cy)
+		)
+
+		# 3 - crop image to size (32, 32)
+		torch_cropped = transforms.functional.crop(torch_translated, cy-17, cx-17, 32, 32)
+		image_tensor = torch_cropped.unsqueeze(0)
+
+		return pose_tensor, image_tensor 
+
 def save_nparr(image, filename):
 	""" 
 	Save numpy.ndarray image in the shared dir
@@ -192,179 +369,7 @@ def save_nparr(image, filename):
 	filepath = os.path.join(SHARED_DIR, filename)
 	np.save(filepath, image)
 
-
-def sample_grasps(obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, save_grasp=""):
-	"""
-	Samples grasps using dexnet oracle and returns grasps with qualities between min_qual and max_qual
-	  inclusive. Contains RPC to oracle.py in running docker container. Saves new grasp object with an 
-	  added sphere to visualize grasp if desired (default: does not save new grasp object)
-	Parameters
-	----------
-	obj_f: String
-		path to the .obj file of the mesh to be grasped
-	num_samples: int
-		Total number of grasps to evaluate (lower bound for number of grasps returned)
-	renderer: Renderer object
-		Renderer to use to render mesh object with camera to convert grasp info to image space	
-	min_qual: float
-		Float between 0.0 and 1.0, minimum quality for returned grasps, defaults to 0.002 according to robust ferrari canny method
-		NOTE: Currently returns a grasp if force_closure metric returns 1 or robust ferrari canny quality is above min_qual
-	max_qual: float
-		Float between 0.0 and 1.0, maximum quality for returned grasps, defaults to 1.0
-	save_grasp: String
-		If empty string, no new grasp objects are saved
-		If not empty, this is the path to the directory where to save new grasp objects that have a sphere added to visualize the grasp
-	Returns
-	-------
-	List of Grasp objects with quality between min_qual and max_qual inclusive
-	"""
-
-	# test logging
-	logger.info("sampling grasps")
-	cands = []
-
-	# renderer mesh
-	mesh, _ = renderer.render_object(obj_f, display=False)
-
-	while len(cands) < num_samples:
-
-		# randomly sample surface points for possible grasps
-		samples_c0 = sample_points_from_meshes(mesh, num_samples*1500)[0]
-		samples_c1 = sample_points_from_meshes(mesh, num_samples*1500)[0]
-		norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
-
-		# mask to eliminate grasps that don't fit in the gripper
-		mask = (norms > 0.0) & (norms <= 0.05)
-		mask = mask.squeeze()
-		norms = norms[mask]
-		c0 = samples_c0[mask, :]
-		c1 = samples_c1[mask, :]
-	
-		# computer grasp center and axis
-		world_centers = (c0 + c1) / 2
-		world_axes = (c1 - c0) / norms.unsqueeze(1)
-
-		# get close_fingers result and quality from gqcnn
-		logger.info("sending %d grasps to server", world_centers.shape[0])
-
-		Pyro4.config.COMMTIMEOUT = None
-		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
-		save_nparr(world_centers.detach().cpu().numpy(), "temp_centers.npy")
-		save_nparr(world_axes.detach().cpu().numpy(), "temp_axes.npy")
-		results = server.close_fingers("temp_centers.npy", "temp_axes.npy")
-		#	results returns list of lists of form [[int: index, Bool: force closure quality, float: rfc quality, (array, array): contact points], ...]
-		logger.info("%d successful grasps returned", len(results))
-
-		cands = cands + results
-
-	# transform successful grasps to image space
-	ret_grasps = []
-	for i in range(len(cands)):
-		g = cands[i]
-		quality = g[1:-1]
-		contact0 = torch.tensor(g[-1][0]).to(renderer.device)
-		contact1 = torch.tensor(g[-1][1]).to(renderer.device)
-		world_center = world_centers[g[0]]
-		world_axis = world_axes[g[0]]
-
-		if save_grasp and i<num_samples:
-			# save object to visualize grasp
-			logger.debug("saving new grasp visualization object")
-			f_name = save_grasp + "/grasp_" + str(i) +".obj"
-			renderer.grasp_sphere((contact0, contact1), mesh, f_name)
-
-		grasp = Grasp(depth=world_center[:-1], world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality)
-		grasp.trans_world_to_im(renderer.camera)
-
-		logger.info("image grasp: %s", str(grasp))
-		print("\tcontact0:", grasp.c0)
-		print("\tcontact1:", grasp.c1)
-
-		ret_grasps.append(grasp)
-
-	return ret_grasps[:num_samples]
-
-
-def extract_tensors(d_im, grasp, logger):
-	"""
-	Use grasp information and depth image to get image and pose tensors in form of GQCNN input
-	Parameters
-	----------
-	d_im: numpy.ndarray
-		Numpy array depth image of object being grasped
-	grasp: Grasp object
-		Grasp to process depth image with respect to
-	Returns
-	-------
-	torch.tensor: pose_tensor, torch.tensor: image_tensor
-		pose_tensor: 1 x 1 tensor of grasp pose
-		image_tensor: 1 x 1 x 32 x 32 tensor of depth image processed for grasp
-	"""
-
-	# check type of input_dim
-	if isinstance(d_im, np.ndarray):
-		torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1).to(device)
-	else:
-		torch_dim = d_im
-
-	# construct pose tensor from grasp depth
-	pose_tensor = torch.zeros([1, 1])
-	pose_tensor = pose_tensor.to(torch_dim.device)
-	pose_tensor[0] = grasp.depth
-
-	# process depth image wrt grasp (steps 1-3) 
-	
-	# 1 - resize image tensor
-	out_shape = torch.tensor([torch_dim.shape], dtype=torch.float32)
-	out_shape *= (1/3)		# using 1/3 based on gqcnn library - may need to change depending on input
-	out_shape = tuple(out_shape.type(torch.int)[0][1:].numpy())
-	logger.debug("out_shape: %s", out_shape)
-
-	torch_transform = transforms.Resize(out_shape, antialias=False) 
-	torch_image_tensor = torch_transform(torch_dim)
-	logger.debug("torch_image_tensor shape: %s", torch_image_tensor.shape)
-
-
-	# 2 - translate wrt to grasp angle and grasp center 
-	theta = -1 * math.degrees(grasp.im_angle)
-	
-	dim_cx = torch_dim.shape[2] // 2
-	dim_cy = torch_dim.shape[1] // 2	
-	
-	translate = ((grasp.im_center[0] - dim_cx) / 3, (grasp.im_center[1]- dim_cy) / 3)
-
-	cx = torch_image_tensor.shape[2] // 2
-	cy = torch_image_tensor.shape[1] // 2
-
-	# keep as two separate transformations so translation is performed before rotation
-	torch_translated = transforms.functional.affine(
-		torch_image_tensor,
-		0,		# angle of rotation in degrees clockwise, between -180 and 180 inclusive
-		translate,
-		scale=1,	# no scale
-		shear=0,	# no shear 
-		interpolation=transforms.InterpolationMode.BILINEAR,
-		center=(cx, cy)	
-	)
-	
-	torch_translated = transforms.functional.affine(
-		torch_translated,
-		theta,
-		translate=(0, 0),
-		scale=1,
-		shear=0,
-		interpolation=transforms.InterpolationMode.BILINEAR,
-		center=(cx, cy)
-	)
-	logger.debug("torch_translated shape: %s", torch_translated.shape)
-
-	# 3 - crop image to size (32, 32)
-	torch_cropped = transforms.functional.crop(torch_translated, cy-17, cx-17, 32, 32)
-	image_tensor = torch_cropped.unsqueeze(0)
-
-	return pose_tensor, image_tensor 
-
-def test_select_grasp(logger):
+def test_select_grasp():
 	model = KitModel("weights.npy")
 	model.eval()
 	run1 = Attack(model=model)
@@ -377,7 +382,7 @@ def test_select_grasp(logger):
 		im_center=(416, 286), 
 		im_angle=-2.896613990462929, 
 	)
-	pose, image = extract_tensors(depth0, grasp, logger)	# tensor extraction
+	pose, image = grasp.extract_tensors(depth0)	# tensor extraction
 	print("prediction:", run1.run(pose, image))		# gqcnn prediction
 	renderer1.display(image)
 
@@ -385,18 +390,18 @@ def test_select_grasp(logger):
 	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=False, title="imported renderer")
 	d_im = renderer1.mesh_to_depth_im(mesh, display=True)
 
-	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="vis_grasps")
+	grasps = Grasp.sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="vis_grasps")
 	for i in range(len(grasps)):
 		grasp = grasps[i]
 		qual = grasp.rfc_quality
-		pose, image = extract_tensors(d_im, grasp, logger)
+		pose, image = grasp.extract_tensors(d_im)
 		prediction = run1.run(pose, image)
 		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
 		renderer1.display(image, title=t)
 
 	return "success"
 
-def test_save_and_load_grasps(logger):
+def test_save_and_load_grasps():
 
 	renderer1 = Renderer()
 
@@ -440,17 +445,8 @@ def test_save_and_load_grasps(logger):
 	
 if __name__ == "__main__":
 
-	# SET UP LOGGING
-	logger = logging.getLogger('select_grasp')
-	logger.setLevel(logging.INFO)
-	ch = logging.StreamHandler()
-	ch.setLevel(logging.INFO)
-	formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-	ch.setFormatter(formatter)
-	logger.addHandler(ch)
-
-	# print(test_select_grasp(logger))
-	print(test_save_and_load_grasps(logger))
+	print(test_select_grasp())
+	# print(test_save_and_load_grasps())
 
 	"""
 	renderer1 = Renderer()
@@ -496,7 +492,7 @@ if __name__ == "__main__":
 
 	grasp.trans_world_to_im(renderer1.camera)
 	# renderer1.grasp_sphere((grasp.c0, grasp.c1), mesh, "vis_grasps/axis_test.obj")
-	pose, image = extract_tensors(d_im, grasp, logger)
+	pose, image = grasp.extract_tensors(d_im)
 	renderer1.display(image, title="axis_test")
 	model_out = model(pose, image)[0][0].item()
 	print("model prediction:", model_out)
@@ -516,7 +512,7 @@ if __name__ == "__main__":
 	print("\noutput points:\n", grasp.im_center, "\n", grasp.im_axis, "\n")
 	print(renderer1.camera.get_world_to_view_transform().get_matrix())
 
-	pose, image = extract_tensors(d_im, grasp, logger)
+	pose, image = grasp.extract_tensors(d_im)
 	renderer1.display(image)
 
 	# Find max and min vertices for each axis
@@ -565,7 +561,7 @@ if __name__ == "__main__":
 		# print("camera transform:", cam_trans[0])
 
 		# view processed depth image
-		_, image = extract_tensors(d_im, grasp, logger)
+		_, image = grasp.extract_tensors(d_im)
 		renderer1.display(image, title=label)
 
 		# # save new grasp object for visualization
@@ -582,12 +578,12 @@ if __name__ == "__main__":
 
 	"""
 	# TESTING SAMPLE GRASPS METHOD AND VISUALIZING
-	grasps = sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
+	grasps = Grasp.sample_grasps("data/bar_clamp.obj", 1, renderer=renderer1, save_grasp="")	#"vis_grasps")
 	# VISUALIZE SAMPLED GRASPS
 	for i in range(len(grasps)):
 		grasp = grasps[i]
 		qual = grasp.rfc_quality
-		pose, image = extract_tensors(d_im, grasp, logger)
+		pose, image = grasp.extract_tensors(d_im)
 		prediction = run1.run(pose, image)
 		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
 		renderer1.display(image, title=t)

@@ -13,13 +13,22 @@ SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
 class Attack: 
 
-	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None, logger=None):
+	# SET UP LOGGING
+	logger = logging.getLogger('run_gqcnn')
+	logger.setLevel(logging.INFO)
+	if not logger.handlers:
+		ch = logging.StreamHandler()
+		ch.setLevel(logging.INFO)
+		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+		ch.setFormatter(formatter)
+		logger.addHandler(ch)
+
+	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None):
 		self.num_plots = num_plots
 		self.steps_per_plot = steps_per_plot
 		self.num_steps = num_plots * steps_per_plot
 		self.model = model
 		self.renderer = renderer
-		self.logger = logger
 		self.loss_weights = {
 			"edge": 10,
 			"normal": 5,
@@ -57,7 +66,7 @@ class Attack:
 		plt.show()
 		plt.savefig(dir+"losses.png")
 
-	def oracle_eval(self, grasp, obj_file, logger):
+	def oracle_eval(self, grasp, obj_file):
 		"""
 		Get a final oracle evaluation of a mesh object via remote call to docker container.
 
@@ -76,13 +85,13 @@ class Attack:
 
 		# check if object file is already saved in shared directory and copy there if not
 		if not os.path.isfile(obj_file):
-			logger.error("Object for oracle evaluation does not exist.")
+			Attack.logger.error("Object for oracle evaluation does not exist.")
 			return None
 
 		obj_name = obj_file.split("/")[-1]
 		obj_shared = SHARED_DIR + "/" + obj_name
 		if not os.path.isfile(obj_shared):
-			logger.info("Saving object file to shared directory (%s) for oracle evaluation", SHARED_DIR)
+			Attack.logger.info("Saving object file to shared directory (%s) for oracle evaluation", SHARED_DIR)
 			shutil.copyfile(obj_file, obj_shared)
 
 		# save grasp info for oracle evaluation
@@ -115,7 +124,7 @@ class Attack:
 		# CHECK CURRENT MODEL PREDICTION
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
-		pose, image = extract_tensors(dim, grasp, logger)
+		pose, image = grasp.extract_tensors(dim)
 		out = self.run(pose, image)
 		cur_pred = out[0][0]
 		cur_pred = cur_pred.to(adv_mesh.device)
@@ -161,7 +170,7 @@ class Attack:
 
 		return loss, adv_mesh, model_pred
 
-	def attack(self, mesh, grasp, dir, lr, momentum, logger):
+	def attack(self, mesh, grasp, dir, lr, momentum):
 		"""
 		Run an attack on the model for number of steps specified in self.num_steps
 
@@ -215,7 +224,7 @@ class Attack:
 		save_obj(final_mesh_file, verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
 
 		# get final oracle prediction
-		oracle = self.oracle_eval(grasp, final_mesh_file, logger)
+		oracle = self.oracle_eval(grasp, final_mesh_file)
 
 		# save final image and attack info, plot losses
 		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle[0])
@@ -233,10 +242,10 @@ class Attack:
 		with open(dir+"setup.txt", "w") as f:
 			json.dump(data, f, indent=4)
 
-		_, image = extract_tensors(dim, grasp, logger)
+		_, image = grasp.extract_tensors(dim)
 		return final_mesh, image
 
-def test_run(logger):
+def test_run():
 	"""Test prediction of gqcnn_pytorch model"""
 
 	if torch.cuda.is_available():
@@ -254,18 +263,18 @@ def test_run(logger):
 	image0 = torch.from_numpy(np.load("data/image_tensor1_raw.npy")).float().permute(0,3,1,2).to(device)
 
 	# tensors from pytorch extraction
-	pose1, image1 = extract_tensors(depth0, grasp, logger)
+	pose1, image1 = grasp.extract_tensors(depth0)
 
 	# tensors from pytorch extraction & pytorch depth image
 	renderer = Renderer()
 	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
-	pose2, image2 = extract_tensors(dim, grasp, logger)
+	pose2, image2 = grasp.extract_tensors(dim)
 
 	# testing with new barclamp object
 	mesh2, _ = renderer.render_object("data/new_barclamp.obj", display=False)
 	dim2 = renderer.mesh_to_depth_im(mesh2, display=False)
-	pose3, image3 = extract_tensors(dim2, grasp, logger)
+	pose3, image3 = grasp.extract_tensors(dim2)
 
 	# instantiate GQCNN PyTorch model
 	model = KitModel("weights.npy")
@@ -280,7 +289,7 @@ def test_run(logger):
 	
 	return "success"
 
-def test_attack(logger):
+def test_attack():
 	"""Test attack on gqcnn_pytorch model"""
 
 	# RENDER MESH AND DEPTH IMAGE
@@ -298,31 +307,22 @@ def test_attack(logger):
 		c1=torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0'))
 	grasp.trans_world_to_im(renderer.camera)
 
-	pose, image = extract_tensors(dim, grasp, logger)
+	pose, image = grasp.extract_tensors(dim)
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=renderer, logger=logger)
+	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=renderer)
 
 	# MODEL VISUALIZATIONS
 	print("model print:")
 	print(model)
 
-	logger.info("ATTACK")
-	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex07/", lr=1e-5, momentum=0.9, logger=logger)
+	Attack.logger.info("ATTACK")
+	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex07/", lr=1e-5, momentum=0.9)
 	renderer.display(final_pic, title="final_grasp", save=True, fname="experiment-results/ex07/final-grasp.png")
 
 	return "success"
 
 if __name__ == "__main__":
-	# SET UP LOGGING
-	logger = logging.getLogger('run_gqcnn')
-	logger.setLevel(logging.INFO)
-	ch = logging.StreamHandler()
-	ch.setLevel(logging.INFO)
-	formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-	ch.setFormatter(formatter)
-	logger.addHandler(ch)
-
-	# print(test_run(logger))
-	print(test_attack(logger))
+	# print(test_run())
+	print(test_attack())
