@@ -96,6 +96,14 @@ class Renderer:
 		verts, faces_idx, _ = load_obj(obj_file)
 		faces = faces_idx.verts_idx
 
+		# check that vertices are unique, and fix if not
+		unique_vals, inverse_indices = torch.unique(verts, sorted=False, return_inverse=True, return_counts=False, dim=0)
+		if (len(unique_vals) != len(verts)):
+			faces_flat = faces_idx.verts_idx.flatten()
+			new_faces_flat = torch.index_select(inverse_indices, 0, faces_flat)
+			faces = new_faces_flat.reshape(faces_idx.verts_idx.shape)
+			verts = unique_vals
+
 		verts_rgb = torch.ones_like(verts)[None]
 		textures = TexturesVertex(verts_features=verts_rgb.to(self.device))
 
@@ -167,11 +175,9 @@ class Renderer:
 		plt.axis("off")
 		if title:
 			plt.title(title)
-		#plt.show()
 
 		if save and fname:
 			plt.savefig(fname)
-		
 		else:
 			plt.show()
 
@@ -196,12 +202,9 @@ class Renderer:
 			print("mesh_to_depth_im: input not a mesh.")
 			return None
 	
-		depth_im = self.rasterizer(mesh).zbuf.squeeze(-1)#.squeeze(0)
-		# depth_im = depth_im.cpu().detach().numpy()
+		depth_im = self.rasterizer(mesh).zbuf.squeeze(-1)
 
 		# ADD TABLE
-		# max_depth = np.max(depth_im)
-		# depth_im[depth_im == -1] = max_depth 
 		max_depth = torch.max(depth_im)	
 		depth_im = torch.where(depth_im == -1, max_depth, depth_im)
 
@@ -267,7 +270,7 @@ def test_renderer():
 	renderer1.display(mesh2, title="testing mesh -> display 2")
 	renderer1.display(image, title="testing torch.tensor -> display")
 	renderer1.display(image2, title="testing torch.tensor -> display 2")
-	# renderer1.display(np.load("data/depth_0.npy"), title="testing np.ndarray -> display")
+	renderer1.display(np.load("data/depth_0.npy"), title="testing np.ndarray -> display")
 
 	# test mesh_to_depth_im -> display np.array
 	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="original barclamp obj")#title="testing mesh_to_depth_im")
