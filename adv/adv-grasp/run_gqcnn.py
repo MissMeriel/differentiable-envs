@@ -1,3 +1,4 @@
+import shutil
 import logging
 import numpy as np
 from torchviz import make_dot
@@ -8,17 +9,20 @@ from render import *
 from gqcnn_pytorch import KitModel
 from select_grasp import *
 
+SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
+
 class Attack: 
 
-	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None):
+	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None, logger=None):
 		self.num_plots = num_plots
 		self.steps_per_plot = steps_per_plot
 		self.num_steps = num_plots * steps_per_plot
 		self.model = model
 		self.renderer = renderer
+		self.logger = logger
 		self.loss_weights = {
 			"edge": 10,
-			"normal": 10,
+			"normal": 5,
 			"smooth": 10
 		}
 		self.losses = None
@@ -53,6 +57,46 @@ class Attack:
 		plt.show()
 		plt.savefig(dir+"losses.png")
 
+	def oracle_eval(self, grasp, obj_file, logger):
+		"""
+		Get a final oracle evaluation of a mesh object via remote call to docker container.
+
+		Parameters
+		----------
+		grasp: Grasp
+			The grasp that is being evaluated
+		obj_file: String
+			The path to the .obj file of the mesh to evaluate
+		Returns
+		-------
+		List: [Boolean, float]
+			List[0]: Boolean quality from force_closure evaluation of dex-net oracle
+			List[1]: float quality value from robust_ferrari_canny evaluation of dex-net oracle
+		"""
+
+		# check if object file is already saved in shared directory and copy there if not
+		if not os.path.isfile(obj_file):
+			logger.error("Object for oracle evaluation does not exist.")
+			return None
+
+		obj_name = obj_file.split("/")[-1]
+		obj_shared = SHARED_DIR + "/" + obj_name
+		if not os.path.isfile(obj_shared):
+			logger.info("Saving object file to shared directory (%s) for oracle evaluation", SHARED_DIR)
+			shutil.copyfile(obj_file, obj_shared)
+
+		# save grasp info for oracle evaluation
+		Pyro4.config.COMMTIMEOUT = None
+		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
+		calc_axis = (grasp.c1 - grasp.c0) / torch.linalg.norm((grasp.c1 - grasp.c0))
+		save_nparr(grasp.world_center.detach().cpu().numpy(), "temp_center.npy")
+		save_nparr(calc_axis.detach().cpu().numpy(), "temp_axis.npy")
+		results = server.final_eval("temp_center.npy", "temp_axis.npy", obj_name)
+
+		print("ORACLE EVALUATION RESULTS:", results)
+		return results
+
+
 	def calc_loss(self, adv_mesh, grasp):
 		"""
 		Calculates loss for the adversarial attack to maximize difference between oracle and model prediction
@@ -84,7 +128,6 @@ class Attack:
 		edge_loss = mesh_edge_loss(adv_mesh) * self.loss_weights["edge"]
 		normal_loss = mesh_normal_consistency(adv_mesh) * self.loss_weights["normal"]
 		smooth_loss = mesh_laplacian_smoothing(adv_mesh) * self.loss_weights["smooth"]
-		#print("\nedge_loss:", edge_loss.item(), "\nnormal_loss:", normal_loss.item(), "\nsmooth_loss", smooth_loss.item())
 		weighted_loss = loss + edge_loss + normal_loss + smooth_loss
 		self.losses["prediction"].append(loss.item())
 		self.losses["edge"].append(edge_loss.item())
@@ -118,7 +161,7 @@ class Attack:
 
 		return loss, adv_mesh, model_pred
 
-	def attack(self, mesh, grasp, dir, lr, momentum):
+	def attack(self, mesh, grasp, dir, lr, momentum, logger):
 		"""
 		Run an attack on the model for number of steps specified in self.num_steps
 
@@ -135,16 +178,10 @@ class Attack:
 		# start by saving attack information
 		if dir[-1] != "/":
 			dir = dir+"/"
+		if not os.path.exists(dir):
+			os.mkdir(dir)
 		save_obj(dir+"initial-mesh.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		grasp.save(dir+"grasp.json")
-		data = {
-			"lr": lr,
-			"momentum": momentum,
-			"optimizer": "SGD",
-			"loss weights": list(self.loss_weights.items())
-		}
-		with open(dir+"setup.txt", "w") as f:
-			json.dump(data, f, indent=4)
 
 		# reset loss tracking to plot at the end
 		self.losses = {
@@ -156,9 +193,6 @@ class Attack:
 
 		# param = mesh.verts_packed().clone().detach().requires_grad_(True)
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
-		print("param before:", param)
-		print("param grad before:", param.grad)
-		print("\n\n")
 		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
 		adv_mesh = mesh.clone()
@@ -168,23 +202,36 @@ class Attack:
 			loss, adv_mesh, model_pred = self.perturb(mesh, param, grasp)
 			loss.backward()
 			optimizer.step()
-			# print("\n")
 			print(f"step {i}\t{loss.item()=:.4f}")
-			# print("param:", param)
-			# print("param grad:", param.grad)
 
 			if i % self.steps_per_plot == 0:
 				title="step " + str(i) + " loss: " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item())
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
 
-		# save final image and object and plot losses
+		# save final object
 		final_mesh = mesh.offset_verts(param)
-		save_obj(dir+"final-mesh.obj", verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
-		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item())
+		final_mesh_file = dir+"final-mesh.obj"
+		save_obj(final_mesh_file, verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
+
+		# get final oracle prediction
+		oracle = self.oracle_eval(grasp, final_mesh_file, logger)
+
+		# save final image and attack info, plot losses
+		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle[0])
 		filename = dir + "step" + str(self.num_steps) + ".png"
 		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
 		Attack.plot_losses(self.losses, dir)
+		data = {
+			"lr": lr,
+			"momentum": momentum,
+			"optimizer": "SGD",
+			"loss weights": list(self.loss_weights.items()), 
+			"final oracle fc": oracle[0],
+			"final oracle rfc": oracle[1]
+		}
+		with open(dir+"setup.txt", "w") as f:
+			json.dump(data, f, indent=4)
 
 		_, image = extract_tensors(dim, grasp, logger)
 		return final_mesh, image
@@ -255,26 +302,17 @@ def test_attack(logger):
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=renderer)
+	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=renderer, logger=logger)
 
 	# MODEL VISUALIZATIONS
 	print("model print:")
 	print(model)
 
-	# yhat = model(pose, image)
-	# make_dot(yhat, params=dict(list(model.named_parameters()))).render("rnn_torchviz", format="png")
-
-	# print("oracle rfc value:", grasp.rfc_quality)
-	# print("oracle fc value:", grasp.fc_quality)
-	# print("prediction:", run1.run(pose, image)[0][0].item())
-
-	print("\nattack")
-	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex03/", lr=1e-5, momentum=0.9)
-	renderer.display(final_pic, title="final_grasp", save=True, fname="experiment-results/ex03/final-grasp.png")
+	logger.info("ATTACK")
+	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex07/", lr=1e-5, momentum=0.9, logger=logger)
+	renderer.display(final_pic, title="final_grasp", save=True, fname="experiment-results/ex07/final-grasp.png")
 
 	return "success"
-
-
 
 if __name__ == "__main__":
 	# SET UP LOGGING
@@ -286,7 +324,5 @@ if __name__ == "__main__":
 	ch.setFormatter(formatter)
 	logger.addHandler(ch)
 
-	print(test_run(logger))
-	# print(test_attack(logger))
-
-
+	# print(test_run(logger))
+	print(test_attack(logger))

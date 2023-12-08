@@ -90,6 +90,32 @@ class Server(object):
 
 		return ret 
 
+	def final_eval(self, centerfile, axisfile, objfile):
+
+		# create GraspableObject3D
+		obj_path = os.path.join(SHARED_DIR, objfile)
+		of = ObjFile(obj_path)
+		mesh = of.read()
+		sdf_file = objfile.split(".")[0] + ".sdf"
+		sdf_path = os.path.join(SHARED_DIR, sdf_file)
+		if not os.path.isfile(sdf_path):
+				mesh2sdf(obj_path)
+		sf = SdfFile(sdf_path)
+		sdf = sf.read()
+		obj = GraspableObject3D(sdf, mesh)
+
+		# create ParallelJawPtGrasp3D object from grasp
+		center = np.load(os.path.join(SHARED_DIR, centerfile))
+		axis = np.load(os.path.join(SHARED_DIR, axisfile))
+		g = ParallelJawPtGrasp3D(ParallelJawPtGrasp3D.configuration_from_params(center, axis, 0.05))
+		success, contacts = g.close_fingers(obj)
+
+		if success:
+				q = self.quality(g, obj)
+				return [success, q[0]]
+
+		return [0, 0.0]
+
 # set up logger
 logger = logging.getLogger("dexnet_server")
 logger.setLevel(logging.DEBUG)
