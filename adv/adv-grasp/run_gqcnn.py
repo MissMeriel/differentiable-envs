@@ -215,6 +215,11 @@ def test_run(logger):
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
 	pose2, image2 = extract_tensors(dim, grasp, logger)
 
+	# testing with new barclamp object
+	mesh2, _ = renderer.render_object("data/new_barclamp.obj", display=False)
+	dim2 = renderer.mesh_to_depth_im(mesh2, display=False)
+	pose3, image3 = extract_tensors(dim2, grasp, logger)
+
 	# instantiate GQCNN PyTorch model
 	model = KitModel("weights.npy")
 	model.eval()
@@ -223,7 +228,8 @@ def test_run(logger):
 	run1 = Attack(model=model)
 	print(run1.run(pose0, image0)[0])
 	print(run1.run(pose1, image1)[0])
-	print(run1.run(pose2, image2)[0])
+	print(run1.run(pose2, image2)[0])	# original barclamp object
+	print(run1.run(pose3, image3)[0])	# new barclamp object
 	
 	return "success"
 
@@ -234,7 +240,6 @@ def test_attack(logger):
 	renderer = Renderer()
 	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
-	# dim = dim[:, :, np.newaxis]
 
 	# FIXED GRASP TO ATTACK
 	grasp = Grasp(
@@ -281,7 +286,7 @@ if __name__ == "__main__":
 	ch.setFormatter(formatter)
 	logger.addHandler(ch)
 
-	# print(test_run(logger))
-	print(test_attack(logger))
+	print(test_run(logger))
+	# print(test_attack(logger))
 
 

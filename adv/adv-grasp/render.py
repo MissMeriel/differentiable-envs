@@ -171,6 +171,9 @@ class Renderer:
 
 		if save and fname:
 			plt.savefig(fname)
+		
+		else:
+			plt.show()
 
 	def mesh_to_depth_im(self, mesh, display=True, title=None, save=False, fname=None):
 		"""
@@ -248,26 +251,30 @@ class Renderer:
 		return mesh
 
 def test_renderer():
-    # instantiate Renderer object with default parameters
-    renderer1 = Renderer()
+	# instantiate Renderer object with default parameters
+	renderer1 = Renderer()
 
-    # test render_obj -> render_mesh -> display mesh
-    mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="testing render_obj -> render_mesh")
+	# test render_obj -> render_mesh -> display mesh
+	mesh, image = renderer1.render_object("data/bar_clamp.obj", display=True, title="original barclamp obj")#title="testing render_obj -> render_mesh")
+	mesh2, image2 = renderer1.render_object("data/new_barclamp.obj", display=True, title="new barclamp obj")#title="testing render_obj -> render_mesh 2")
 
-    """
 	# test render_mesh
 	tens = renderer1.render_mesh(mesh, display=True, title="testing mesh -> render_mesh")
+	tens2 = renderer1.render_mesh(mesh2, display=True, title="testing mesh -> render_mesh 2")
 
 	# test display with all possible input types
 	renderer1.display(mesh, title="testing mesh -> display")
+	renderer1.display(mesh2, title="testing mesh -> display 2")
 	renderer1.display(image, title="testing torch.tensor -> display")
-	renderer1.display(np.load("data/depth_0.npy"), title="testing np.ndarray -> display")
+	renderer1.display(image2, title="testing torch.tensor -> display 2")
+	# renderer1.display(np.load("data/depth_0.npy"), title="testing np.ndarray -> display")
 
 	# test mesh_to_depth_im -> display np.array
-	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="testing mesh_to_depth_im")
-    """
+	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="original barclamp obj")#title="testing mesh_to_depth_im")
+	depth_im2 = renderer1.mesh_to_depth_im(mesh2, display=True, title="new barclamp obj")#title="testing mesh_to_depth_im 2")
+    
 
-    return "success"
+	return "success"
 
 if __name__ == "__main__":
 	print(test_renderer())
