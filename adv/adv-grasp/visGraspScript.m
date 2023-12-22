@@ -7,10 +7,13 @@ alpha 0.5
 for i = 1:size(bar.f.v,1)
     triangle = bar.v(bar.f.v(i,:)',:);
     triangleCenter = mean(triangle,1);
+    dir1 = triangle(2,1:3)-triangle(1,1:3);
+    dir1 = dir1/norm(dir1);
+    dir2 = triangle(3,1:3)-triangle(1,1:3);
+    dir2 = dir2/norm(dir2);
     text(triangleCenter(1),triangleCenter(2),triangleCenter(3),num2str(i));
-    if i == 252
-        plot3(triangle(:,1),triangle(:,2),triangle(:,3),'r*')
-    end
+    normal = cross(dir1,dir2)*0.05/2;
+    quiver3(triangleCenter(1),triangleCenter(2),triangleCenter(3),normal(1),normal(2),normal(3),'b','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
 end
 %pcshow(bar.v(:,1:3))
 ray_o = [[-0.0472,  0.0167, -0.0634];
