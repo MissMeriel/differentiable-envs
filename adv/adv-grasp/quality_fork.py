@@ -334,11 +334,13 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         # Compute object center of mass.
         object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
 
-        # Compute negative SSE from the best fit plane for each grasp.
-        antipodality_thresh = abs(
-            np.percentile(antipodality_q, 100 - self._antipodality_pctile))
+        # Can rank grasps, instead of compute absolute score. Only makes sense if seeding many grasps
+        # antipodality_thresh = abs(
+        #     np.percentile(antipodality_q, 100 - self._antipodality_pctile))
         qualities = []
-        max_q = max(state.rgbd_im.height, state.rgbd_im.width)
+        max_q = torch.norm(torch.diff(state.get_bounding_boxes(),1,2))
+
+        
         for i, action in enumerate(actions):
             q = max_q
             friction_cone_angle = antipodality_q[i]
