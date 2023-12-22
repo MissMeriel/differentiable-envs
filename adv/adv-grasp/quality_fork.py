@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from pytorch3d.io import load_obj
+import pytorch3d.transforms as tf
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
         look_at_view_transform,
@@ -64,7 +65,7 @@ class Grasp2D(object):
             self.camera_intr = camera_intr
 	"""
         self.camera_intr = camera_intr
-
+        
 
         self.contact_points = contact_points
         self.contact_normals = contact_normals
@@ -80,7 +81,24 @@ class Grasp2D(object):
     @property
     def axis(self):
         """Returns the grasp axis."""
-        return np.array([np.cos(self.angle), np.sin(self.angle)])
+        return torch.cat((torch.cos(self.angle), torch.sin(self.angle)), dim=1)
+    
+    @property
+    def axis3D(self):
+        """Returns the grasp axis."""
+        axis_in_camera = torch.cat((self.axis, torch.zeros([self.axis.shape[0],1],device=self.axis.device)), dim=1)
+        return self.camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera)
+    
+    @property
+    def center3D(self):
+        """Returns the grasp axis."""
+        center_in_camera = torch.cat((self.center, self.depth), dim=1)
+        return self.camera_intr.unproject_points(center_in_camera, world_coordinates=True)
+    
+    @property
+    def tform_to_camera(self):
+        """Returns the grasp axis."""
+        return self.camera_intr.get_full_projection_transform()
 
     @property
     def approach_axis(self):
@@ -108,19 +126,26 @@ class Grasp2D(object):
                                        " compute gripper width in 3D space.")
             raise ValueError(missing_camera_intr_msg)
         # Form the jaw locations in 3D space at the given depth.
-        p1 = Point(np.array([0, 0, self.depth]), frame=self.frame)
-        p2 = Point(np.array([self.width, 0, self.depth]), frame=self.frame)
+        p1 =torch.cat((torch.zeros([self.depth.shape[0],2],device=self.depth.device), self.depth), dim=1)
+        p2 =torch.cat((self.depth, torch.zeros([self.depth.shape[0],1],device=self.depth.device), self.depth), dim=1)
 
         # Project into pixel space.
-        u1 = self.camera_intr.project(p1)
-        u2 = self.camera_intr.project(p2)
-        return np.linalg.norm(u1.data - u2.data)
+        u1 = self.camera_intr.transform_points(p1)
+        u2 = self.camera_intr.transform_points(p2)
+        return torch.norm(u1 - u2,dim=-1)
 
     @property
     def endpoints(self):
         """Returns the grasp endpoints."""
-        p1 = self.center.data - (self.width_px / 2) * self.axis
-        p2 = self.center.data + (self.width_px / 2) * self.axis
+        p1 = self.center - (self.width_px / 2) * self.axis
+        p2 = self.center + (self.width_px / 2) * self.axis
+        return p1, p2
+    
+    @property
+    def endpoints3D(self):
+        """Returns the grasp endpoints."""
+        p1 = self.center3D - (self.width / 2) * self.axis3D
+        p2 = self.center3D + (self.width / 2) * self.axis3D
         return p1, p2
 
     @property
@@ -184,13 +209,15 @@ class ParallelJawQualityFunction(GraspQualityFunction):
                                         " without precomputed contact points"
                                         " and normals.")
             raise ValueError(invalid_friction_ang_msg)
-        dot_prod1 = min(max(action.contact_normals[0].dot(-action.axis), -1.0),
-                        1.0)
-        angle1 = np.arccos(dot_prod1)
-        dot_prod2 = min(max(action.contact_normals[1].dot(action.axis), -1.0),
-                        1.0)
-        angle2 = np.arccos(dot_prod2)
-        return max(angle1, angle2)
+        axisBatched = torch.unsqueeze(action.axis3D,0)
+        opposite_dir_rays = torch.cat([-axisBatched, axisBatched], 0)
+        dot_prod = torch.sum(torch.mul(action.contact_normals,opposite_dir_rays),-1) 
+        # not sure if necessary, should already be bounded -1 to 1. 
+        dot_prod = torch.minimum(torch.maximum(dot_prod, torch.tensor(-1.0)), torch.tensor(1.0))
+        angle = torch.arccos(dot_prod)
+        max_angle = torch.max(angle,0)
+
+        return max_angle
 
     def force_closure(self, action):
         """Determine if the grasp is in force closure."""
@@ -225,7 +252,7 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         
 
 
-    def solveForIntersection(self, state, grasp): 
+    def solveForIntersection(self, state, actions): 
         """Compute where grasp contacts a mesh, state is meshes, action is grasp2d"""
         # TODO
         # for grasp in grasp 
@@ -233,22 +260,35 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         # for each triangle (vectorize for parallel)
         #  compute intersection
         #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
-        mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-        
-        finger1_o = grasp.center - grasp.axis * grasp.jaw_width / 2
-        ray_o = grasp.center + (torch.cat([-grasp.axis, grasp.axis], 0) * grasp.jaw_width / 2)
-        ray_d = torch.cat([grasp.axis, -grasp.axis], 0)
+        mesh_unwrapped = multi_gather_tris(state.verts_packed(), state.faces_packed())
+        axisBatched = torch.unsqueeze(actions.axis3D,0)
+        opposite_dir_rays = torch.cat([-axisBatched, axisBatched], 0)
+        ray_o = actions.center3D + (opposite_dir_rays * actions.width / 2)
+        ray_d = -opposite_dir_rays
         # ray is n, 3
-        u, v, t = moller_trumbore(ray_o, ray_d, mesh_unwrapped, eps=1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        target_shape = ray_o.shape
+        # moller_trumbore assumes flat list of rays (2d Nx3)
+        ray_o_flat = torch.flatten(ray_o, end_dim=-2)
+        ray_d_flat = torch.flatten(ray_d, end_dim=-2)
+
+        u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped, eps=1e-8)
+
+        u = torch.unflatten(u, 0, target_shape[:-1])
+        v = torch.unflatten(v, 0, target_shape[:-1])
+        t = torch.unflatten(t, 0, target_shape[:-1])
         # correct dir, not too far, actually hits triangle
-        inside1 = ((t >= 0.0) * (t < grasp.jaw_width/2) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
-        t(torch.not(inside1)) = float('Inf')
+        inside1 = ((t >= 0.0) * (t < actions.width/2) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
+        t[torch.logical_not(inside1)] = float('Inf')
         # (n_rays, n_faces)
-        min_out = min(t, 1)
+        min_out = torch.min(t, -1,keepdim=True)
 
         intersectionPoints = ray_o + ray_d * min_out.values
         faces_index = min_out.indices
-        contactFound = torch.not(torch.or(torch.isinf(t)))
+        contactFound = torch.logical_not(torch.isinf(min_out.values))
+        actions.contact_points = intersectionPoints
+        actions.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
+        return actions, faces_index, contactFound
 
 
         # find intersection
@@ -283,13 +323,11 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         :obj:`numpy.ndarray`
             Array of the quality for each grasp.
         """
-        actions = ParallelJawQualityFunction.solveForIntersection(self, state, actions)
+        actions, faces_index, contactFound = ParallelJawQualityFunction.solveForIntersection(self, state, actions)
 
         # Compute antipodality.
-        antipodality_q = [
-            ParallelJawQualityFunction.friction_cone_angle(self, action)
-            for action in actions
-        ]
+        antipodality_q = ParallelJawQualityFunction.friction_cone_angle(self, actions)
+
 
         # Compute object center of mass.
         object_com = ParallelJawQualityFunction.compute_mesh_COM(self, state)
@@ -315,8 +353,7 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
             qualities.append(q)
 
         return np.array(qualities)
-
-// taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
+# taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
 
 def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
     shape = list(shape)
@@ -386,6 +423,7 @@ def ray_stabbing(pts: torch.Tensor, verts: torch.Tensor, faces: torch.Tensor, mu
     pts = pts.reshape(-1, 3)
     ray_d = torch.rand_like(pts)  # (n_rays, 3)
     ray_d = normalize(ray_d)  # (n_rays, 3)
+    # 251,252
     u, v, t = moller_trumbore(pts, ray_d, multi_gather_tris(verts, faces))  # (n_rays, n_faces, 3)
     inside = ((t >= 0.0) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
     inside = (inside.count_nonzero(dim=-1) % 2).bool()  # if mod 2 is 0, even, outside, inside is odd
@@ -394,7 +432,7 @@ def ray_stabbing(pts: torch.Tensor, verts: torch.Tensor, faces: torch.Tensor, mu
     return inside
 
 
-def moller_trumbore(ray_o: torch.Tensor, ray_d: torch.Tensor, tris: torch.Tensor, eps=1e-8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def moller_trumbore(ray_o, ray_d, tris , eps=1e-8):
     """
     The Moller Trumbore algorithm for fast ray triangle intersection
     Naive batch implementation (m rays and n triangles at the same time)
@@ -422,8 +460,7 @@ def moller_trumbore(ray_o: torch.Tensor, ray_d: torch.Tensor, tris: torch.Tensor
 
     return u, v, t
 
-
-// Our code
+# Our code
 
 def pytorch_setup():
         # set PyTorch device, use cuda if available
@@ -484,7 +521,17 @@ def test_quality():
 
 	# load Grasp2D 
 	# camera_intr = CameraIntrinsics.load("data/primesense.intr") 
-	grasp = Grasp2D(np.array([299.4833, 182.4288]), 0, 0.583332717, 0.05, 0) 
+	# center2d = torch.tensor([[299.4833, 182.4288]],device=device)
+	# angle = torch.tensor([[0]],device=device)
+	# depth = torch.tensor([[0.583332717]],device=device)
+	# width = torch.tensor([[0.05]],device=device)
+
+	center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
+	angle = torch.tensor([[0.3525843322277069]],device=device)
+	depth = torch.tensor([[0.5824159979820251]],device=device)
+	width = torch.tensor([[0.05]],device=device)
+
+	grasp = Grasp2D(center2d, angle, depth, width, renderer.rasterizer.cameras) 
 
 	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 	config_dict = {
