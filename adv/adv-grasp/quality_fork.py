@@ -233,20 +233,22 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
         # B, F, 3, 3
         # assume Faces, verts, coords
-        totalCoords = torch.sum(mesh_unwrapped, 0)
+        totalCoords = torch.sum(mesh_unwrapped, 1)
         meanVert = torch.sum(totalCoords,0) / (totalCoords.shape[0] * totalCoords.shape[1])
 
         totalCoords = totalCoords + meanVert
         com_per_triangle = totalCoords / 4
 
-        meanVert_expand = meanVert.expand([totalCoords.shape[0], 1, 1])
+        meanVert_expand = torch.reshape(meanVert,[1,1, 3])
+        meanVert_expand = meanVert_expand.expand(mesh_unwrapped.shape[0],1,3)
 
         mesh_tetra = torch.cat([mesh_unwrapped, meanVert_expand], 1)
+        mesh_tetra = torch.cat([mesh_tetra, torch.ones([mesh_tetra.shape[0],4,1],device=mesh_unwrapped.device)], -1)
         # det([[x1,y1,z1,1],[x2,y2,z2,1],[x3,y3,z3,1],[x4,y4,z4,1]]) / 6 
         # does det on last 2 dims, considers at least first 1 to be batch dim
-        vol_per_triangle = torch.linalg.det(mesh_tetra)
+        vol_per_triangle = torch.reshape(torch.linalg.det(mesh_tetra),(mesh_tetra.shape[0],1))
 
-        com = com_per_triangle * vol_per_triangle / torch.sum(vol_per_triangle)
+        com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / torch.sum(vol_per_triangle)
 
         return com
         
@@ -330,7 +332,7 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
 
 
         # Compute object center of mass.
-        object_com = ParallelJawQualityFunction.compute_mesh_COM(self, state)
+        object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
 
         # Compute negative SSE from the best fit plane for each grasp.
         antipodality_thresh = abs(
