@@ -191,8 +191,7 @@ class GraspQualityFunction():	#ABC):
         pass
 
 class ParallelJawQualityFunction(GraspQualityFunction):
-    """Abstract wrapper class for parallel jaw quality functions (only image
-    based metrics for now)."""
+    """Abstract wrapper class for parallel jaw quality functions ()."""
 
     def __init__(self, config):
         GraspQualityFunction.__init__(self)
@@ -215,7 +214,7 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         # not sure if necessary, should already be bounded -1 to 1. 
         dot_prod = torch.minimum(torch.maximum(dot_prod, torch.tensor(-1.0)), torch.tensor(1.0))
         angle = torch.arccos(dot_prod)
-        max_angle = torch.max(angle,0)
+        max_angle = torch.max(angle,0).values
 
         return max_angle
 
@@ -304,7 +303,6 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
     """Measures the distance to the estimated center of mass for antipodal
     parallel-jaw grasps."""
     def __init__(self, config):
-        """Create a best-fit planarity suction metric."""
         self._antipodality_pctile = config["antipodality_pctile"]
         ParallelJawQualityFunction.__init__(self, config)
     def quality(self, state, actions, params=None):
@@ -337,26 +335,19 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         # Can rank grasps, instead of compute absolute score. Only makes sense if seeding many grasps
         # antipodality_thresh = abs(
         #     np.percentile(antipodality_q, 100 - self._antipodality_pctile))
-        qualities = []
-        max_q = torch.norm(torch.diff(state.get_bounding_boxes(),1,2))
-
         
-        for i, action in enumerate(actions):
-            q = max_q
-            friction_cone_angle = antipodality_q[i]
-            force_closure = ParallelJawQualityFunction.force_closure(
-                self, action)
-            if force_closure or friction_cone_angle < antipodality_thresh:
-                grasp_center = np.array([action.center.y, action.center.x])
+        max_q = torch.norm(torch.diff(state.get_bounding_boxes(),1,2))
+        quality = torch.ones(actions.depth.shape,device=actions.depth.device) * max_q
+        
+        in_force_closure = ParallelJawQualityFunction.force_closure(self, actions)
+        
+        dist = torch.norm(actions.center3D - object_com,dim=-1)
+        quality[in_force_closure] = dist[in_force_closure]
+        # some kind of damped sigmoid, not sure where it comes from
+        e_inverse = torch.exp(torch.tensor(-1))
+        quality = (torch.exp(-quality / max_q) - e_inverse) / (1 - e_inverse)
 
-
-                q = np.linalg.norm(grasp_center - object_com)
-
-
-            q = (np.exp(-q / max_q) - np.exp(-1)) / (1 - np.exp(-1))
-            qualities.append(q)
-
-        return np.array(qualities)
+        return quality
 # taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
 
 def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
