@@ -17,6 +17,11 @@ from pytorch3d.renderer import (
 )
 from qpth.qp import QPFunction
 
+# class Grasp(Object)
+#
+# grasp2D(self, updateRotation=False)
+
+
 # Grasp2D class copied from: https://github.com/BerkeleyAutomation/gqcnn/blob/master/gqcnn/grasping/grasp.py
 class Grasp2D(object):
     """Parallel-jaw grasp in image space.
@@ -46,26 +51,45 @@ class Grasp2D(object):
                  width=0.0,
                  camera_intr=None,
                  contact_points=None,
-                 contact_normals=None):
-        self.center = center
-        self.angle = angle
-        self.depth = depth
+                 contact_normals=None,
+                 axis3D=None,
+                 rotateCamera=False):
         self.width = width
+        if(center.shape[-1] == 3): # 3D grasp
+            self.center3D = center
+            if rotateCamera: # too keep specified axis, we need to update the camera
+                R = camera_intr
 
-        # If `camera_intr` is none use default primesense camera intrinsics.
-        """
-	# don't have CameraIntrinsics import, but can get info from PyTorch camera
-        if not camera_intr:
-            self.camera_intr = CameraIntrinsics("primesense_overhead",
-                                                fx=525,
-                                                fy=525,
-                                                cx=319.5,
-                                                cy=239.5,
-                                                width=640,
-                                                height=480)
+            else: # to keep specified camera, we need to update the axis
+                axis3D = camera_intr.get_world_to_view_transform().transform_normals(axis3D)
+                axis3D[...,2] = 0
+                axis3D = torch.nn.functional.normalize(axis3D,dim=-1)
+                axis3D = camera_intr.get_world_to_view_transform().inverse().transform_normals(axis3D)
+                
+            self.center = camera_intr.get_full_projection_transform().transform_points(self.center3D)[..., :2]
+            self.depth = camera_intr.get_world_to_view_transform().transform_points(self.center3D)[..., 2]
+            self.axis3D = axis3D
+
+            p1, p2 = self.endpoints3D
+            p1 = camera_intr.get_full_projection_transform().transform_points(p1)
+            p2 = camera_intr.get_full_projection_transform().transform_points(p2)
+            
+            self.axis = torch.nn.functional.normalize(p2-p1,dim=-1)[..., :2]
+            self.angle = torch.atan2(self.axis[..., 1],self.axis[..., 0])
+
+        elif(center.shape[-1] == 2): # 2D grasp:
+            self.center = center
+            self.angle = angle
+            self.depth = depth
+
+            center_in_camera = torch.cat((self.center, self.depth), dim=-1)
+            self.center3D = camera_intr.unproject_points(center_in_camera, world_coordinates=True)
+            self.axis = torch.cat((torch.cos(self.angle), torch.sin(self.angle)), dim=-1) # TODO, do we need to check if last dim is 1?
+
+            axis_in_camera = torch.cat((self.axis, torch.zeros([self.axis.shape[0],1],device=self.axis.device)), dim=1)
+            self.axis3D =  camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera)
         else:
-            self.camera_intr = camera_intr
-	"""
+            self = None
         self.camera_intr = camera_intr
         
 
@@ -73,13 +97,46 @@ class Grasp2D(object):
         self.contact_normals = contact_normals
         self.friction_cone = None
 
-        """
-        frame = "image"
-        if camera_intr is not None:
-            frame = camera_intr.frame
-        if isinstance(center, np.ndarray):
-            self.center = Point(center, frame=frame)
-        """
+        
+    
+        
+    
+    @property
+    def tform_to_camera(self):
+        """Returns a pytorch3d transform to go from world to camera (pixel) coordinates"""
+        return self.camera_intr.get_full_projection_transform()
+    
+    @property
+    def endpoints(self):
+        """Returns the grasp endpoints."""
+        p1 = self.center - (self.width_px / 2) * self.axis
+        p2 = self.center + (self.width_px / 2) * self.axis
+        return p1, p2
+    
+    @property
+    def endpoints3D(self):
+        """Returns the grasp endpoints."""
+        p1 = self.center3D - (self.width / 2) * self.axis3D
+        p2 = self.center3D + (self.width / 2) * self.axis3D
+        return p1, p2
+
+
+    @property
+    def width_px(self):
+        """Returns the width in pixels."""
+        if self.camera_intr is None:
+            missing_camera_intr_msg = ("Must specify camera intrinsics to"
+                                       " compute gripper width in 3D space.")
+            raise ValueError(missing_camera_intr_msg)
+        # Form the jaw locations in 3D space at the given depth.
+        p1 =torch.cat((torch.zeros([self.depth.shape[0],2],device=self.depth.device), self.depth), dim=1)
+        p2 =torch.cat((self.depth, torch.zeros([self.depth.shape[0],1],device=self.depth.device), self.depth), dim=1)
+
+        # Project into pixel space.
+        u1 = self.camera_intr.transform_points(p1)
+        u2 = self.camera_intr.transform_points(p2)
+        return torch.norm(u1 - u2,dim=-1)
+    
     def torques(self, forces, com):
         """
         Get the torques that can be applied by a set of force vectors at the contact point.
@@ -244,75 +301,30 @@ class Grasp2D(object):
         self.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
         return self, faces_index, contactFound
 
-    @property
-    def axis(self):
-        """Returns the grasp axis."""
-        return torch.cat((torch.cos(self.angle), torch.sin(self.angle)), dim=1)
-    
-    @property
-    def axis3D(self):
-        """Returns the grasp axis."""
-        axis_in_camera = torch.cat((self.axis, torch.zeros([self.axis.shape[0],1],device=self.axis.device)), dim=1)
-        return self.camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera)
-    
-    @property
-    def center3D(self):
-        """Returns the grasp axis."""
-        center_in_camera = torch.cat((self.center, self.depth), dim=1)
-        return self.camera_intr.unproject_points(center_in_camera, world_coordinates=True)
-    
-    @property
-    def tform_to_camera(self):
-        """Returns the grasp axis."""
-        return self.camera_intr.get_full_projection_transform()
 
-    @property
-    def approach_axis(self):
-        return np.array([0, 0, 1])
 
-    @property
-    def approach_angle(self):
-        """The angle between the grasp approach axis and camera optical axis.
-        """
-        return 0.0
 
-    @property
-    def frame(self):
-        """The name of the frame of reference for the grasp."""
-        if self.camera_intr is None:
+    # @property
+    # def approach_axis(self):
+    #     return np.array([0, 0, 1])
 
-            raise ValueError("Must specify camera intrinsics")
-        return self.camera_intr.frame
+    # @property
+    # def approach_angle(self):
+    #     """The angle between the grasp approach axis and camera optical axis.
+    #     """
+    #     return 0.0
 
-    @property
-    def width_px(self):
-        """Returns the width in pixels."""
-        if self.camera_intr is None:
-            missing_camera_intr_msg = ("Must specify camera intrinsics to"
-                                       " compute gripper width in 3D space.")
-            raise ValueError(missing_camera_intr_msg)
-        # Form the jaw locations in 3D space at the given depth.
-        p1 =torch.cat((torch.zeros([self.depth.shape[0],2],device=self.depth.device), self.depth), dim=1)
-        p2 =torch.cat((self.depth, torch.zeros([self.depth.shape[0],1],device=self.depth.device), self.depth), dim=1)
+    # @property
+    # def frame(self):
+    #     """The name of the frame of reference for the grasp."""
+    #     if self.camera_intr is None:
 
-        # Project into pixel space.
-        u1 = self.camera_intr.transform_points(p1)
-        u2 = self.camera_intr.transform_points(p2)
-        return torch.norm(u1 - u2,dim=-1)
+    #         raise ValueError("Must specify camera intrinsics")
+    #     return self.camera_intr.frame
 
-    @property
-    def endpoints(self):
-        """Returns the grasp endpoints."""
-        p1 = self.center - (self.width_px / 2) * self.axis
-        p2 = self.center + (self.width_px / 2) * self.axis
-        return p1, p2
-    
-    @property
-    def endpoints3D(self):
-        """Returns the grasp endpoints."""
-        p1 = self.center3D - (self.width / 2) * self.axis3D
-        p2 = self.center3D + (self.width / 2) * self.axis3D
-        return p1, p2
+
+
+
 
     @property
     def feature_vec(self):
@@ -499,6 +511,7 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
         # todo reshape back to batch dim
         closest = torch.min(dist)
+        print(closest)
 
 
 
@@ -702,8 +715,22 @@ def test_quality():
 	depth = torch.tensor([[0.5824159979820251]],device=device)
 	width = torch.tensor([[0.05]],device=device)
 
-	grasp = Grasp2D(center2d, angle, depth, width, renderer.rasterizer.cameras) 
+	grasp1 = Grasp2D(center2d, angle, depth, width, renderer.rasterizer.cameras) 
+        
+    #                  center,
+    #                  angle=0.0,
+    #                  depth=1.0,
+    #                  width=0.0,
+    #                  camera_intr=None,
+    #                  contact_points=None,
+    #                  contact_normals=None,
+    #                  axis3D=None,
+    #                  rotateCamera=False):
 
+	center3D = torch.tensor([[ 0.027602000162005424, 0.017583999782800674, -9.273400064557791e-05]], device=device)
+	axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
+
+	grasp2 = Grasp2D(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
 	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 	config_dict = {
 		"friction_coef": 0.8,
