@@ -1,7 +1,9 @@
 import torch
 import numpy as np
+import math
 from pytorch3d.io import load_obj
 import pytorch3d.transforms as tf
+from scipy.spatial import ConvexHull
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
         look_at_view_transform,
@@ -13,7 +15,7 @@ from pytorch3d.renderer import (
         PointLights,
         TexturesVertex
 )
-
+from qpth.qp import QPFunction
 
 # Grasp2D class copied from: https://github.com/BerkeleyAutomation/gqcnn/blob/master/gqcnn/grasping/grasp.py
 class Grasp2D(object):
@@ -69,6 +71,7 @@ class Grasp2D(object):
 
         self.contact_points = contact_points
         self.contact_normals = contact_normals
+        self.friction_cone = None
 
         """
         frame = "image"
@@ -77,6 +80,169 @@ class Grasp2D(object):
         if isinstance(center, np.ndarray):
             self.center = Point(center, frame=frame)
         """
+    def torques(self, forces, com):
+        """
+        Get the torques that can be applied by a set of force vectors at the contact point.
+
+        Parameters
+        ----------
+        forces : 3xN :obj:`numpy.ndarray`
+            the forces applied at the contact
+
+        Returns
+        -------
+        success : bool
+            whether or not computation was successful
+        torques : 3xN :obj:`numpy.ndarray`
+            the torques that can be applied by given forces at the contact
+        """
+        # TODO error
+        if self.friction_cone is None:
+            return None   
+        
+        momentArm = self.contact_points - com
+        momentArm = momentArm.expand([forces.shape[0]]+list(momentArm.shape))
+        torques = torch.linalg.cross(momentArm, forces, dim=-1)
+        return torques
+        
+    def normal_force_magnitude(self):
+        """ Returns the component of the force that the contact would apply along the normal direction.
+
+        Returns
+        -------
+        float
+            magnitude of force along object surface normal
+        """
+        axisBatched = torch.unsqueeze(self.axis3D,0)
+        in_direction = torch.cat([axisBatched, -axisBatched], 0)
+        in_direction_norm = torch.nn.functional.normalize(in_direction,dim=-1)
+
+        in_normal = -self.contact_normals
+
+        normal_force_mag = torch.sum(torch.mul(in_normal, in_direction_norm),-1)
+        return torch.nn.functional.relu(normal_force_mag)
+
+    def grasp_matrix(self, forces, torques, normals, torque_scaling):
+        """ Computes the grasp map between contact forces and wrenchs on the object in its reference frame.
+
+        Parameters
+        ----------
+        forces : 3xN :obj:`numpy.ndarray`
+            set of forces on object in object basis
+        torques : 3xN :obj:`numpy.ndarray`
+            set of torques on object in object basis
+        normals : 3xN :obj:`numpy.ndarray`
+            surface normals at the contact points
+        soft_fingers : bool
+            whether or not to use the soft finger contact model
+        finger_radius : float
+            the radius of the fingers to use
+        params : :obj:`GraspQualityConfig`
+            set of parameters for grasp matrix and contact model
+
+        Returns
+        -------
+        G : 6xM :obj:`numpy.ndarray`
+            grasp map
+        """
+        return torch.cat([forces, torques*torque_scaling], dim=-1)
+
+
+    def compute_friction_cone(self, state, num_cone_faces=8, friction_coef=0.5):
+        """ Computes the friction cone and normal for all contact points.
+
+        Parameters
+        ----------
+        num_cone_faces : int
+            number of cone faces to use in discretization
+        friction_coef : float 
+            coefficient of friction at contact point
+        
+        Returns
+        -------
+        success : bool
+            False when cone can't be computed
+        cone_support : :obj:`numpy.ndarray`
+            array where each column is a vector on the boundary of the cone
+        normal : normalized 3x1 :obj:`numpy.ndarray`
+            outward facing surface normal
+        """
+
+        if self.friction_cone is not None:
+            return self.friction_cone
+
+        if self.contact_points is None or self.contact_normals is  None:
+            # TODO return warning that normals are needed first
+            return self.friction_cone
+        
+        def cross_unit(vec1, vec2):
+            vec3 =  torch.linalg.cross(vec1, vec2, dim=-1)
+            return torch.nn.functional.normalize(vec3,dim=-1)
+        
+        # get unit vectors orthogonal to normal
+        ref = torch.eye(1, m=3,device=self.contact_normals.device).expand(self.contact_normals.shape)
+        tmpvec = cross_unit(self.contact_normals, ref)
+ 
+        yvec = cross_unit(self.contact_normals, tmpvec)
+        xvec = cross_unit(self.contact_normals, yvec)
+        # TODO check if contact would slip https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/grasping/contacts.py#L251
+
+
+        def reshape_local(vec, num_faces):
+            vec = vec.unsqueeze(0)
+            target_shape = list(vec.shape)
+            target_shape[0] = num_cone_faces
+            return vec.expand(target_shape)
+            
+        yvec = reshape_local(yvec, num_cone_faces)
+        xvec = reshape_local(xvec, num_cone_faces)
+
+        sampleAngles = torch.linspace(0, 2 * math.pi, num_cone_faces+1, device=self.contact_normals.device)
+        sampleAngles = sampleAngles[:-1]
+        sampleAngles = torch.reshape(sampleAngles, [num_cone_faces] + [1] * (len(xvec.shape)-1))
+
+        tan_vec = torch.mul(xvec, torch.cos(sampleAngles)) + torch.mul(yvec, torch.sin(sampleAngles))
+        self.friction_cone = self.contact_normals + friction_coef * tan_vec
+        return self.friction_cone
+
+        
+    def solveForIntersection(self, state): 
+        """Compute where grasp contacts a mesh, state is meshes, action is grasp2d"""
+        # TODO
+        # for grasp in grasp 
+        # for each ray (2)
+        # for each triangle (vectorize for parallel)
+        #  compute intersection
+        #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
+        mesh_unwrapped = multi_gather_tris(state.verts_packed(), state.faces_packed())
+        axisBatched = torch.unsqueeze(self.axis3D,0)
+        opposite_dir_rays = torch.cat([-axisBatched, axisBatched], 0)
+        ray_o = self.center3D + (opposite_dir_rays * self.width / 2)
+        ray_d = -opposite_dir_rays # [axis3d, -axis3d]
+        # ray is n, 3
+        
+        target_shape = ray_o.shape
+        # moller_trumbore assumes flat list of rays (2d Nx3)
+        ray_o_flat = torch.flatten(ray_o, end_dim=-2)
+        ray_d_flat = torch.flatten(ray_d, end_dim=-2)
+
+        u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped, eps=1e-8)
+
+        u = torch.unflatten(u, 0, target_shape[:-1])
+        v = torch.unflatten(v, 0, target_shape[:-1])
+        t = torch.unflatten(t, 0, target_shape[:-1])
+        # correct dir, not too far, actually hits triangle
+        inside1 = ((t >= 0.0) * (t < self.width/2) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
+        t[torch.logical_not(inside1)] = float('Inf')
+        # (n_rays, n_faces)
+        min_out = torch.min(t, -1,keepdim=True)
+
+        intersectionPoints = ray_o + ray_d * min_out.values
+        faces_index = min_out.indices
+        contactFound = torch.logical_not(torch.isinf(min_out.values))
+        self.contact_points = intersectionPoints
+        self.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
+        return self, faces_index, contactFound
 
     @property
     def axis(self):
@@ -218,6 +384,8 @@ class ParallelJawQualityFunction(GraspQualityFunction):
 
         return max_angle
 
+    
+
     def force_closure(self, action):
         """Determine if the grasp is in force closure."""
         return (self.friction_cone_angle(action) <
@@ -253,43 +421,6 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         
 
 
-    def solveForIntersection(self, state, actions): 
-        """Compute where grasp contacts a mesh, state is meshes, action is grasp2d"""
-        # TODO
-        # for grasp in grasp 
-        # for each ray (2)
-        # for each triangle (vectorize for parallel)
-        #  compute intersection
-        #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
-        mesh_unwrapped = multi_gather_tris(state.verts_packed(), state.faces_packed())
-        axisBatched = torch.unsqueeze(actions.axis3D,0)
-        opposite_dir_rays = torch.cat([-axisBatched, axisBatched], 0)
-        ray_o = actions.center3D + (opposite_dir_rays * actions.width / 2)
-        ray_d = -opposite_dir_rays
-        # ray is n, 3
-        
-        target_shape = ray_o.shape
-        # moller_trumbore assumes flat list of rays (2d Nx3)
-        ray_o_flat = torch.flatten(ray_o, end_dim=-2)
-        ray_d_flat = torch.flatten(ray_d, end_dim=-2)
-
-        u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped, eps=1e-8)
-
-        u = torch.unflatten(u, 0, target_shape[:-1])
-        v = torch.unflatten(v, 0, target_shape[:-1])
-        t = torch.unflatten(t, 0, target_shape[:-1])
-        # correct dir, not too far, actually hits triangle
-        inside1 = ((t >= 0.0) * (t < actions.width/2) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
-        t[torch.logical_not(inside1)] = float('Inf')
-        # (n_rays, n_faces)
-        min_out = torch.min(t, -1,keepdim=True)
-
-        intersectionPoints = ray_o + ray_d * min_out.values
-        faces_index = min_out.indices
-        contactFound = torch.logical_not(torch.isinf(min_out.values))
-        actions.contact_points = intersectionPoints
-        actions.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
-        return actions, faces_index, contactFound
 
 
         # find intersection
@@ -323,14 +454,59 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         :obj:`numpy.ndarray`
             Array of the quality for each grasp.
         """
-        actions, faces_index, contactFound = ParallelJawQualityFunction.solveForIntersection(self, state, actions)
+        actions, faces_index, contactFound = actions.solveForIntersection(state)
+        
+        # Compute object center of mass.
+        object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
+
+        bounding_box = state.get_bounding_boxes()
+        bounding_lengths = torch.diff(bounding_box, dim=-1 )
+        median_length = torch.median(bounding_lengths)
+        torque_scaling = torch.pow(median_length, -1)
+
+        n_force = actions.normal_force_magnitude().unsqueeze(-1)
+        normals = torch.mul(-actions.contact_normals , n_force)
+
+        n_force = n_force.unsqueeze(0)
+        cone = torch.mul(actions.compute_friction_cone(state), n_force)
+        torques = torch.mul(actions.torques(cone, object_com), n_force)
+        
+        
+        #### refactor to class fwd
+        ### solve QP over G to figure out sign
+
+        ### find all simplices
+        ## create pool and run on cpu
+        G = actions.grasp_matrix(cone, torques, normals, torque_scaling).reshape([16,6])
+        numpyG = G.numpy(force=True)
+        hull = ConvexHull(numpyG)
+        ### reassemble simplices into batch may be too many and need to serialize
+        ## maybe we only (re)compute the important one in pytorch, drop others for memory
+        facets = G[hull.simplices,:]
+
+        # square facet matrix
+        Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
+        wrench_regularizer=1e-10
+        regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = G.device))
+        P = 2 * (Gsquared + regulizer_mat)
+        q = torch.zeros(1, P.shape[1], device = G.device)
+        G = -torch.eye(P.shape[1], device = G.device)
+        h = torch.zeros(1, P.shape[1], device = G.device)
+        A = torch.ones(1,P.shape[1], device = G.device)
+        b = torch.ones(1,device = G.device)
+
+        x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
+        dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
+        # todo reshape back to batch dim
+        closest = torch.min(dist)
+
+
 
         # Compute antipodality.
         antipodality_q = ParallelJawQualityFunction.friction_cone_angle(self, actions)
 
 
-        # Compute object center of mass.
-        object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
+
 
         # Can rank grasps, instead of compute absolute score. Only makes sense if seeding many grasps
         # antipodality_thresh = abs(
@@ -502,7 +678,7 @@ def test_quality():
 	# load PyTorch3D mesh from .obj file
 	renderer, device = pytorch_setup()
 
-	verts, faces_idx, _ = load_obj("data/bar_clamp.obj")
+	verts, faces_idx, _ = load_obj("adv/adv-grasp/data/bar_clamp.obj")
 	faces = faces_idx.verts_idx
 	verts_rgb = torch.ones_like(verts)[None]
 	textures = TexturesVertex(verts_features=verts_rgb.to(device))
