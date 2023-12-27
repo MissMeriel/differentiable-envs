@@ -55,6 +55,7 @@ class Grasp2D(object):
                  axis3D=None,
                  rotateCamera=False):
         self.width = width
+        self.camera_intr = camera_intr
         if(center.shape[-1] == 3): # 3D grasp
             self.center3D = center
             if rotateCamera: # too keep specified axis, we need to update the camera
@@ -67,7 +68,7 @@ class Grasp2D(object):
                 axis3D = camera_intr.get_world_to_view_transform().inverse().transform_normals(axis3D)
                 
             self.center = camera_intr.get_full_projection_transform().transform_points(self.center3D)[..., :2]
-            self.depth = camera_intr.get_world_to_view_transform().transform_points(self.center3D)[..., 2]
+            self.depth = camera_intr.get_world_to_view_transform().transform_points(self.center3D)[..., [2]]
             self.axis3D = axis3D
 
             p1, p2 = self.endpoints3D
@@ -75,22 +76,27 @@ class Grasp2D(object):
             p2 = camera_intr.get_full_projection_transform().transform_points(p2)
             
             self.axis = torch.nn.functional.normalize(p2-p1,dim=-1)[..., :2]
-            self.angle = torch.atan2(self.axis[..., 1],self.axis[..., 0])
+            self.angle = torch.atan2(self.axis[..., 1],self.axis[..., 0]) + math.pi
 
         elif(center.shape[-1] == 2): # 2D grasp:
             self.center = center
             self.angle = angle
             self.depth = depth
+            self.axis = torch.cat((torch.cos(self.angle + math.pi), torch.sin(self.angle + math.pi)), dim=-1) # TODO, do we need to check if last dim is 1?
 
             center_in_camera = torch.cat((self.center, self.depth), dim=-1)
             self.center3D = camera_intr.unproject_points(center_in_camera, world_coordinates=True)
-            self.axis = torch.cat((torch.cos(self.angle), torch.sin(self.angle)), dim=-1) # TODO, do we need to check if last dim is 1?
+            endpoints1, endpoints2 = self.endpoints
+            p1 = camera_intr.unproject_points(torch.cat((endpoints1, self.depth), dim=-1), world_coordinates=True)
+            p2 = camera_intr.unproject_points(torch.cat((endpoints2, self.depth), dim=-1), world_coordinates=True)
+            self.axis3D = torch.nn.functional.normalize(p2-p1,dim=-1)
+            
 
             axis_in_camera = torch.cat((self.axis, torch.zeros([self.axis.shape[0],1],device=self.axis.device)), dim=1)
             self.axis3D =  camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera)
         else:
             self = None
-        self.camera_intr = camera_intr
+        
         
 
         self.contact_points = contact_points
@@ -129,7 +135,7 @@ class Grasp2D(object):
                                        " compute gripper width in 3D space.")
             raise ValueError(missing_camera_intr_msg)
         # Form the jaw locations in 3D space at the given depth.
-        p1 =torch.cat((torch.zeros([self.depth.shape[0],2],device=self.depth.device), self.depth), dim=1)
+        p1 =torch.cat((torch.zeros([self.depth.shape[0],2],device=self.depth.device), self.depth), dim=-1)
         p2 =torch.cat((self.depth, torch.zeros([self.depth.shape[0],1],device=self.depth.device), self.depth), dim=1)
 
         # Project into pixel space.
@@ -498,7 +504,7 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
 
         # square facet matrix
         Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
-        wrench_regularizer=1e-10
+        wrench_regularizer=1 #e-10
         regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = G.device))
         P = 2 * (Gsquared + regulizer_mat)
         q = torch.zeros(1, P.shape[1], device = G.device)
@@ -740,7 +746,7 @@ def test_quality():
 	com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
 
 	# Call quality with the Grasp2D and mesh
-	com_qual_func.quality(mesh, grasp)
+	com_qual_func.quality(mesh, grasp2)
 
 if __name__ == "__main__":
 	test_quality()
