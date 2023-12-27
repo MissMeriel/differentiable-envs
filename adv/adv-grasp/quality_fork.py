@@ -23,7 +23,7 @@ from qpth.qp import QPFunction
 
 
 # Grasp2D class copied from: https://github.com/BerkeleyAutomation/gqcnn/blob/master/gqcnn/grasping/grasp.py
-class Grasp2D(object):
+class GraspTorch(object):
     """Parallel-jaw grasp in image space.
 
     Attributes
@@ -52,56 +52,67 @@ class Grasp2D(object):
                  camera_intr=None,
                  contact_points=None,
                  contact_normals=None,
-                 axis3D=None,
-                 rotateCamera=False):
+                 axis3D=None):
         self.width = width
         self.camera_intr = camera_intr
         if(center.shape[-1] == 3): # 3D grasp
             self.center3D = center
-            if rotateCamera: # too keep specified axis, we need to update the camera
-                R = camera_intr
-
-            else: # to keep specified camera, we need to update the axis
-                axis3D = camera_intr.get_world_to_view_transform().transform_normals(axis3D)
-                axis3D[...,2] = 0
-                axis3D = torch.nn.functional.normalize(axis3D,dim=-1)
-                axis3D = camera_intr.get_world_to_view_transform().inverse().transform_normals(axis3D)
-                
-            self.center = camera_intr.get_full_projection_transform().transform_points(self.center3D)[..., :2]
-            self.depth = camera_intr.get_world_to_view_transform().transform_points(self.center3D)[..., [2]]
             self.axis3D = axis3D
 
-            p1, p2 = self.endpoints3D
-            p1 = camera_intr.get_full_projection_transform().transform_points(p1)
-            p2 = camera_intr.get_full_projection_transform().transform_points(p2)
-            
-            self.axis = torch.nn.functional.normalize(p2-p1,dim=-1)[..., :2]
-            self.angle = torch.atan2(self.axis[..., 1],self.axis[..., 0]) + math.pi
 
         elif(center.shape[-1] == 2): # 2D grasp:
             self.center = center
             self.angle = angle
             self.depth = depth
-            self.axis = torch.cat((torch.cos(self.angle + math.pi), torch.sin(self.angle + math.pi)), dim=-1) # TODO, do we need to check if last dim is 1?
+            self.axis = torch.cat((torch.cos(self.angle), torch.sin(self.angle)), dim=-1) # TODO, do we need to check if last dim is 1?
 
             center_in_camera = torch.cat((self.center, self.depth), dim=-1)
             self.center3D = camera_intr.unproject_points(center_in_camera, world_coordinates=True)
-            endpoints1, endpoints2 = self.endpoints
-            p1 = camera_intr.unproject_points(torch.cat((endpoints1, self.depth), dim=-1), world_coordinates=True)
-            p2 = camera_intr.unproject_points(torch.cat((endpoints2, self.depth), dim=-1), world_coordinates=True)
-            self.axis3D = torch.nn.functional.normalize(p2-p1,dim=-1)
-            
+            axis_in_camera = torch.cat((self.axis, torch.zeros(list(self.axis.shape)[:-1]+[1], device=self.axis.device)),dim=-1)
+            self.axis3D = camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera)
 
-            axis_in_camera = torch.cat((self.axis, torch.zeros([self.axis.shape[0],1],device=self.axis.device)), dim=1)
-            self.axis3D =  camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera)
         else:
+            # TODO error
             self = None
-        
-        
-
         self.contact_points = contact_points
         self.contact_normals = contact_normals
         self.friction_cone = None
+
+    def make2D(self, updateCamera=False,camera_intr=None):
+        if camera_intr==None:
+            camera_intr = self.camera_intr
+        if camera_intr==None:
+            # TODO error
+            return None
+
+        if updateCamera: # in order to keep specified axis, we need to update the camera
+            cameraDir = torch.tensor([[0.,0.,1.]],device=self.axis3D.device) # camera Z
+            axis3D = camera_intr.get_world_to_view_transform().transform_normals(self.axis3D) # in world
+            rotVec = torch.cross(cameraDir, axis3D, dim=-1) # vector orthogonal to both
+            rotVecNorm = torch.linalg.vector_norm(rotVec) # includes angle information
+            rotAngle = torch.asin( rotVecNorm ) - math.pi/2 # compare current angle to 90 deg, assume cameraDir, axis3D are unit
+            rodVec = rotAngle/rotVecNorm * rotVec # axis scaled by angle
+            rotToGraspAxis = tf.Rotate(tf.so3_exp_map(rodVec))
+            transformOrig = camera_intr.get_world_to_view_transform()
+            transformFull = transformOrig.compose(rotToGraspAxis)
+            R = transformFull.get_matrix()[...,:3,:3]
+            T = transformFull.get_matrix()[..., 3,:3]
+            camera_intr.get_world_to_view_transform(R=R, T=T) # acts as setter for camera_intr
+            self.camera_intr = camera_intr
+
+        else: # to keep specified camera, we need to update the axis
+            axis3D = camera_intr.get_world_to_view_transform().transform_normals(self.axis3D)
+            axis3D[...,2] = 0
+            axis3D = torch.nn.functional.normalize(axis3D,dim=-1)
+            axis3D = camera_intr.get_world_to_view_transform().inverse().transform_normals(axis3D)
+            self.axis3D = axis3D
+            
+        self.center = camera_intr.get_full_projection_transform().transform_points(self.center3D)[..., :2]
+        self.depth = camera_intr.get_world_to_view_transform().transform_points(self.center3D)[..., [2]]
+        self.axis = torch.nn.functional.normalize(camera_intr.get_world_to_view_transform().transform_normals(self.axis3D),dim=-1)[..., :2]
+        self.angle = torch.atan2(self.axis[..., 1],self.axis[..., 0])
+
+        return camera_intr
 
         
     
@@ -495,28 +506,10 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
 
         ### find all simplices
         ## create pool and run on cpu
+        # TODO don't hardcode, handle batches
         G = actions.grasp_matrix(cone, torques, normals, torque_scaling).reshape([16,6])
-        numpyG = G.numpy(force=True)
-        hull = ConvexHull(numpyG)
-        ### reassemble simplices into batch may be too many and need to serialize
-        ## maybe we only (re)compute the important one in pytorch, drop others for memory
-        facets = G[hull.simplices,:]
-
-        # square facet matrix
-        Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
-        wrench_regularizer=1 #e-10
-        regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = G.device))
-        P = 2 * (Gsquared + regulizer_mat)
-        q = torch.zeros(1, P.shape[1], device = G.device)
-        G = -torch.eye(P.shape[1], device = G.device)
-        h = torch.zeros(1, P.shape[1], device = G.device)
-        A = torch.ones(1,P.shape[1], device = G.device)
-        b = torch.ones(1,device = G.device)
-
-        x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
-        dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
-        # todo reshape back to batch dim
-        closest = torch.min(dist)
+        closest = minHull.apply(G)
+        #closest = mH(G)
         print(closest)
 
 
@@ -544,6 +537,40 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
 
         return quality
 # taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
+class minHull(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, G):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+        ctx.save_for_backward(input)
+        numpyG = G.numpy(force=True)
+        hull = ConvexHull(numpyG)
+        ### reassemble simplices into batch may be too many and need to serialize
+        ## maybe we only (re)compute the important one in pytorch, drop others for memory
+        facets = G[hull.simplices,:]
+
+        # square facet matrix
+        Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
+        wrench_regularizer=1e-10
+        regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = G.device))
+        P = 2 * (Gsquared + regulizer_mat)
+        q = torch.zeros(1, P.shape[1], device = G.device)
+        G = -torch.eye(P.shape[1], device = G.device)
+        h = torch.zeros(1, P.shape[1], device = G.device)
+        A = torch.ones(1,P.shape[1], device = G.device)
+        b = torch.ones(1,device = G.device)
+
+        x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
+        dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
+        # todo reshape back to batch dim
+        closest = torch.min(dist[torch.logical_not(torch.isnan(dist))])
+        return closest
+    
 
 def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
     shape = list(shape)
@@ -717,11 +744,11 @@ def test_quality():
 	# width = torch.tensor([[0.05]],device=device)
 
 	center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
-	angle = torch.tensor([[0.3525843322277069]],device=device)
+	angle = torch.tensor([[0.3525843322277069 + math.pi]],device=device)
 	depth = torch.tensor([[0.5824159979820251]],device=device)
 	width = torch.tensor([[0.05]],device=device)
 
-	grasp1 = Grasp2D(center2d, angle, depth, width, renderer.rasterizer.cameras) 
+	grasp1 = GraspTorch(center2d, angle, depth, width, renderer.rasterizer.cameras) 
         
     #                  center,
     #                  angle=0.0,
@@ -736,7 +763,8 @@ def test_quality():
 	center3D = torch.tensor([[ 0.027602000162005424, 0.017583999782800674, -9.273400064557791e-05]], device=device)
 	axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
 
-	grasp2 = Grasp2D(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
+	grasp2 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
+	grasp2.make2D(updateCamera=True)
 	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 	config_dict = {
 		"friction_coef": 0.8,
