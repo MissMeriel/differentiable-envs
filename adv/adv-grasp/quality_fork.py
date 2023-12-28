@@ -86,13 +86,18 @@ class GraspTorch(object):
             return None
 
         if updateCamera: # in order to keep specified axis, we need to update the camera
-            cameraDir = torch.tensor([[0.,0.,1.]],device=self.axis3D.device) # camera Z
+            
             axis3D = camera_intr.get_world_to_view_transform().transform_normals(self.axis3D) # in world
+            
+            cameraDir = torch.tensor([0.,0.,1.],device=self.axis3D.device) # camera Z
+            cameraDir = cameraDir.reshape([1]*(len(axis3D.shape)-1)+[3])
+            cameraDir = cameraDir.expand(axis3D.shape)
             rotVec = torch.cross(cameraDir, axis3D, dim=-1) # vector orthogonal to both
-            rotVecNorm = torch.linalg.vector_norm(rotVec) # includes angle information
+            rotVecNorm = torch.linalg.vector_norm(rotVec,dim=-1) # includes angle information
             rotAngle = torch.asin( rotVecNorm ) - math.pi/2 # compare current angle to 90 deg, assume cameraDir, axis3D are unit
-            rodVec = rotAngle/rotVecNorm * rotVec # axis scaled by angle
-            rotToGraspAxis = tf.Rotate(tf.so3_exp_map(rodVec))
+            rodVec = torch.unsqueeze(rotAngle/rotVecNorm,-1) * rotVec # axis scaled by angle
+
+            rotToGraspAxis = tf.Rotate(tf.so3_exp_map(rodVec.reshape(-1,3)))
             transformOrig = camera_intr.get_world_to_view_transform()
             transformFull = transformOrig.compose(rotToGraspAxis)
             R = transformFull.get_matrix()[...,:3,:3]
@@ -507,7 +512,7 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         ### find all simplices
         ## create pool and run on cpu
         # TODO don't hardcode, handle batches
-        G = actions.grasp_matrix(cone, torques, normals, torque_scaling).reshape([16,6])
+        G = actions.grasp_matrix(cone, torques, normals, torque_scaling)
         closest = minHull.apply(G)
         #closest = mH(G)
         print(closest)
@@ -547,12 +552,24 @@ class minHull(torch.autograd.Function):
         to stash information for backward computation. You can cache arbitrary
         objects for use in the backward pass using the ctx.save_for_backward method.
         """
+        original_shape = G.shape
+        G_unwrapped = G.reshape((original_shape[0]*original_shape[1], -1, 6))
         ctx.save_for_backward(input)
-        numpyG = G.numpy(force=True)
-        hull = ConvexHull(numpyG)
+        numpyG = G_unwrapped.numpy(force=True)
+        
+  
+        facets_local = []
+        lengths = []
+        for batch_idx in range(numpyG.shape[1]):
+           miniGnumpy = numpyG[:,batch_idx,:]
+           miniG = G_unwrapped[:,batch_idx,:]
+           hull = ConvexHull(miniGnumpy)
+           facets_local.append(miniG[hull.simplices,:])
+           lengths.append(hull.nsimplex)
+        facets = torch.cat(facets_local,dim=0)
         ### reassemble simplices into batch may be too many and need to serialize
         ## maybe we only (re)compute the important one in pytorch, drop others for memory
-        facets = G[hull.simplices,:]
+
 
         # square facet matrix
         Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
@@ -567,8 +584,14 @@ class minHull(torch.autograd.Function):
 
         x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
         dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
+        start_ind = 0
+        closest = torch.zeros(len(lengths),1)
+        for index,length in enumerate(lengths):
         # todo reshape back to batch dim
-        closest = torch.min(dist[torch.logical_not(torch.isnan(dist))])
+            end_ind = start_ind + length
+            dist_local = dist[start_ind:end_ind]
+            closest[index] = torch.sqrt(torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0).values)
+            start_ind = end_ind
         return closest
     
 
@@ -689,14 +712,17 @@ def pytorch_setup():
                 device = torch.device("cpu")
 
         lights = PointLights(device=device, location=[[0.0, 0.0, 3.0]])
+        dist = torch.linspace(0.5,0.7,4).reshape(1,1,-1).expand(6,6,4).reshape(-1,1)
+        elev = torch.linspace(80,100,6).reshape(1,-1,1).expand(6,6,4).reshape(-1,1)
+        azim = torch.linspace(-5,5,6).reshape(-1,1,1).expand(6,6,4).reshape(-1,1)
 
 	# camera with info from gqcnn primesense
-        R, T = look_at_view_transform(dist=0.6, elev=90, azim=0)        # camera located above object, pointing down
+        R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)        # camera located above object, pointing down
         fl = torch.tensor([[525.0]])
         pp = torch.tensor([[319.5, 239.5]])
         im_size = torch.tensor([[480, 640]])
 
-        camera = PerspectiveCameras(focal_length=fl, principal_point=pp, in_ndc=False, image_size=im_size, device=device, R=R, T=T)[0]
+        camera = PerspectiveCameras(focal_length=fl, principal_point=pp, in_ndc=False, image_size=im_size, device=device, R=R, T=T)
 
         raster_settings = RasterizationSettings(
                  image_size=(480, 640),  # image size (H, W) in pixels
@@ -764,7 +790,7 @@ def test_quality():
 	axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
 
 	grasp2 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
-	grasp2.make2D(updateCamera=True)
+	grasp2.make2D(updateCamera=False)
 	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 	config_dict = {
 		"friction_coef": 0.8,
