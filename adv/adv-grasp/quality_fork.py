@@ -1,4 +1,5 @@
 import torch
+from torch.profiler import profile, record_function, ProfilerActivity
 import numpy as np
 import math
 from pytorch3d.io import load_obj
@@ -121,7 +122,10 @@ class GraspTorch(object):
 
         
     
-        
+    @property
+    def ray_directions(self):
+        axisBatched = torch.unsqueeze(self.axis3D,0)
+        return torch.cat([axisBatched, -axisBatched], 0)
     
     @property
     def tform_to_camera(self):
@@ -192,9 +196,8 @@ class GraspTorch(object):
         float
             magnitude of force along object surface normal
         """
-        axisBatched = torch.unsqueeze(self.axis3D,0)
-        in_direction = torch.cat([axisBatched, -axisBatched], 0)
-        in_direction_norm = torch.nn.functional.normalize(in_direction,dim=-1)
+
+        in_direction_norm = torch.nn.functional.normalize(-self.ray_directions,dim=-1)
 
         in_normal = -self.contact_normals
 
@@ -294,8 +297,7 @@ class GraspTorch(object):
         #  compute intersection
         #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
         mesh_unwrapped = multi_gather_tris(state.verts_packed(), state.faces_packed())
-        axisBatched = torch.unsqueeze(self.axis3D,0)
-        opposite_dir_rays = torch.cat([-axisBatched, axisBatched], 0)
+        opposite_dir_rays = self.ray_directions
         ray_o = self.center3D + (opposite_dir_rays * self.width / 2)
         ray_d = -opposite_dir_rays # [axis3d, -axis3d]
         # ray is n, 3
@@ -398,7 +400,7 @@ class ParallelJawQualityFunction(GraspQualityFunction):
 
         # Read parameters.
         self._friction_coef = config["friction_coef"]
-        self._max_friction_cone_angle = np.arctan(self._friction_coef)
+
 
     def friction_cone_angle(self, action):
         """Compute the angle between the axis and the boundaries of the
@@ -408,9 +410,7 @@ class ParallelJawQualityFunction(GraspQualityFunction):
                                         " without precomputed contact points"
                                         " and normals.")
             raise ValueError(invalid_friction_ang_msg)
-        axisBatched = torch.unsqueeze(action.axis3D,0)
-        opposite_dir_rays = torch.cat([-axisBatched, axisBatched], 0)
-        dot_prod = torch.sum(torch.mul(action.contact_normals,opposite_dir_rays),-1) 
+        dot_prod = torch.sum(torch.mul(action.contact_normals, action.ray_directions),-1) 
         # not sure if necessary, should already be bounded -1 to 1. 
         dot_prod = torch.minimum(torch.maximum(dot_prod, torch.tensor(-1.0)), torch.tensor(1.0))
         angle = torch.arccos(dot_prod)
@@ -464,11 +464,10 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         # that intersection is contact_point
         # angle between ray and normal is contact_normal
 
-class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
+class CannyFerrariQualityFunction(ParallelJawQualityFunction):
     """Measures the distance to the estimated center of mass for antipodal
     parallel-jaw grasps."""
     def __init__(self, config):
-        self._antipodality_pctile = config["antipodality_pctile"]
         ParallelJawQualityFunction.__init__(self, config)
     def quality(self, state, actions, params=None):
         """Given a parallel-jaw grasp, compute the distance to the center of
@@ -488,7 +487,8 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         :obj:`numpy.ndarray`
             Array of the quality for each grasp.
         """
-        actions, faces_index, contactFound = actions.solveForIntersection(state)
+        with record_function("solveForIntersection"):
+            actions, faces_index, contactFound = actions.solveForIntersection(state)
         
         # Compute object center of mass.
         object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
@@ -496,54 +496,50 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         bounding_box = state.get_bounding_boxes()
         bounding_lengths = torch.diff(bounding_box, dim=-1 )
         median_length = torch.median(bounding_lengths)
-        torque_scaling = torch.pow(median_length, -1)
+        torque_scaling = 1000#torch.pow(median_length, -1)
 
         n_force = actions.normal_force_magnitude().unsqueeze(-1)
         normals = torch.mul(-actions.contact_normals , n_force)
 
         n_force = n_force.unsqueeze(0)
-        cone = torch.mul(actions.compute_friction_cone(state), n_force)
+        cone = torch.mul(actions.compute_friction_cone(state,friction_coef=self._friction_coef), n_force)
         torques = torch.mul(actions.torques(cone, object_com), n_force)
         
         
         #### refactor to class fwd
-        ### solve QP over G to figure out sign
+
 
         ### find all simplices
         ## create pool and run on cpu
         # TODO don't hardcode, handle batches
         G = actions.grasp_matrix(cone, torques, normals, torque_scaling)
-        closest = minHull.apply(G)
+        with record_function("minHull"):
+            closest = minHull.apply(G)
         #closest = mH(G)
         print(closest)
 
-
-
-        # Compute antipodality.
-        antipodality_q = ParallelJawQualityFunction.friction_cone_angle(self, actions)
-
-
-
-
-        # Can rank grasps, instead of compute absolute score. Only makes sense if seeding many grasps
-        # antipodality_thresh = abs(
-        #     np.percentile(antipodality_q, 100 - self._antipodality_pctile))
-        
-        max_q = torch.norm(torch.diff(state.get_bounding_boxes(),1,2))
-        quality = torch.ones(actions.depth.shape,device=actions.depth.device) * max_q
-        
-        in_force_closure = ParallelJawQualityFunction.force_closure(self, actions)
-        
-        dist = torch.norm(actions.center3D - object_com,dim=-1)
-        quality[in_force_closure] = dist[in_force_closure]
-        # some kind of damped sigmoid, not sure where it comes from
-        e_inverse = torch.exp(torch.tensor(-1))
-        quality = (torch.exp(-quality / max_q) - e_inverse) / (1 - e_inverse)
-
-        return quality
-# taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
+        return None
+    
+    # taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
 class minHull(torch.autograd.Function):
+    @staticmethod
+    def qp_wrap(facets):
+        ### TODO solve QP over G to figure out sign
+        # square facet matrix
+        Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
+        wrench_regularizer=1e-4#e-10
+        regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = facets.device))
+        P = 2 * (Gsquared + regulizer_mat)
+        q = torch.zeros(1, P.shape[1], device = facets.device)
+        G = -torch.eye(P.shape[1], device = facets.device)
+        h = torch.zeros(1, P.shape[1], device = facets.device)
+        A = torch.ones(1,P.shape[1], device = facets.device)
+        b = torch.ones(1,device = facets.device)
 
+        x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
+        dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
+        return dist
+    
     @staticmethod
     def forward(ctx, G):
         """
@@ -560,30 +556,19 @@ class minHull(torch.autograd.Function):
   
         facets_local = []
         lengths = []
-        for batch_idx in range(numpyG.shape[1]):
-           miniGnumpy = numpyG[:,batch_idx,:]
-           miniG = G_unwrapped[:,batch_idx,:]
-           hull = ConvexHull(miniGnumpy)
-           facets_local.append(miniG[hull.simplices,:])
-           lengths.append(hull.nsimplex)
+        with record_function("ConvexHull-Loop"):
+            for batch_idx in range(numpyG.shape[1]):
+                miniGnumpy = numpyG[:,batch_idx,:]
+                miniG = G_unwrapped[:,batch_idx,:]
+                hull = ConvexHull(miniGnumpy)
+                facets_local.append(miniG[hull.simplices,:])
+                lengths.append(hull.nsimplex)
         facets = torch.cat(facets_local,dim=0)
         ### reassemble simplices into batch may be too many and need to serialize
         ## maybe we only (re)compute the important one in pytorch, drop others for memory
+        with record_function("qp_wrap"):
+            dist = minHull.qp_wrap(facets)
 
-
-        # square facet matrix
-        Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
-        wrench_regularizer=1e-10
-        regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = G.device))
-        P = 2 * (Gsquared + regulizer_mat)
-        q = torch.zeros(1, P.shape[1], device = G.device)
-        G = -torch.eye(P.shape[1], device = G.device)
-        h = torch.zeros(1, P.shape[1], device = G.device)
-        A = torch.ones(1,P.shape[1], device = G.device)
-        b = torch.ones(1,device = G.device)
-
-        x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
-        dist = torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))
         start_ind = 0
         closest = torch.zeros(len(lengths),1)
         for index,length in enumerate(lengths):
@@ -593,7 +578,61 @@ class minHull(torch.autograd.Function):
             closest[index] = torch.sqrt(torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0).values)
             start_ind = end_ind
         return closest
+
     
+class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
+    """Measures the distance to the estimated center of mass for antipodal
+    parallel-jaw grasps."""
+    def __init__(self, config):
+        self._antipodality_pctile = config["antipodality_pctile"]
+        ParallelJawQualityFunction.__init__(self, config)
+        self._max_friction_cone_angle = np.arctan(self._friction_coef)
+    def quality(self, state, actions, params=None):
+        """Given a parallel-jaw grasp, compute the distance to the center of
+        mass of the grasped object.
+
+        Parameters
+        ----------
+        state : :obj:`Pytorch3D Meshes object `
+            A Meshes object of size 1 containing a watertight mesh
+        action: :obj:`Grasp`
+            A suction grasp in image space that encapsulates center and axis
+        params: dict
+            Stores params used in computing quality.
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Array of the quality for each grasp.
+        """
+        object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
+
+        with record_function("solveForIntersection"):
+            actions, faces_index, contactFound = actions.solveForIntersection(state)
+       
+        # Compute antipodality.
+        antipodality_q = ParallelJawQualityFunction.friction_cone_angle(self, actions)
+
+
+
+
+        # Can rank grasps, instead of compute absolute score. Only makes sense if seeding many grasps
+        # antipodality_thresh = abs(
+        #     np.percentile(antipodality_q, 100 - self._antipodality_pctile))
+        
+        max_q = torch.norm(torch.diff(state.get_bounding_boxes(),1,2))
+        quality = torch.ones(list(actions.axis3D.shape)[:-1]+[1],device=actions.axis3D.device) * max_q
+        
+        in_force_closure = ParallelJawQualityFunction.force_closure(self, actions)
+        
+        dist = torch.norm(actions.center3D - object_com,dim=-1)
+        quality[in_force_closure] = dist[in_force_closure]
+        # some kind of damped sigmoid, not sure where it comes from
+        e_inverse = torch.exp(torch.tensor(-1))
+        quality = (torch.exp(-quality / max_q) - e_inverse) / (1 - e_inverse)
+
+        return quality
+
 
 def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
     shape = list(shape)
@@ -688,7 +727,7 @@ def moller_trumbore(ray_o, ray_d, tris , eps=1e-8):
 
     # batch cross product
     N = torch.cross(E1, E2)  # normal to E1 and E2, automatically batched to (n_faces, 3)
-
+    # TODO, should this be a solve instead? need to batch u,v,t into one matrix?
     invdet = 1. / -(torch.einsum('md,nd->mn', ray_d, N) + eps)  # inverse determinant (n_faces, 3)
 
     A0 = ray_o[:, None] - tris[None, :, 0]  # (n_rays, 3) - (n_faces, 3) -> (n_rays, n_faces, 3) automatic broadcast
@@ -749,8 +788,8 @@ def pytorch_setup():
 def test_quality():
 	# load PyTorch3D mesh from .obj file
 	renderer, device = pytorch_setup()
-
-	verts, faces_idx, _ = load_obj("adv/adv-grasp/data/bar_clamp.obj")
+	with record_function("load_obj"):
+		verts, faces_idx, _ = load_obj("adv/adv-grasp/data/bar_clamp.obj")
 	faces = faces_idx.verts_idx
 	verts_rgb = torch.ones_like(verts)[None]
 	textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -791,17 +830,32 @@ def test_quality():
 
 	grasp2 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
 	grasp2.make2D(updateCamera=False)
+
+	center3D = torch.tensor([[-0.03714486211538315, -0.029467197135090828, 0.01168159581720829]], device=device)
+	axis3D   = torch.tensor([[-0.974246621131897, -0.19650164246559143, -0.11059238761663437]], device=device)
+
+	grasp3 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
 	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 	config_dict = {
 		"friction_coef": 0.8,
 		"antipodality_pctile": 1.0 
 	}
-	
-	com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
+	with record_function("FastAntipodalityFunction"):
+		com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
 
 	# Call quality with the Grasp2D and mesh
-	com_qual_func.quality(mesh, grasp2)
+		com_qual_func.quality(mesh, grasp3)
+
+	with record_function("CannyFerrari"):
+		com_qual_func = CannyFerrariQualityFunction(config_dict)
+
+	# Call quality with the Grasp2D and mesh
+		com_qual_func.quality(mesh, grasp3)
 
 if __name__ == "__main__":
-	test_quality()
-
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, with_stack=False) as prof:
+        with record_function("test_quality"):
+            #model(inputs)
+            test_quality()
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
+    # prof.export_chrome_trace("trace.json")
