@@ -387,7 +387,7 @@ class GraspTorch(object):
         return np.r_[p1, p2, self.depth]
 
 
-class GraspQualityFunction():	#ABC):
+class GraspQualityFunction():    #ABC):
     """Abstract grasp quality class."""
 
     def __init__(self):
@@ -844,7 +844,7 @@ def pytorch_setup():
         elev = torch.linspace(80,100,6).reshape(1,-1,1).expand(6,6,4).reshape(-1,1)
         azim = torch.linspace(-5,5,6).reshape(-1,1,1).expand(6,6,4).reshape(-1,1)
 
-	# camera with info from gqcnn primesense
+    # camera with info from gqcnn primesense
         R, T = look_at_view_transform(dist=dist, elev=elev, azim=azim)        # camera located above object, pointing down
         fl = torch.tensor([[525.0]])
         pp = torch.tensor([[319.5, 239.5]])
@@ -871,128 +871,128 @@ def pytorch_setup():
                           lights = lights
                  )
         )
-	
-        return renderer, device	
-	
+    
+        return renderer, device    
+    
 def test_quality():
-	# load PyTorch3D mesh from .obj file
-	renderer, device = pytorch_setup()
-	with record_function("load_obj"):
-		verts, faces_idx, _ = load_obj("adv/adv-grasp/data/bar_clamp.obj")
-	faces = faces_idx.verts_idx
-	verts_rgb = torch.ones_like(verts)[None]
-	textures = TexturesVertex(verts_features=verts_rgb.to(device))
+    # load PyTorch3D mesh from .obj file
+    renderer, device = pytorch_setup()
+    with record_function("load_obj"):
+        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/bar_clamp.obj")
+    faces = faces_idx.verts_idx
+    verts_rgb = torch.ones_like(verts)[None]
+    textures = TexturesVertex(verts_features=verts_rgb.to(device))
 
-	mesh = Meshes(
-		verts=[verts.to(device)],
-		faces=[faces.to(device)],
-		textures=textures
-	)
-	config_dict = {
+    mesh = Meshes(
+        verts=[verts.to(device)],
+        faces=[faces.to(device)],
+        textures=textures
+    )
+    config_dict = {
         "torque_scaling":1000,
         "soft_fingers":1,
-		"friction_coef": 0.5, # TODO use 0.8 in practice
-		"antipodality_pctile": 1.0 
-	}
+        "friction_coef": 0.5, # TODO use 0.8 in practice
+        "antipodality_pctile": 1.0 
+    }
 
-	object_com = ParallelJawQualityFunction.compute_mesh_COM(mesh)
+    object_com = ParallelJawQualityFunction.compute_mesh_COM(mesh)
 
     # Test intersection finding
-	test_grasps_compute = []
-	test_grasps_set = []
-	dicts = []
-	for i in [3,5]: # range(12):
-		f = open('adv/adv-grasp/data/data/data'+str(i)+'.json')
-		dicts.append(json.load(f))
-		center3D = torch.tensor([dicts[-1]['pytorch_w_center']],device=device)
-		axis3D = torch.tensor([dicts[-1]['pytorch_w_axis']],device=device)        
+    test_grasps_compute = []
+    test_grasps_set = []
+    dicts = []
+    for i in [3,5]: # range(12):
+        f = open('adv/adv-grasp/data/data/data'+str(i)+'.json')
+        dicts.append(json.load(f))
+        center3D = torch.tensor([dicts[-1]['pytorch_w_center']],device=device)
+        axis3D = torch.tensor([dicts[-1]['pytorch_w_axis']],device=device)        
 
-		test_grasps_compute.append(GraspTorch(center3D, axis3D=axis3D, width=0.05))
-		test_grasps_compute[-1], _, _ = test_grasps_compute[-1].solveForIntersection(mesh)
-		print("contact points:", i)
-		print(test_grasps_compute[-1].contact_points.squeeze().numpy(force=True))
-		print(np.array(dicts[-1]['contact_points']))
-		print("contact normals:", i)
-		print(test_grasps_compute[-1].contact_normals.squeeze().numpy(force=True))
-		print(-np.array(dicts[-1]['normals_1']).T) # .json has inward normal
+        test_grasps_compute.append(GraspTorch(center3D, axis3D=axis3D, width=0.05))
+        test_grasps_compute[-1], _, _ = test_grasps_compute[-1].solveForIntersection(mesh)
+        print("contact points:", i)
+        print(test_grasps_compute[-1].contact_points.squeeze().numpy(force=True))
+        print(np.array(dicts[-1]['contact_points']))
+        print("contact normals:", i)
+        print(test_grasps_compute[-1].contact_normals.squeeze().numpy(force=True))
+        print(-np.array(dicts[-1]['normals_1']).T) # .json has inward normal
 
-		test_grasps_set.append(GraspTorch(center3D, axis3D=axis3D, width=0.05))
-		test_grasps_set[-1].contact_points = torch.tensor(dicts[-1]['contact_points'],device=device).unsqueeze(1).double()
-		test_grasps_set[-1].contact_normals = -torch.nn.functional.normalize(torch.tensor(dicts[-1]['normals_1'],device=device).transpose(0,1).unsqueeze(1).double(),dim=-1)
+        test_grasps_set.append(GraspTorch(center3D, axis3D=axis3D, width=0.05))
+        test_grasps_set[-1].contact_points = torch.tensor(dicts[-1]['contact_points'],device=device).unsqueeze(1).double()
+        test_grasps_set[-1].contact_normals = -torch.nn.functional.normalize(torch.tensor(dicts[-1]['normals_1'],device=device).transpose(0,1).unsqueeze(1).double(),dim=-1)
 
-	# Test intermediate values, forces/torques
-	tests = [[3e-3, 1e-1, test_grasps_set], [1, 1, test_grasps_compute]]
-	for test in tests:
-		for i in range(len(dicts)):
-			n_force =test[2][i].normal_force_magnitude().unsqueeze(-1)
+    # Test intermediate values, forces/torques
+    tests = [[3e-3, 1e-1, test_grasps_set], [1, 1, test_grasps_compute]]
+    for test in tests:
+        for i in range(len(dicts)):
+            n_force =test[2][i].normal_force_magnitude().unsqueeze(-1)
 
-			cone = torch.mul(test[2][i].compute_friction_cone(mesh,friction_coef=config_dict["friction_coef"]), n_force)
-			torques = torch.mul(test[2][i].torques(cone, object_com), n_force)
-		
-			print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
-			print("cone:", i)
-			print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
-			print(np.array(dicts[i]['forces_1']).T)
-			np.testing.assert_allclose(cone.transpose(0,1).numpy(force=True).reshape(16,3), 
+            cone = torch.mul(test[2][i].compute_friction_cone(mesh,friction_coef=config_dict["friction_coef"]), n_force)
+            torques = torch.mul(test[2][i].torques(cone, object_com), n_force)
+        
+            print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
+            print("cone:", i)
+            print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
+            print(np.array(dicts[i]['forces_1']).T)
+            np.testing.assert_allclose(cone.transpose(0,1).numpy(force=True).reshape(16,3), 
                             np.array(dicts[i]['forces_1']).T,
                             atol=test[0],rtol=test[1])
-		
-			print("torqes:", i)
-			print(torques.transpose(0,1).numpy(force=True).reshape(16,3))
-			print(np.array(dicts[i]['torques_1']).T)
-			np.testing.assert_allclose(torques.transpose(0,1).numpy(force=True).reshape(16,3),
+        
+            print("torqes:", i)
+            print(torques.transpose(0,1).numpy(force=True).reshape(16,3))
+            print(np.array(dicts[i]['torques_1']).T)
+            np.testing.assert_allclose(torques.transpose(0,1).numpy(force=True).reshape(16,3),
                             np.array(dicts[i]['torques_1']).T,
                             atol=test[0],rtol=test[1])
 
     # Test final grasp quality
-	tests = [[1e-3, 1e-5, test_grasps_set], [1e-2, 1e-3, test_grasps_compute]]
-	print("atol", tests[0][0], "rtol", tests[0][1],"atol", tests[1][0], "rtol", tests[1][1])
-	print("torch (w/o col), torch (w/ col), dexnet")
-	for i in range(len(dicts)):            
-			com_qual_func = CannyFerrariQualityFunction(config_dict)
-			torch_quality_no_col = com_qual_func.quality(mesh, tests[0][2][i]).numpy(force=True)[0]
-			np.testing.assert_allclose(torch_quality_no_col,
+    tests = [[1e-3, 1e-5, test_grasps_set], [1e-2, 1e-3, test_grasps_compute]]
+    print("atol", tests[0][0], "rtol", tests[0][1],"atol", tests[1][0], "rtol", tests[1][1])
+    print("torch (w/o col), torch (w/ col), dexnet")
+    for i in range(len(dicts)):            
+            com_qual_func = CannyFerrariQualityFunction(config_dict)
+            torch_quality_no_col = com_qual_func.quality(mesh, tests[0][2][i]).numpy(force=True)[0]
+            np.testing.assert_allclose(torch_quality_no_col,
                     np.array(dicts[i]['rfc_quality']).T,
                     atol=tests[0][0],rtol=tests[0][1])
                
-			torch_quality_col = com_qual_func.quality(mesh, tests[1][2][i]).numpy(force=True)[0]
-			np.testing.assert_allclose(torch_quality_col,
+            torch_quality_col = com_qual_func.quality(mesh, tests[1][2][i]).numpy(force=True)[0]
+            np.testing.assert_allclose(torch_quality_col,
                     np.array(dicts[i]['rfc_quality']).T,
                     atol=tests[1][0],rtol=tests[1][1])
-			print(torch_quality_no_col[0],",", torch_quality_col[0],",",
-	        dicts[i]['rfc_quality'],";")
+            print(torch_quality_no_col[0],",", torch_quality_col[0],",",
+            dicts[i]['rfc_quality'],";")
 
-	center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
-	angle = torch.tensor([[0.3525843322277069 + math.pi]],device=device)
-	depth = torch.tensor([[0.5824159979820251]],device=device)
-	width = torch.tensor([[0.05]],device=device)
+    center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
+    angle = torch.tensor([[0.3525843322277069 + math.pi]],device=device)
+    depth = torch.tensor([[0.5824159979820251]],device=device)
+    width = torch.tensor([[0.05]],device=device)
 
-	grasp1 = GraspTorch(center2d, angle, depth, width, renderer.rasterizer.cameras) 
+    grasp1 = GraspTorch(center2d, angle, depth, width, renderer.rasterizer.cameras) 
         
 
-	center3D = torch.tensor([[ 0.027602000162005424, 0.017583999782800674, -9.273400064557791e-05]], device=device)
-	axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
+    center3D = torch.tensor([[ 0.027602000162005424, 0.017583999782800674, -9.273400064557791e-05]], device=device)
+    axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
 
-	grasp2 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
-	grasp2.make2D(updateCamera=False)
+    grasp2 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
+    grasp2.make2D(updateCamera=False)
 
-	center3D = torch.tensor([[-0.03714486211538315, -0.029467197135090828, 0.01168159581720829]], device=device)
-	axis3D   = torch.tensor([[-0.974246621131897, -0.19650164246559143, -0.11059238761663437]], device=device)
+    center3D = torch.tensor([[-0.03714486211538315, -0.029467197135090828, 0.01168159581720829]], device=device)
+    axis3D   = torch.tensor([[-0.974246621131897, -0.19650164246559143, -0.11059238761663437]], device=device)
 
-	grasp3 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
-	# Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
+    grasp3 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras) 
+    # Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 
-	with record_function("FastAntipodalityFunction"):
-		com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
+    with record_function("FastAntipodalityFunction"):
+        com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
 
-	# Call quality with the Grasp2D and mesh
-		com_qual_func.quality(mesh, grasp3)
+    # Call quality with the Grasp2D and mesh
+        com_qual_func.quality(mesh, grasp3)
 
-	with record_function("CannyFerrari"):
-		com_qual_func = CannyFerrariQualityFunction(config_dict)
+    with record_function("CannyFerrari"):
+        com_qual_func = CannyFerrariQualityFunction(config_dict)
 
-	# Call quality with the Grasp2D and mesh
-		com_qual_func.quality(mesh, grasp3)
+    # Call quality with the Grasp2D and mesh
+        com_qual_func.quality(mesh, grasp3)
 
 if __name__ == "__main__":
     #minHull.apply(torch.tensor(dict['G']).transpose(0,1).reshape((20,1,1,6)))
