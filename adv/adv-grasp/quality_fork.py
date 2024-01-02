@@ -558,7 +558,7 @@ class minHull(torch.autograd.Function):
         A = torch.ones((n_batch,1,n_dim), device = facets.device, dtype=facets.dtype)
         b = torch.ones((n_batch,1),device = facets.device, dtype=facets.dtype)
 
-        x = QPFunction(check_Q_spd=False)(P, q, G, h, A , b)
+        x = QPFunction(check_Q_spd=True)(P, q, G, h, A , b)
         dist = torch.sqrt(torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))/2)
         return dist, x, P
     @staticmethod
@@ -626,18 +626,8 @@ class minHull(torch.autograd.Function):
             lam = slacks = None
 
         return prob.value, zhat, nu, lam, slacks
-
     @staticmethod
-    def forward(ctx, G):
-        """
-        In the forward pass we receive a Tensor containing the input and return
-        a Tensor containing the output. ctx is a context object that can be used
-        to stash information for backward computation. You can cache arbitrary
-        objects for use in the backward pass using the ctx.save_for_backward method.
-        """
-        original_shape = G.shape
-        G_unwrapped = G.reshape((original_shape[0]*original_shape[1], -1, 6))
-        ctx.save_for_backward(input)
+    def distWrap(G_unwrapped):
         numpyG = G_unwrapped.numpy(force=True)
         
   
@@ -655,6 +645,20 @@ class minHull(torch.autograd.Function):
         ## maybe we only (re)compute the important one in pytorch, drop others for memory
         with record_function("qp_wrap"):
             dist,x,P = minHull.qp_wrap(facets)
+        return dist, lengths
+    
+    @staticmethod
+    def forward(ctx, G):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+        ctx.save_for_backward(input)
+        original_shape = G.shape
+        G_unwrapped = G.reshape((original_shape[0]*original_shape[1], -1, 6))
+        dist,lengths = minHull.distWrap(ctx, G_unwrapped)
 
 
         start_ind = 0
@@ -897,7 +901,7 @@ def test_quality():
 	test_grasps_compute = []
 	test_grasps_set = []
 	dicts = []
-	for i in range(12):
+	for i in [3,5]: # range(12):
 		f = open('adv/adv-grasp/data/data/data'+str(i)+'.json')
 		dicts.append(json.load(f))
 		center3D = torch.tensor([dicts[-1]['pytorch_w_center']],device=device)
@@ -913,8 +917,8 @@ def test_quality():
 		print(-np.array(dicts[-1]['normals_1']).T) # .json has inward normal
 
 		test_grasps_set.append(GraspTorch(center3D, axis3D=axis3D, width=0.05))
-		test_grasps_set[i].contact_points = torch.tensor(dicts[i]['contact_points'],device=device).unsqueeze(1).double()
-		test_grasps_set[i].contact_normals = -torch.nn.functional.normalize(torch.tensor(dicts[i]['normals_1'],device=device).transpose(0,1).unsqueeze(1).double(),dim=-1)
+		test_grasps_set[-1].contact_points = torch.tensor(dicts[-1]['contact_points'],device=device).unsqueeze(1).double()
+		test_grasps_set[-1].contact_normals = -torch.nn.functional.normalize(torch.tensor(dicts[-1]['normals_1'],device=device).transpose(0,1).unsqueeze(1).double(),dim=-1)
 
 	# Test intermediate values, forces/torques
 	tests = [[3e-3, 1e-1, test_grasps_set], [1, 1, test_grasps_compute]]
@@ -925,17 +929,17 @@ def test_quality():
 			cone = torch.mul(test[2][i].compute_friction_cone(mesh,friction_coef=config_dict["friction_coef"]), n_force)
 			torques = torch.mul(test[2][i].torques(cone, object_com), n_force)
 		
-			# print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
-			# print("cone:", i)
-			# print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
-			# print(np.array(dicts[i]['forces_1']).T)
+			print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
+			print("cone:", i)
+			print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
+			print(np.array(dicts[i]['forces_1']).T)
 			np.testing.assert_allclose(cone.transpose(0,1).numpy(force=True).reshape(16,3), 
                             np.array(dicts[i]['forces_1']).T,
                             atol=test[0],rtol=test[1])
 		
-			# print("torqes:", i)
-			# print(torques.transpose(0,1).numpy(force=True).reshape(16,3))
-			# print(np.array(dicts[i]['torques_1']).T)
+			print("torqes:", i)
+			print(torques.transpose(0,1).numpy(force=True).reshape(16,3))
+			print(np.array(dicts[i]['torques_1']).T)
 			np.testing.assert_allclose(torques.transpose(0,1).numpy(force=True).reshape(16,3),
                             np.array(dicts[i]['torques_1']).T,
                             atol=test[0],rtol=test[1])
