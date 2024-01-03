@@ -490,29 +490,9 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         self._soft_fingers = config["soft_fingers"]
         self._torque_scaling = config["torque_scaling"]
         ParallelJawQualityFunction.__init__(self, config)
-    def quality(self, state, actions):
-        """Given a parallel-jaw grasp, compute the distance to the center of
-        mass of the grasped object.
 
-        Parameters
-        ----------
-        state : :obj:`Pytorch3D Meshes object `
-            A Meshes object of size 1 containing a watertight mesh
-        action: :obj:`Grasp`
-            A suction grasp in image space that encapsulates center and axis
-        params: dict
-            Stores params used in computing quality.
-
-        Returns
-        -------
-        :obj:`numpy.ndarray`
-            Array of the quality for each grasp.
-        """
-        if actions.contact_normals == None or actions.contact_points == None:
-            with record_function("solveForIntersection"):
-                actions, faces_index, contactFound = actions.solveForIntersection(state)
-        
-        # Compute object center of mass.
+    def compute_grasp_matrix(self, state, actions):
+                # Compute object center of mass.
         object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
 
         bounding_box = state.get_bounding_boxes()
@@ -535,6 +515,30 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         G = actions.grasp_matrix(cone, torques, normals, torque_scaling, 
                                  soft_fingers=self._soft_fingers, finger_radius=0.005, 
                                  friction_coef=self._friction_coef)
+        return G
+    def quality(self, state, actions):
+        """Given a parallel-jaw grasp, compute the distance to the center of
+        mass of the grasped object.
+
+        Parameters
+        ----------
+        state : :obj:`Pytorch3D Meshes object `
+            A Meshes object of size 1 containing a watertight mesh
+        action: :obj:`Grasp`
+            A suction grasp in image space that encapsulates center and axis
+        params: dict
+            Stores params used in computing quality.
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Array of the quality for each grasp.
+        """
+        if actions.contact_normals == None or actions.contact_points == None:
+            with record_function("solveForIntersection"):
+                actions, faces_index, contactFound = actions.solveForIntersection(state)
+        
+        G = self.compute_grasp_matrix(state,actions)
         with record_function("minHull"):
             closest = minHull.apply(G)
 
@@ -658,7 +662,7 @@ class minHull(torch.autograd.Function):
         ctx.save_for_backward(input)
         original_shape = G.shape
         G_unwrapped = G.reshape((original_shape[0]*original_shape[1], -1, 6))
-        dist,lengths = minHull.distWrap(ctx, G_unwrapped)
+        dist,lengths = minHull.distWrap(G_unwrapped)
 
 
         start_ind = 0
@@ -928,7 +932,7 @@ def test_quality():
 
             cone = torch.mul(test[2][i].compute_friction_cone(mesh,friction_coef=config_dict["friction_coef"]), n_force)
             torques = torch.mul(test[2][i].torques(cone, object_com), n_force)
-        
+
             print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
             print("cone:", i)
             print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
@@ -943,6 +947,27 @@ def test_quality():
             np.testing.assert_allclose(torques.transpose(0,1).numpy(force=True).reshape(16,3),
                             np.array(dicts[i]['torques_1']).T,
                             atol=test[0],rtol=test[1])
+            
+            com_qual_func = CannyFerrariQualityFunction(config_dict)
+            G = com_qual_func.compute_grasp_matrix(mesh, test[2][i])
+            G_unwrapped = G.reshape((G.shape[0]*G.shape[1], -1, 6))
+            #G = G[list(range(8))+list(range(10,18))+list(range(8,10))+list(range(18,20)),:]
+            print("G:", i)
+            print(G_unwrapped.transpose(0,1).numpy(force=True).reshape(20,6)[16:,:])
+            print(np.array(dicts[i]['G']).T[16:,:])
+            np.testing.assert_allclose(G_unwrapped.transpose(0,1).numpy(force=True).reshape(20,6)[16:,:],
+                            np.array(dicts[i]['G']).T[16:,:],
+                            atol=test[0],rtol=test[1])
+    # TODO, test grasp matrix, need to account for order of soft finger torsion terms
+    # Test dists
+    for i in range(len(dicts)):
+        com_qual_func = CannyFerrariQualityFunction(config_dict)
+        G = com_qual_func.compute_grasp_matrix(mesh, test_grasps_set[i])
+        G_unwrapped = G.reshape((G.shape[0]*G.shape[1], -1, 6))
+        dists,_ = minHull.distWrap(G_unwrapped)
+        np.testing.assert_allclose(dists.reshape((-1)).numpy(force=True),
+                np.array(dicts[i]['dists']).T,
+                atol=0.04,rtol=test[1])
 
     # Test final grasp quality
     tests = [[1e-3, 1e-5, test_grasps_set], [1e-2, 1e-3, test_grasps_compute]]
