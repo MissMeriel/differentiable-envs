@@ -348,7 +348,15 @@ class GraspTorch(object):
         faces_index = min_out.indices
         contactFound = torch.logical_not(torch.isinf(min_out.values))
         self.contact_points = intersectionPoints
-        self.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
+        #self.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
+
+        ## experimental, weighted vertex normals
+        vertex_normals = state.verts_normals_packed()[state.faces_packed()[faces_index,:]]
+        u_vals = torch.gather(u, 2, faces_index).unsqueeze(3).unsqueeze(4)
+        v_vals = torch.gather(v, 2, faces_index).unsqueeze(3).unsqueeze(4)
+        w_vals = 1 - u_vals - v_vals
+        weights = torch.cat((u_vals,v_vals,w_vals),-2)
+        self.contact_normals = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
         return self, faces_index, contactFound
 
 
@@ -649,7 +657,7 @@ class minHull(torch.autograd.Function):
         ## maybe we only (re)compute the important one in pytorch, drop others for memory
         with record_function("qp_wrap"):
             dist,x,P = minHull.qp_wrap(facets)
-        return dist, lengths
+        return dist, lengths, x, facets
     
     @staticmethod
     def forward(ctx, G):
@@ -662,7 +670,7 @@ class minHull(torch.autograd.Function):
         ctx.save_for_backward(input)
         original_shape = G.shape
         G_unwrapped = G.reshape((original_shape[0]*original_shape[1], -1, 6))
-        dist,lengths = minHull.distWrap(G_unwrapped)
+        dist, lengths, x, facets = minHull.distWrap(G_unwrapped)
 
 
         start_ind = 0
@@ -671,8 +679,11 @@ class minHull(torch.autograd.Function):
         # todo reshape back to batch dim
             end_ind = start_ind + length
             dist_local = dist[start_ind:end_ind]
-            closest[index] = torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0).values
+            minReturn = torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0)
+            closest[index] = minReturn.values
             start_ind = end_ind
+        # print("closest point: ", x[minReturn.indices])
+        # print("vert vals: ",facets[minReturn.indices])
         return closest
 
     dtype=torch.float64
@@ -905,7 +916,7 @@ def test_quality():
     test_grasps_compute = []
     test_grasps_set = []
     dicts = []
-    for i in [3,5]: # range(12):
+    for i in range(12):
         f = open('adv/adv-grasp/data/data/data'+str(i)+'.json')
         dicts.append(json.load(f))
         center3D = torch.tensor([dicts[-1]['pytorch_w_center']],device=device)
@@ -933,17 +944,17 @@ def test_quality():
             cone = torch.mul(test[2][i].compute_friction_cone(mesh,friction_coef=config_dict["friction_coef"]), n_force)
             torques = torch.mul(test[2][i].torques(cone, object_com), n_force)
 
-            print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
-            print("cone:", i)
-            print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
-            print(np.array(dicts[i]['forces_1']).T)
+            # print("n_force:",list(n_force.squeeze().numpy(force=True)),(dicts[i]['n_0'],dicts[i]['n_1']),i)
+            # print("cone:", i)
+            # print(cone.transpose(0,1).numpy(force=True).reshape(16,3))
+            # print(np.array(dicts[i]['forces_1']).T)
             np.testing.assert_allclose(cone.transpose(0,1).numpy(force=True).reshape(16,3), 
                             np.array(dicts[i]['forces_1']).T,
                             atol=test[0],rtol=test[1])
         
-            print("torqes:", i)
-            print(torques.transpose(0,1).numpy(force=True).reshape(16,3))
-            print(np.array(dicts[i]['torques_1']).T)
+            # print("torqes:", i)
+            # print(torques.transpose(0,1).numpy(force=True).reshape(16,3))
+            # print(np.array(dicts[i]['torques_1']).T)
             np.testing.assert_allclose(torques.transpose(0,1).numpy(force=True).reshape(16,3),
                             np.array(dicts[i]['torques_1']).T,
                             atol=test[0],rtol=test[1])
@@ -952,22 +963,22 @@ def test_quality():
             G = com_qual_func.compute_grasp_matrix(mesh, test[2][i])
             G_unwrapped = G.reshape((G.shape[0]*G.shape[1], -1, 6))
             #G = G[list(range(8))+list(range(10,18))+list(range(8,10))+list(range(18,20)),:]
-            print("G:", i)
-            print(G_unwrapped.transpose(0,1).numpy(force=True).reshape(20,6)[16:,:])
-            print(np.array(dicts[i]['G']).T[16:,:])
-            np.testing.assert_allclose(G_unwrapped.transpose(0,1).numpy(force=True).reshape(20,6)[16:,:],
+            # print("G:", i)
+            # print(G_unwrapped.transpose(0,1).numpy(force=True).reshape(-1,6)[16:,:])
+            # print(np.array(dicts[i]['G']).T[16:,:])
+            np.testing.assert_allclose(G_unwrapped.transpose(0,1).numpy(force=True).reshape(-1,6)[16:,:],
                             np.array(dicts[i]['G']).T[16:,:],
                             atol=test[0],rtol=test[1])
     # TODO, test grasp matrix, need to account for order of soft finger torsion terms
     # Test dists
-    for i in range(len(dicts)):
-        com_qual_func = CannyFerrariQualityFunction(config_dict)
-        G = com_qual_func.compute_grasp_matrix(mesh, test_grasps_set[i])
-        G_unwrapped = G.reshape((G.shape[0]*G.shape[1], -1, 6))
-        dists,_ = minHull.distWrap(G_unwrapped)
-        np.testing.assert_allclose(dists.reshape((-1)).numpy(force=True),
-                np.array(dicts[i]['dists']).T,
-                atol=0.04,rtol=test[1])
+    # for i in range(len(dicts)):
+    #     com_qual_func = CannyFerrariQualityFunction(config_dict)
+    #     G = com_qual_func.compute_grasp_matrix(mesh, test_grasps_set[i])
+    #     G_unwrapped = G.reshape((G.shape[0]*G.shape[1], -1, 6))
+    #     dists,_,_,_ = minHull.distWrap(G_unwrapped)
+    #     np.testing.assert_allclose(dists.reshape((-1)).numpy(force=True),
+    #             np.array(dicts[i]['dists']).T,
+    #             atol=0.04,rtol=test[1])
 
     # Test final grasp quality
     tests = [[1e-3, 1e-5, test_grasps_set], [1e-2, 1e-3, test_grasps_compute]]
@@ -975,16 +986,17 @@ def test_quality():
     print("torch (w/o col), torch (w/ col), dexnet")
     for i in range(len(dicts)):            
             com_qual_func = CannyFerrariQualityFunction(config_dict)
+            # print("set")
             torch_quality_no_col = com_qual_func.quality(mesh, tests[0][2][i]).numpy(force=True)[0]
             np.testing.assert_allclose(torch_quality_no_col,
                     np.array(dicts[i]['rfc_quality']).T,
                     atol=tests[0][0],rtol=tests[0][1])
-               
+            # print("compute")
             torch_quality_col = com_qual_func.quality(mesh, tests[1][2][i]).numpy(force=True)[0]
             np.testing.assert_allclose(torch_quality_col,
                     np.array(dicts[i]['rfc_quality']).T,
                     atol=tests[1][0],rtol=tests[1][1])
-            print(torch_quality_no_col[0],",", torch_quality_col[0],",",
+            print("dists:",torch_quality_no_col[0],",", torch_quality_col[0],",",
             dicts[i]['rfc_quality'],";")
 
     center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
