@@ -7,9 +7,11 @@ import cvxopt as cvx
 import cvxpy as cp
 import pyhull.convex_hull as cvh
 from pytorch3d.io import load_obj
+from pytorch3d import _C
 import pytorch3d.transforms as tf
 from scipy.spatial import ConvexHull
-from pytorch3d.structures import Meshes
+from scipy.io import savemat
+from pytorch3d.structures import Meshes, Pointclouds
 from pytorch3d.renderer import (
         look_at_view_transform,
         PerspectiveCameras,
@@ -330,10 +332,10 @@ class GraspTorch(object):
         
         target_shape = ray_o.shape
         # moller_trumbore assumes flat list of rays (2d Nx3)
-        ray_o_flat = torch.flatten(ray_o, end_dim=-2).float()
-        ray_d_flat = torch.flatten(ray_d, end_dim=-2).float()
+        ray_o_flat = torch.flatten(ray_o, end_dim=-2)
+        ray_d_flat = torch.flatten(ray_d, end_dim=-2)
 
-        u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped)
+        u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped.double())
 
         u = torch.unflatten(u, 0, target_shape[:-1])
         v = torch.unflatten(v, 0, target_shape[:-1])
@@ -348,19 +350,234 @@ class GraspTorch(object):
         faces_index = min_out.indices
         contactFound = torch.logical_not(torch.isinf(min_out.values))
         self.contact_points = intersectionPoints
-        #self.contact_normals = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
-
-        ## experimental, weighted vertex normals
+        
+        verts = state.verts_packed()[state.faces_packed()[faces_index,:]]
+        # experimental, weighted vertex normals
         vertex_normals = state.verts_normals_packed()[state.faces_packed()[faces_index,:]]
         u_vals = torch.gather(u, 2, faces_index).unsqueeze(3).unsqueeze(4)
         v_vals = torch.gather(v, 2, faces_index).unsqueeze(3).unsqueeze(4)
         w_vals = 1 - u_vals - v_vals
-        weights = torch.cat((u_vals,v_vals,w_vals),-2)
-        self.contact_normals = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
+        weights = torch.cat((w_vals,u_vals,v_vals),-2)
+        minReturn=torch.min(weights,dim=-2)
+        normsVert = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
+        verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
+        vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = state.faces_normals_packed()[faces_index,:]
+        bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
+        normsDexnet = normalSphereSamples(self.contact_points, state, ray_d)
+        #torch.mean(verts, dim=-2,keepdim=True)
+        #vertex_normals.scatter_( state.faces_normals_packed()[faces_index,:])
+        # TODO, update to use built in https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/ops/interp_face_attrs.html
+        #self.contact_normals = (torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2) + torch.squeeze(state.faces_normals_packed()[faces_index,:],-2))/2
+        normsVertFace = torch.sum(torch.multiply(vertex_normals,bary),dim=-2).squeeze(-2)
+        normsFace = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
+        self.contact_normals = normsDexnet
+
+        # experimental, weighted adjacent face normals
+        #faces_edges = state.faces_packed_to_edges_packed()[faces_index,:]
+        # near the end, this has all edge (face) pairs, organized by edge index, so just need face to edge to get 6 normals, 3 the same as face
+        # so, for instance, we can sum each and subtract face to get non-face
+        #GraspTorch.mesh_normal_consistency(state)
+        #bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
         return self, faces_index, contactFound
 
+def normalSphereSamples(surface_point, mesh, in_rays):
+    point = surface_point.unsqueeze(-2) # add dim for samples
+    sdf_dim = 100
+    sdf_padding = 5
+    gridDist = 1.5  
+    steps = 7 # positive int, probably odd
+    steps_cubed = steps**3
+    # matches min scaling from:
+    obj_target_scale = 0.040
+    # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/database/mesh_processor.py#L281
+    maxDim = torch.max(torch.diff(mesh.get_bounding_boxes(),dim=-1))
+    scaling = (maxDim / (sdf_dim - sdf_padding * 2)) # box to meters
+    step_ends = (steps-1)/2
+    step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps)
+    sphereDirsTuple = torch.meshgrid(step_tensor,step_tensor,step_tensor,indexing='ij')
+    sphereDirs = torch.cat((sphereDirsTuple[0].reshape(steps_cubed,1),sphereDirsTuple[1].reshape(steps_cubed,1),sphereDirsTuple[2].reshape(steps_cubed,1)),1)
+    sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * scaling * gridDist
+    sphereDirs = sphereDirs.reshape([1]*(len(point.shape)-2)+ [steps_cubed, 3])
+    pointSphere = sphereDirs + point
+    origShape = pointSphere.shape
+    pointSphereCloud = Pointclouds([pointSphere.reshape(-1,3)])
+    verts_packed = mesh.verts_packed()
+    faces_packed = mesh.faces_packed()
+    tris = verts_packed[faces_packed]
+    edges_packed = mesh.edges_packed()
+    segms = verts_packed[edges_packed]
+
+    dists_face, idxs_face = _C.point_face_dist_forward(pointSphereCloud.points_packed().float(), 
+                                             pointSphereCloud.cloud_to_packed_first_idx(), 
+                                             tris.float(), 
+                                             mesh.mesh_to_faces_packed_first_idx(), 
+                                             pointSphereCloud.num_points_per_cloud().max().item(),
+                                             5e-6)
+    dists_edge, idxs_edge = _C.point_edge_dist_forward(pointSphereCloud.points_packed().float(), 
+                                             pointSphereCloud.cloud_to_packed_first_idx(), 
+                                             segms.float(), 
+                                             mesh.mesh_to_edges_packed_first_idx(), 
+                                             pointSphereCloud.num_points_per_cloud().max().item(),
+                                             )
+    dists = dists_edge
+    edges_to_check = mesh.faces_packed_to_edges_packed()[idxs_face,:]
+    face_edge_shared = torch.any(edges_to_check == idxs_edge.unsqueeze(1), dim=1)
+    dists[face_edge_shared] = dists_face[face_edge_shared] # TODO, double check barycentric
+    
+    dists = dists.reshape([-1, steps_cubed, 1])
+    minDist = (scaling * np.sqrt(2) / 2)**2 /3 # square meters 
+    masks = torch.split(dists < minDist,dim=0,split_size_or_sections=1)
+    normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+    for maskInd in range(len(masks)):
+        (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
+        normals[maskInd,:] = V[:, -1]
+    normals = normals.reshape(surface_point.shape)
+    return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
 
 
+
+def Barycentric(p,  tri):
+    a = torch.select(tri, -2, torch.tensor(0) ).unsqueeze(-2)
+    b = torch.select(tri, -2, torch.tensor(1) ).unsqueeze(-2)
+    c = torch.select(tri, -2, torch.tensor(2) ).unsqueeze(-2)
+    v0 = b - a
+    v1 = c - a
+    v2 = p - a
+    d00 = torch.sum(v0* v0,dim=-1)
+    d01 = torch.sum(v0* v1,dim=-1)
+    d11 = torch.sum(v1* v1,dim=-1)
+    d20 = torch.sum(v2* v0,dim=-1)
+    d21 = torch.sum(v2* v1,dim=-1)
+    denom = d00 * d11 - d01 * d01
+    
+    v = (d11 * d20 - d01 * d21) / denom
+    w = (d00 * d21 - d01 * d20) / denom
+    u = 1 - v - w
+    return  torch.cat((u.unsqueeze(-1),v.unsqueeze(-1),w.unsqueeze(-1)),dim=-2)
+
+
+    def mesh_normal_consistency(meshes):
+        """
+        Computes the normal consistency of each mesh in meshes.
+        We compute the normal consistency for each pair of neighboring faces.
+        If e = (v0, v1) is the connecting edge of two neighboring faces f0 and f1,
+        then the normal consistency between f0 and f1
+
+        .. code-block:: python
+
+                        a
+                        /\
+                    /  \
+                    / f0 \
+                    /      \
+                v0  /____e___\ v1
+                    \        /
+                    \      /
+                    \ f1 /
+                    \  /
+                        \/
+                        b
+
+        The normal consistency is
+
+        .. code-block:: python
+
+            nc(f0, f1) = 1 - cos(n0, n1)
+
+            where cos(n0, n1) = n0^n1 / ||n0|| / ||n1|| is the cosine of the angle
+            between the normals n0 and n1, and
+
+            n0 = (v1 - v0) x (a - v0)
+            n1 = - (v1 - v0) x (b - v0) = (b - v0) x (v1 - v0)
+
+        This means that if nc(f0, f1) = 0 then n0 and n1 point to the same
+        direction, while if nc(f0, f1) = 2 then n0 and n1 point opposite direction.
+
+        .. note::
+            For well-constructed meshes the assumption that only two faces share an
+            edge is true. This assumption could make the implementation easier and faster.
+            This implementation does not follow this assumption. All the faces sharing e,
+            which can be any in number, are discovered.
+
+        Args:
+            meshes: Meshes object with a batch of meshes.
+
+        Returns:
+            loss: Average normal consistency across the batch.
+            Returns 0 if meshes contains no meshes or all empty meshes.
+        """
+        if meshes.isempty():
+            return torch.tensor(
+                [0.0], dtype=torch.float32, device=meshes.device, requires_grad=True
+            )
+
+        N = len(meshes)
+        verts_packed = meshes.verts_packed()  # (sum(V_n), 3)
+        faces_packed = meshes.faces_packed()  # (sum(F_n), 3)
+        edges_packed = meshes.edges_packed()  # (sum(E_n), 2)
+        verts_packed_to_mesh_idx = meshes.verts_packed_to_mesh_idx()  # (sum(V_n),)
+        face_to_edge = meshes.faces_packed_to_edges_packed()  # (sum(F_n), 3)
+        E = edges_packed.shape[0]  # sum(E_n)
+        F = faces_packed.shape[0]  # sum(F_n)
+
+        # We don't want gradients for the following operation. The goal is to
+        # find for each edge e all the vertices associated with e. In the example
+        # above, the vertices associated with e are (a, b), i.e. the points connected
+        # on faces to e.
+        with torch.no_grad():
+            edge_idx = face_to_edge.reshape(F * 3)  # (3 * F,) indexes into edges
+            vert_idx = (
+                faces_packed.view(1, F, 3).expand(3, F, 3).transpose(0, 1).reshape(3 * F, 3)
+            )
+            edge_idx, edge_sort_idx = edge_idx.sort()
+            vert_idx = vert_idx[edge_sort_idx]
+
+            # In well constructed meshes each edge is shared by precisely 2 faces
+            # However, in many meshes, this assumption is not always satisfied.
+            # We want to find all faces that share an edge, a number which can
+            # vary and which depends on the topology.
+            # In particular, we find the vertices not on the edge on the shared faces.
+            # In the example above, we want to associate edge e with vertices a and b.
+            # This operation is done more efficiently in cpu with lists.
+            # TODO(gkioxari) find a better way to do this.
+
+            # edge_idx represents the index of the edge for each vertex. We can count
+            # the number of vertices which are associated with each edge.
+            # There can be a different number for each edge.
+            edge_num = edge_idx.bincount(minlength=E)
+
+            # This calculates all pairs of vertices which are opposite to the same edge.
+            vert_edge_pair_idx = _C.mesh_normal_consistency_find_verts(edge_num.cpu()).to(
+                edge_num.device
+            )
+
+        if vert_edge_pair_idx.shape[0] == 0:
+            return torch.tensor(
+                [0.0], dtype=torch.float32, device=meshes.device, requires_grad=True
+            )
+
+        v0_idx = edges_packed[edge_idx, 0]
+        v0 = verts_packed[v0_idx]
+        v1_idx = edges_packed[edge_idx, 1]
+        v1 = verts_packed[v1_idx]
+
+        # two of the following cross products are zeros as they are cross product
+        # with either (v1-v0)x(v1-v0) or (v1-v0)x(v0-v0)
+        n_temp0 = (v1 - v0).cross(verts_packed[vert_idx[:, 0]] - v0, dim=1)
+        n_temp1 = (v1 - v0).cross(verts_packed[vert_idx[:, 1]] - v0, dim=1)
+        n_temp2 = (v1 - v0).cross(verts_packed[vert_idx[:, 2]] - v0, dim=1)
+        n = n_temp0 + n_temp1 + n_temp2
+        n0 = n[vert_edge_pair_idx[:, 0]]
+        n1 = -n[vert_edge_pair_idx[:, 1]]
+        loss = 1 - torch.cosine_similarity(n0, n1, dim=1)
+
+        verts_packed_to_mesh_idx = verts_packed_to_mesh_idx[vert_idx[:, 0]]
+        verts_packed_to_mesh_idx = verts_packed_to_mesh_idx[vert_edge_pair_idx[:, 0]]
+        num_normals = verts_packed_to_mesh_idx.bincount(minlength=N)
+        weights = 1.0 / num_normals[verts_packed_to_mesh_idx].float()
+
+        loss = loss * weights
+        return loss.sum() / N
 
     # @property
     # def approach_axis(self):
@@ -893,7 +1110,7 @@ def test_quality():
     # load PyTorch3D mesh from .obj file
     renderer, device = pytorch_setup()
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/bar_clamp.obj")
+        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/new_barclamp.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -996,7 +1213,7 @@ def test_quality():
             np.testing.assert_allclose(torch_quality_col,
                     np.array(dicts[i]['rfc_quality']).T,
                     atol=tests[1][0],rtol=tests[1][1])
-            print("dists:",torch_quality_no_col[0],",", torch_quality_col[0],",",
+            print(torch_quality_no_col[0],",", torch_quality_col[0],",",
             dicts[i]['rfc_quality'],";")
 
     center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
