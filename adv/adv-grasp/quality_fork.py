@@ -363,7 +363,9 @@ class GraspTorch(object):
         verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
         vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = state.faces_normals_packed()[faces_index,:]
         bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
-        normsDexnet = normalSphereSamples(self.contact_points, state, ray_d)
+        (idxs_face, masks, sphereDirs) = sphereSamples(self.contact_points, state)
+        normsDexnet = svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
+        normsSphereAvg = avgSpherePoints(state, idxs_face, masks, self.contact_points)
         #torch.mean(verts, dim=-2,keepdim=True)
         #vertex_normals.scatter_( state.faces_normals_packed()[faces_index,:])
         # TODO, update to use built in https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/ops/interp_face_attrs.html
@@ -380,12 +382,12 @@ class GraspTorch(object):
         #bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
         return self, faces_index, contactFound
 
-def normalSphereSamples(surface_point, mesh, in_rays):
+def sphereSamples(surface_point, mesh):
     point = surface_point.unsqueeze(-2) # add dim for samples
     sdf_dim = 100
     sdf_padding = 5
     gridDist = 1.5  
-    steps = 7 # positive int, probably odd
+    steps = 3 # positive int, probably odd
     steps_cubed = steps**3
     # matches min scaling from:
     obj_target_scale = 0.040
@@ -393,7 +395,7 @@ def normalSphereSamples(surface_point, mesh, in_rays):
     maxDim = torch.max(torch.diff(mesh.get_bounding_boxes(),dim=-1))
     scaling = (maxDim / (sdf_dim - sdf_padding * 2)) # box to meters
     step_ends = (steps-1)/2
-    step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps)
+    step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps,device=mesh.device,dtype=surface_point.dtype)
     sphereDirsTuple = torch.meshgrid(step_tensor,step_tensor,step_tensor,indexing='ij')
     sphereDirs = torch.cat((sphereDirsTuple[0].reshape(steps_cubed,1),sphereDirsTuple[1].reshape(steps_cubed,1),sphereDirsTuple[2].reshape(steps_cubed,1)),1)
     sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * scaling * gridDist
@@ -401,32 +403,53 @@ def normalSphereSamples(surface_point, mesh, in_rays):
     pointSphere = sphereDirs + point
     origShape = pointSphere.shape
     pointSphereCloud = Pointclouds([pointSphere.reshape(-1,3)])
+
+    (idxs_face, dists, face_edge_shared) = checkSamples(pointSphereCloud, mesh)
+
+    dists = dists.reshape([-1, steps_cubed, 1])
+    face_edge_shared = face_edge_shared.reshape([-1, steps_cubed, 1])
+    idxs_face = idxs_face.reshape([-1, steps_cubed, 1])
+    minDist = (scaling * np.sqrt(2) / 2)**2  # square meters 
+    masks = torch.split(torch.logical_and(dists < minDist,face_edge_shared), dim=0, split_size_or_sections=1)
+    return idxs_face, masks, sphereDirs
+
+def checkSamples(samples, mesh):
     verts_packed = mesh.verts_packed()
     faces_packed = mesh.faces_packed()
     tris = verts_packed[faces_packed]
     edges_packed = mesh.edges_packed()
     segms = verts_packed[edges_packed]
 
-    dists_face, idxs_face = _C.point_face_dist_forward(pointSphereCloud.points_packed().float(), 
-                                             pointSphereCloud.cloud_to_packed_first_idx(), 
+    dists_face, idxs_face = _C.point_face_dist_forward(samples.points_packed().float(), 
+                                             samples.cloud_to_packed_first_idx(), 
                                              tris.float(), 
                                              mesh.mesh_to_faces_packed_first_idx(), 
-                                             pointSphereCloud.num_points_per_cloud().max().item(),
+                                             samples.num_points_per_cloud().max().item(),
                                              5e-6)
-    dists_edge, idxs_edge = _C.point_edge_dist_forward(pointSphereCloud.points_packed().float(), 
-                                             pointSphereCloud.cloud_to_packed_first_idx(), 
+    dists_edge, idxs_edge = _C.point_edge_dist_forward(samples.points_packed().float(), 
+                                             samples.cloud_to_packed_first_idx(), 
                                              segms.float(), 
                                              mesh.mesh_to_edges_packed_first_idx(), 
-                                             pointSphereCloud.num_points_per_cloud().max().item(),
+                                             samples.num_points_per_cloud().max().item(),
                                              )
     dists = dists_edge
     edges_to_check = mesh.faces_packed_to_edges_packed()[idxs_face,:]
     face_edge_shared = torch.any(edges_to_check == idxs_edge.unsqueeze(1), dim=1)
     dists[face_edge_shared] = dists_face[face_edge_shared] # TODO, double check barycentric
     
-    dists = dists.reshape([-1, steps_cubed, 1])
-    minDist = (scaling * np.sqrt(2) / 2)**2 /3 # square meters 
-    masks = torch.split(dists < minDist,dim=0,split_size_or_sections=1)
+    return idxs_face, dists, face_edge_shared
+
+
+
+def avgSpherePoints(mesh, idxs_face, masks, surface_point):
+    normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+    for maskInd in range(len(masks)):
+        normals[maskInd,:] = torch.mean(mesh.faces_normals_packed()[idxs_face.squeeze()[maskInd, masks[maskInd].squeeze()],:], dim=0)
+    normals = normals.reshape(surface_point.shape)
+    return normals
+
+def svdSpherePoints(surface_point, sphereDirs, masks, in_rays):
+
     normals = torch.zeros_like(surface_point).reshape((len(masks),3))
     for maskInd in range(len(masks)):
         (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
