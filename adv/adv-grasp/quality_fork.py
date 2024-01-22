@@ -364,6 +364,7 @@ class GraspTorch(object):
         vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = state.faces_normals_packed()[faces_index,:]
         bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
         (idxs_face, masks, sphereDirs) = sphereSamples(self.contact_points, state)
+        normsContinuous = avgSphereArc(state, self.contact_points)
         normsDexnet = svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
         normsSphereAvg = avgSpherePoints(state, idxs_face, masks, self.contact_points)
         #torch.mean(verts, dim=-2,keepdim=True)
@@ -382,23 +383,29 @@ class GraspTorch(object):
         #bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
         return self, faces_index, contactFound
 
-def sphereSamples(surface_point, mesh):
-    point = surface_point.unsqueeze(-2) # add dim for samples
+def dexnetRadius(mesh, gridDist=1.5):
+    # matches min scaling from:
+    # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/database/mesh_processor.py#L281
     sdf_dim = 100
     sdf_padding = 5
-    gridDist = 1.5  
-    steps = 3 # positive int, probably odd
-    steps_cubed = steps**3
-    # matches min scaling from:
-    obj_target_scale = 0.040
-    # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/database/mesh_processor.py#L281
+
     maxDim = torch.max(torch.diff(mesh.get_bounding_boxes(),dim=-1))
     scaling = (maxDim / (sdf_dim - sdf_padding * 2)) # box to meters
+    sphereRadius = scaling * gridDist
+    return sphereRadius, scaling
+
+def sphereSamples(surface_point, mesh):
+    point = surface_point.unsqueeze(-2) # add dim for samples
+
+    steps = 3 # positive int, probably odd
+    steps_cubed = steps**3
+    obj_target_scale = 0.040
+    sphereRadius,scaling = dexnetRadius(mesh)
     step_ends = (steps-1)/2
     step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps,device=mesh.device,dtype=surface_point.dtype)
     sphereDirsTuple = torch.meshgrid(step_tensor,step_tensor,step_tensor,indexing='ij')
     sphereDirs = torch.cat((sphereDirsTuple[0].reshape(steps_cubed,1),sphereDirsTuple[1].reshape(steps_cubed,1),sphereDirsTuple[2].reshape(steps_cubed,1)),1)
-    sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * scaling * gridDist
+    sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * sphereRadius
     sphereDirs = sphereDirs.reshape([1]*(len(point.shape)-2)+ [steps_cubed, 3])
     pointSphere = sphereDirs + point
     origShape = pointSphere.shape
@@ -439,6 +446,94 @@ def checkSamples(samples, mesh):
     
     return idxs_face, dists, face_edge_shared
 
+def avgSphereArc(mesh, surface_point):
+    radius,_ = dexnetRadius(mesh)
+    verts_packed = mesh.verts_packed()
+    faces_packed = mesh.faces_packed()
+    tris = verts_packed[faces_packed]
+
+    # find reference frame for each face
+    face_normals_unsqeeze = mesh.faces_normals_packed().unsqueeze(-1)
+    edge_dir = torch.nn.functional.normalize(tris[:,1,:]-tris[:,0,:],dim=-1).unsqueeze(-1)
+    face_rot_ms = torch.cat((edge_dir, torch.cross(face_normals_unsqeeze,edge_dir),face_normals_unsqeeze),-1)
+    
+    # rotate each face to that frame
+    tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
+    # rotate contacts to that frame
+    sp_shape = list(surface_point.shape[:-1]) + [1] * len(face_rot_ms.shape[:-1]) + [3]
+    rm_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [3,3]
+    surface_point_rot = torch.matmul(surface_point.reshape(sp_shape), face_rot_ms.double().reshape(rm_shape)).squeeze(-2)
+    tris_2D = tris_rot[...,:-1]
+    sphere_plane_dist = surface_point_rot[...,-1] - tris_rot[...,0,-1]
+    intersects_plane = torch.abs(sphere_plane_dist) < radius
+    sphere_center_2D = surface_point_rot[...,:-1]
+    # get radius of projection of sphere to triangle plane, 0 out all non-intersections
+    radius_2D = torch.sqrt( torch.nn.functional.relu(radius**2 - sphere_plane_dist**2) )
+    radius_2D_inv = torch.zeros_like(radius_2D)
+    radius_2D_inv[intersects_plane] = 1 / radius_2D[intersects_plane]
+    # triangle centered at projection with radius 0 
+    tris_2D_unit = (tris_2D - sphere_center_2D.unsqueeze(-2)) * radius_2D_inv.unsqueeze(-1).unsqueeze(-1)
+    tris_2D_unit = tris_2D_unit[intersects_plane]
+
+    # # can filter on mesh_on_contact_proj all less than face_radius
+
+    edge_dir_2D = tris_2D_unit[...,(1,2,0),:] - tris_2D_unit
+    # # mesh_on_contact_proj and edge_dir_2D define line segment
+    # # solve for intersection with unit circle
+    # https://mathworld.wolfram.com/Circle-LineIntersection.html
+    edge_length_2D_sq = torch.sum(edge_dir_2D**2,dim=-1)
+    # # x1y2 - x2y1
+    edge_det_2D = tris_2D_unit[...,0] * tris_2D_unit[...,(1,2,0),1] - tris_2D_unit[...,1] * tris_2D_unit[...,(1,2,0),0]
+    edge_disc_2D = edge_length_2D_sq - edge_det_2D ** 2
+    projection_contact_on_edge_2D = edge_dir_2D[...,(1,0)] * torch.cat((edge_det_2D.unsqueeze(-1),-edge_det_2D.unsqueeze(-1)),dim=-1) / edge_length_2D_sq.unsqueeze(-1)
+    projection_contact_on_edge_2D_norm = torch.sum((projection_contact_on_edge_2D - tris_2D_unit) * edge_dir_2D,dim=-1) / edge_length_2D_sq
+    edge_norm_2d = torch.cat((edge_dir_2D[...,(1)].unsqueeze(-1),-edge_dir_2D[...,(0)].unsqueeze(-1)),dim=-1)
+    contact_is_above_line = torch.sum(-tris_2D_unit * edge_norm_2d, dim = -1) < 0
+    contact_is_above = torch.all( contact_is_above_line, dim=-1)
+    proj_falls_in_seg = torch.all(
+        torch.logical_and(
+            projection_contact_on_edge_2D_norm > 0,
+            projection_contact_on_edge_2D_norm < 1,
+            ),dim=-1)
+    contains_projected_sphere = torch.logical_and(contact_is_above,
+        torch.all(torch.linalg.vector_norm(projection_contact_on_edge_2D,dim=-1) > 1,dim=-1))
+    contact_fully_contained = torch.logical_and(proj_falls_in_seg, contains_projected_sphere)
+    intersects_line = edge_disc_2D > 0
+    # filter out known bad lines
+    edge_dir_2D = edge_dir_2D[intersects_line]
+    edge_det_2D = edge_det_2D[intersects_line]
+    edge_length_2D_sq = edge_length_2D_sq[intersects_line]
+    edge_disc_2D = edge_disc_2D[intersects_line]
+    tris_2D_unit = tris_2D_unit[intersects_line]
+    projection_contact_on_edge_2D = projection_contact_on_edge_2D[intersects_line]
+    # can filter on disc, if neg, no intersection
+    x_scale = (torch.sign(edge_dir_2D[...,1]) * edge_dir_2D[...,0]).unsqueeze(-1)
+    y_scale = abs(edge_dir_2D[...,1]).unsqueeze(-1)
+    offset_to_tri_sphere_inter_2D = (torch.cat((x_scale,y_scale),dim=-1) * 
+                                     torch.sqrt(edge_disc_2D).unsqueeze(-1) / 
+                                     edge_length_2D_sq.unsqueeze(-1)
+                                     ).unsqueeze(-2)
+    intersection_sphere_edge_2D = projection_contact_on_edge_2D.unsqueeze(-2) + torch.cat((offset_to_tri_sphere_inter_2D,-offset_to_tri_sphere_inter_2D),dim=-2)
+    intersection_sphere_edge_2D_norm = torch.sum((intersection_sphere_edge_2D - tris_2D_unit.unsqueeze(-2)) * edge_dir_2D.unsqueeze(-2),dim=-1) / edge_length_2D_sq.unsqueeze(-1)
+    intersects_segment = torch.logical_and(intersection_sphere_edge_2D_norm > 0,intersection_sphere_edge_2D_norm < 1)
+    
+    #
+    # # can filter on line segment, sign(mesh_on_contact_proj[0,0] - x) == sign(x - mesh_on_contact_proj[0,1])
+    #
+    # # if both are valid, check if opposite vertex/or center is further than line from origin
+    # # like norm(mean(x),mean(y)) < norm(mean(mesh_on_contact_proj))
+    # # if center further, add angle to running tally per face
+    #
+    # if both 2nd i and 1st i+1 valid, add angle to running tally per face
+    #
+    # scale face angles by face_radius
+    #
+    # create weights by normalizing scaled face angles to sum to 1 
+    #
+    # weighted average face normal
+
+
+    return surface_point
 
 
 def avgSpherePoints(mesh, idxs_face, masks, surface_point):
