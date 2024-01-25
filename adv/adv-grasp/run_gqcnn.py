@@ -51,6 +51,11 @@ class Attack:
 		torch.tensor: {batch_size} where entries indicate grasp quality prediction by model
 		"""
 
+		# check for bad output from Grasp.extract_tensors
+		if pose_tensor==None or image_tensor==None:
+			Attack.logger.error("Pose tensor and/or image tensor input is bad.")
+			return 0
+
 		return self.model(pose_tensor, image_tensor)
 
 	@staticmethod

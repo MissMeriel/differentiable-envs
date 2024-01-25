@@ -98,8 +98,8 @@ class Grasp:
 			dictionary["im_center"] = torch.from_numpy(np.array(dictionary["im_center"])).to(device)
 			dictionary["im_axis"] = torch.from_numpy(np.array(dictionary["im_axis"])).to(device)
 		if dictionary["world_center"] and dictionary["world_axis"]:
-			dictionary["world_center"] = torch.from_numpy(np.array(dictionary["world_center"])).to(device)
-			dictionary["world_axis"] = torch.from_numpy(np.array(dictionary["world_axis"])).to(device)
+			dictionary["world_center"] = torch.from_numpy(np.array(dictionary["world_center"])).to(device).float()
+			dictionary["world_axis"] = torch.from_numpy(np.array(dictionary["world_axis"])).to(device).float()
 		if dictionary["c0"] and dictionary["c1"]:
 			dictionary["c0"] = torch.from_numpy(np.array(dictionary["c0"])).to(device)
 			dictionary["c1"] = torch.from_numpy(np.array(dictionary["c1"])).to(device)
@@ -166,24 +166,27 @@ class Grasp:
 			Grasp.logger.error("Grasp does not have world points to transform to image points")
 			return None
 
-		# convert grasp center (3D point) to camera space
+		# convert grasp center (3D point) to 2D camera space
 		world_points = torch.stack((self.world_center, self.world_center))
 		im_points = camera.transform_points(world_points)
 		for i in range(im_points.shape[0]):		# fix depth value
 			im_points[i][2] = 1/im_points[i][2]
-		self.im_center = im_points[0]
-		self.depth = self.im_center[2].item()
+		self.im_center = im_points[0][:-1]
+		self.depth = im_points[0][2]
 
-		# convert grasp axis (direction vector) to camera space
+		# convert grasp axis (direction vector) to 2D camera space
 		R = camera.get_world_to_view_transform().get_matrix()[:, :3, :3]	# rotation matrix
-		im_axis = torch.matmul(R, self.world_axis.unsqueeze(-1)).squeeze(-1).squeeze()	# apply only rotation, not translation
-		self.im_axis = im_axis
+		axis = torch.matmul(R, self.world_axis.unsqueeze(-1)).squeeze(-1).squeeze()	# apply only rotation, not translation
+		axis[2] = 0
+		axis = torch.nn.functional.normalize(axis, dim=-1)		# normalize axis without z-coord
+		self.im_axis = axis[:-1]
 
-		# calculate angle between im_axis and camera x-axis for im_angle
-		x_axis = torch.tensor([-1.0, 0.0, 0.0]).to(camera.device)
-		dotp = torch.dot(self.im_axis, x_axis)
-		axis_norm = torch.linalg.vector_norm(self.im_axis)
-		self.im_angle = torch.acos(dotp / axis_norm).item()
+		# convert normalized grasp axis back to world coordinates
+		axis = camera.get_world_to_view_transform().inverse().transform_normals(axis.unsqueeze(0))
+		self.world_axis = axis
+
+		# calculate angle of im_axis
+		self.im_angle = torch.atan2(self.im_axis[1], self.im_axis[0])
 
 	@classmethod
 	def sample_grasps(cls, obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, save_grasp=""):
@@ -298,6 +301,11 @@ class Grasp:
 		else:
 			torch_dim = d_im
 
+		# check if grasp is 2D
+		if (self.depth==None or self.im_center==None or self.im_angle==None):
+			Grasp.logger.error("Grasp is not in 2D, must convert with camera intrinsics before tensor extraction.")
+			return None, None
+
 		# construct pose tensor from grasp depth
 		pose_tensor = torch.zeros([1, 1])
 		pose_tensor = pose_tensor.to(torch_dim.device)
@@ -315,7 +323,7 @@ class Grasp:
 
 
 		# 2 - translate wrt to grasp angle and grasp center 
-		theta = -1 * math.degrees(self.im_angle)
+		theta = math.degrees(self.im_angle)
 		 
 		dim_cx = torch_dim.shape[2] // 2
 		dim_cy = torch_dim.shape[1] // 2	
@@ -441,11 +449,41 @@ def test_save_and_load_grasps():
 	g2 = Grasp.read("test-grasp2.json")
 	print(g2)
 
+	# test model inference and trans_world_to_im on saved grasps
+	model = KitModel("weights.npy")
+	model.eval()
+	run1 = Attack(model=model)
+
+	mesh, im = renderer1.render_object("data/bar_clamp.obj", display=False)
+	d_im = renderer1.mesh_to_depth_im(mesh, display=False)
+
+	g2.trans_world_to_im(renderer1.camera)
+	pose, image = g2.extract_tensors(d_im)
+	print("prediction:", run1.run(pose, image))		# gqcnn prediction
+
 	return "success"
 	
+def test_trans_world_to_im():
+	r = Renderer()
+	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
+	dim = r.mesh_to_depth_im(mesh, display=False)
+
+	model = KitModel("weights.npy")
+	model.eval()
+	run1 = Attack(model=model)
+
+	grasp = Grasp.read("experiment-results/ex00/grasp.json")
+	grasp.trans_world_to_im(camera=r.camera)
+	r.grasp_sphere((grasp.c0, grasp.c1), mesh, "vis_grasps/test_trans_world_to_im.obj")
+	pose, image = grasp.extract_tensors(dim)
+
+	model_out = run1.run(pose, image)[0][0].item()
+	r.display(image, title="processed dim\npred: "+str(model_out))
+
 if __name__ == "__main__":
 
-	print(test_select_grasp())
+	test_trans_world_to_im()
+	# print(test_select_grasp())
 	# print(test_save_and_load_grasps())
 
 	"""
