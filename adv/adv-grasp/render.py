@@ -37,8 +37,11 @@ class Renderer:
 		if camera:
 			self.camera = camera
 		else:
-			# R, T = look_at_view_transform(dist=0.7, elev=90, azim=180)
-			R, T = look_at_view_transform(dist=0.6, elev=90, azim=0)	# camera located above object, pointing down
+			# R, T = look_at_view_transform(dist=0.6, elev=90, azim=0)	# camera located above object, pointing down
+			eye = torch.tensor([[0.0, 0.6, 0.0]])	# 
+			up = torch.tensor([[0.0, 0.0, 1.0]])
+			at = torch.tensor([[0.0, 0.0, 0.0]])
+			R, T = look_at_view_transform(eye=eye, up=up, at=at)	# camera located above object, pointing down
 
 			# camera intrinsics
 			fl = torch.tensor([[525.0]])
