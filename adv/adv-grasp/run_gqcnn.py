@@ -287,10 +287,27 @@ def test_run():
 
 	# instantiate Attack class and run prediction
 	run1 = Attack(model=model)
-	print(run1.run(pose0, image0)[0])
-	print(run1.run(pose1, image1)[0])
-	print(run1.run(pose2, image2)[0])	# original barclamp object
-	print(run1.run(pose3, image3)[0])	# new barclamp object
+	print(run1.run(pose0, image0)[0][0].item())
+	print(run1.run(pose1, image1)[0][0].item())
+	print(run1.run(pose2, image2)[0][0].item())	# original barclamp object
+	print(run1.run(pose3, image3)[0][0].item())	# new barclamp object
+
+	# test model with varying batch sizes
+	pose4 = torch.cat([pose1, pose2, pose3], 0)
+	image4 = torch.cat([image1, image2, image3], 0)
+	print("\n")
+	print(pose4.shape, image4.shape)
+	print(run1.run(pose4, image4))
+
+	pose5 = torch.cat([pose1, pose2, pose2, pose3, pose1, pose3, pose3, pose1, pose2])
+	image5 = torch.cat([image1, image2, image2, image3, image1, image3, image3, image1, image2])
+	print(pose5.shape, image5.shape)
+	print(run1.run(pose5, image5))
+
+	pose6 = torch.cat([pose4, pose5], dim=0)
+	image6 = torch.cat([image4, image5], dim=0)
+	print(pose6.shape, image6.shape)
+	print(run1.run(pose6, image6))
 	
 	return "success"
 
@@ -329,5 +346,5 @@ def test_attack():
 	return "success"
 
 if __name__ == "__main__":
-	# print(test_run())
-	print(test_attack())
+	print(test_run())
+	# print(test_attack())

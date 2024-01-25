@@ -91,10 +91,10 @@ class KitModel(nn.Module):
         LRN_1           = F.local_response_norm(Relu_3, size=5, alpha=9.999999747378752e-05, beta=0.75, k=1.0)
         MaxPool_3, MaxPool_3_idx = F.max_pool2d(LRN_1, kernel_size=(1, 1), stride=(1, 1), padding=0, ceil_mode=False, return_indices=True)
         MaxPool_3 = torch.permute(MaxPool_3, (0,2,3,1))
-        if MaxPool_3.shape[0] == 1:
-            Reshape_3       = torch.reshape(input = MaxPool_3, shape=(1,16384)) #shape = (64,16384))
-        else:
-            Reshape_3       = torch.reshape(input = MaxPool_3, shape=(64,16384))
+        batch = MaxPool_3.shape[0]
+        if (batch < 1) or (batch > 64):
+            print("ERROR - gqcnn_pytorch model can only take between 1 and 64 grasps in a batch")
+        Reshape_3       = torch.reshape(input = MaxPool_3, shape=(batch,16384))
         MatMul          = torch.matmul(Reshape_3, _other_weights["fc3W"].to(x2.device))       # Reshape_3 * fc3W/read
         add_4           = MatMul + _other_weights["fc3b"].to(x2.device)                     # MatMul + fc3b/read
         Relu_4          = F.relu(add_4)
