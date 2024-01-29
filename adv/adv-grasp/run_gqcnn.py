@@ -23,12 +23,26 @@ class Attack:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None):
+	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None, oracle_method="docker"):
 		self.num_plots = num_plots
 		self.steps_per_plot = steps_per_plot
 		self.num_steps = num_plots * steps_per_plot
+
 		self.model = model
+		if model == None:
+			model = KitModel("weights.npy")
+			model.eval()
+			self.model = model
+
 		self.renderer = renderer
+		if renderer == None:
+			self.renderer = Renderer()
+
+		self.oracle_method = oracle_method
+		if oracle_method not in ["dexnet", "pytorch"]:
+			Attack.logger.error("Attack oracle evaluation method must be 'dexnet' or 'pytorch' -- defaulting to 'dexnet'.")
+			self.oracle_method = "dexnet"
+
 		self.loss_weights = {
 			"edge": 10,
 			"normal": 5,
@@ -73,19 +87,36 @@ class Attack:
 
 	def oracle_eval(self, grasp, obj_file):
 		"""
-		Get a final oracle evaluation of a mesh object via remote call to docker container.
+		Get a final oracle evalution of a mesh object according to self.oracle_method
 
 		Parameters
 		----------
 		grasp: Grasp
 			The grasp that is being evaluated
-		obj_file: String
+		obj_fil: String
 			The path to the .obj file of the mesh to evaluate
+
 		Returns
 		-------
 		List: [Boolean, float]
-			List[0]: Boolean quality from force_closure evaluation of dex-net oracle
-			List[1]: float quality value from robust_ferrari_canny evaluation of dex-net oracle
+			List[0]: Boolean quality from force_closure evaluation
+			List[1]: float quality from ferarri canny evaluation
+
+		"""
+		if self.oracle_method == "dexnet":
+			return self.oracle_eval_dexnet(grasp, obj_file)
+		
+		elif self.oracle_method == "pytorch":
+			return self.oracle_eval_pytorch(grasp, obj_file)
+
+		else:
+			Attack.logger.error("oracle evaluation method must be 'docker' or 'pytorch'.")
+
+	def oracle_eval_dexnet(self, grasp, obj_file):
+		"""
+		Get a final oracle evaluation of a mesh object via remote call to docker container.
+
+		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
 
 		# check if object file is already saved in shared directory and copy there if not
@@ -110,6 +141,15 @@ class Attack:
 		print("ORACLE EVALUATION RESULTS:", results)
 		return results
 
+	def oracle_eval_pytorch(self, grasp, obj_file):
+		"""
+		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
+
+		Refer to `oracle_eval` method documentation for details on parameters and return values.
+		"""
+
+		Attack.logger.error("Attack.oracle_eval_pytorch not yet implemented.")
+		return None
 
 	def calc_loss(self, adv_mesh, grasp):
 		"""
@@ -211,6 +251,7 @@ class Attack:
 
 		adv_mesh = mesh.clone()
 
+		num_steps = 0
 		for i in range(self.num_steps):
 			optimizer.zero_grad()
 			loss, adv_mesh, model_pred = self.perturb(mesh, param, grasp)
@@ -223,6 +264,10 @@ class Attack:
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
 
+			if model_pred < 0.5:
+				num_steps = i+1
+				break
+
 		# save final object
 		final_mesh = mesh.offset_verts(param)
 		final_mesh_file = dir+"final-mesh.obj"
@@ -232,8 +277,11 @@ class Attack:
 		oracle = self.oracle_eval(grasp, final_mesh_file)
 
 		# save final image and attack info, plot losses
-		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle[0])
-		filename = dir + "step" + str(self.num_steps) + ".png"
+		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle[0]) + ", " + str(oracle[1])
+		if num_steps == 0:
+			filename = dir + "step" + str(self.num_steps) + ".png"
+		else:
+			filename = dir + "step" + str(num_steps) + ".png"
 		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
 		Attack.plot_losses(self.losses, dir)
 		data = {
