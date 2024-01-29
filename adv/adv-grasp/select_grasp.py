@@ -27,10 +27,10 @@ class Grasp:
 
 	# SET UP LOGGING
 	logger = logging.getLogger('select_grasp')
-	logger.setLevel(logging.INFO)
+	logger.setLevel(logging.DEBUG)
 	if not logger.handlers:
 		ch = logging.StreamHandler()
-		ch.setLevel(logging.INFO)
+		ch.setLevel(logging.DEBUG)
 		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
@@ -130,12 +130,18 @@ class Grasp:
 		if (self.c0 is not None) and (self.c1 is not None):
 			c0_list = self.c0.clone().detach().cpu().numpy().tolist()
 			c1_list = self.c1.clone().detach().cpu().numpy().tolist()
+		depth = self.depth
+		if isinstance(self.depth, torch.Tensor):
+			depth = self.depth.item()
+		angle = self.im_angle
+		if isinstance(self.im_angle, torch.Tensor):
+			angle = self.im_angle.item()
 
 		grasp_data = {
-			"depth": self.depth,
+			"depth": depth,
 			"im_center": imc_list,
 			"im_axis": imax_list,
-			"im_angle": self.im_angle,
+			"im_angle": angle,
 			"world_center": wc_list,
 			"world_axis": was_list,
 			"c0": c0_list,
@@ -189,11 +195,11 @@ class Grasp:
 		self.im_angle = torch.atan2(self.im_axis[1], self.im_axis[0])
 
 	@classmethod
-	def sample_grasps(cls, obj_f, num_samples, renderer, min_qual=0.002, max_qual=1.0, save_grasp=""):
+	def sample_grasps(cls, obj_f, num_samples, renderer, oracle_method="dexnet", **kwargs): # min_qual=0.002, max_qual=1.0, save_grasp="", oracle_method="dexnet"):
 		"""
-		Samples grasps using dexnet oracle and returns grasps with qualities between min_qual and max_qual
-		inclusive. Contains RPC to oracle.py in running docker container. Saves new grasp object with an 
-		added sphere to visualize grasp if desired (default: does not save new grasp object)
+		Samples grasps using oracle depending on oracle_method arg and returns grasps with qualities between min_qual and max_qual inclusive. 
+		Saves new grasp object with an added sphere to visualize grasp if desired (default: does not save new grasp object).
+
 		Parameters
 		----------
 		obj_f: String
@@ -201,19 +207,74 @@ class Grasp:
 		num_samples: int
 			Total number of grasps to evaluate (lower bound for number of grasps returned)
 		renderer: Renderer object
-			Renderer to use to render mesh object with camera to convert grasp info to image space	
+			Renderer to use to render mesh object with camera to convert grasp info to image space
+		
+		* optional kwargs:
 		min_qual: float
-			Float between 0.0 and 1.0, minimum quality for returned grasps, defaults to 0.002 according to robust ferrari canny method
+			Float between 0.0 and 1.0, minimum ferrari canny quality for returned grasps, defaults to 0.0005
+				(0.002 according to dexnet robust ferrari canny method)
 			NOTE: Currently returns a grasp if force_closure metric returns 1 or robust ferrari canny quality is above min_qual
 		max_qual: float
-			Float between 0.0 and 1.0, maximum quality for returned grasps, defaults to 1.0
+			Float between 0.0 and 1.0, maximum ferrari canny quality for returned grasps, defaults to 1.0
 		save_grasp: String
 			If empty string, no new grasp objects are saved
 			If not empty, this is the path to the directory where to save new grasp objects that have a sphere added to visualize the grasp
+		oracle_method: String in ["dexnet", "pytorch"]
+			"dexnet": use dexnet docker implementation of oracle
+			"pytorch": use local implementation of oracle
+
 		Returns
 		-------
-		List of Grasp objects with quality between min_qual and max_qual inclusive
+		List of Grasp objects with quality between min_qual and max_qual inclusive in descending order of rfc_quality
 		"""
+
+		if oracle_method not in ["dexnet", "pytorch"]:
+			cls.logger.error("Grasp.sample_grasps argument `oracle_method` must be 'dexnet' or 'pytorch' -- defaulting to 'dexnet'.")
+			oracle_method = "dexnet"
+
+		if oracle_method == "dexnet":
+			return cls.sample_grasps_dexnet(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
+
+		else:
+			return cls.sample_grasps_pytorch(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
+
+	@classmethod
+	def sample_grasps_pytorch(cls, obj_f, num_samples, renderer, **kwargs):
+		"""
+		Helper method for sample_grasps: samples grasps using local pytorch oracle implementation.
+
+		Refer to `sample_grasps` method documentation for details on parameters and return values.
+		"""
+
+		cls.logger.error("Grasp.sample_grasps_pytorch not yet implemented.")
+		return []
+
+		# process kwargs
+		keys = kwargs.keys()
+		if "min_qual" not in keys:
+			kwargs["min_qual"] = 0.002
+		if "max_qual" not in keys:
+			kwargs["max_qual"] = 1.0
+		if "save_grasp" not in keys:
+			kwargs["save_grasp"] = ""
+
+
+	@classmethod
+	def sample_grasps_dexnet(cls, obj_f, num_samples, renderer, **kwargs):
+		"""
+		Helper method for sample_grasps: samples grasps using dexnet oracle using RPC to oracle.py in running docker container.
+
+		Refer to `sample_grasps` method documentation for details on parameters and return values.
+		"""
+
+		# process kwargs
+		keys = kwargs.keys()
+		if "min_qual" not in keys:
+			kwargs["min_qual"] = 0.0005
+		if "max_qual" not in keys:
+			kwargs["max_qual"] = 1.0
+		if "save_grasp" not in keys:
+			kwargs["save_grasp"] = ""
 
 		# test logging
 		cls.logger.info("Sampling grasps...")
@@ -222,6 +283,7 @@ class Grasp:
 		# renderer mesh
 		mesh, _ = renderer.render_object(obj_f, display=False)
 
+		it = 0	# track iterations
 		while len(cands) < num_samples:
 
 			# randomly sample surface points for possible grasps
@@ -240,6 +302,25 @@ class Grasp:
 			world_centers = (c0 + c1) / 2
 			world_axes = (c1 - c0) / norms.unsqueeze(1)
 
+			if it == 0:
+				world_centers_batch = torch.clone(world_centers).unsqueeze(0)
+				world_axes_batch = torch.clone(world_axes).unsqueeze(0)
+			else:
+				world_centers_add = torch.clone(world_centers)
+				world_axes_add = torch.clone(world_axes)
+
+				# match sizes for batches of world centers and axes
+				diff = world_centers_batch.shape[1] - world_centers_add.shape[0]
+				if diff > 0:
+					world_centers_add = torch.cat((world_centers_add, torch.zeros(diff, 3, device=device)), 0)
+					world_axes_add = torch.cat((world_axes_add, torch.zeros(diff, 3, device=device)), 0)
+				elif diff < 0:
+					world_centers_batch = torch.cat((world_centers_batch, torch.zeros(world_centers_batch.shape[0], -1*diff, 3, device=device)), 1)
+					world_axes_batch = torch.cat((world_axes_batch, torch.zeros(world_axes_batch.shape[0], -1*diff, 3, device=device)), 1)
+
+				world_centers_batch = torch.cat((world_centers_batch, world_centers_add.unsqueeze(0)), 0)
+				world_axes_batch = torch.cat((world_axes_batch, world_axes_add.unsqueeze(0)), 0)
+
 			# get close_fingers result and quality from gqcnn
 			cls.logger.info("sending %d grasps to server", world_centers.shape[0])
 
@@ -247,36 +328,41 @@ class Grasp:
 			server = Pyro4.Proxy("PYRO:Server@localhost:5000")
 			save_nparr(world_centers.detach().cpu().numpy(), "temp_centers.npy")
 			save_nparr(world_axes.detach().cpu().numpy(), "temp_axes.npy")
-			results = server.close_fingers("temp_centers.npy", "temp_axes.npy")
+			results = server.close_fingers("temp_centers.npy", "temp_axes.npy", kwargs["min_qual"], kwargs["max_qual"])
 			#	results returns list of lists of form [[int: index, Bool: force closure quality, float: rfc quality, (array, array): contact points], ...]
+			for res in results:
+				res.append(it)	# track which batch/iteration grasp is from (for access to world centers/axes)
 			cls.logger.info("%d successful grasps returned", len(results))
 
 			cands = cands + results
+			if len(results) > 0:
+				it += 1
 
 		# transform successful grasps to image space
 		ret_grasps = []
 		for i in range(len(cands)):
 			g = cands[i]
-			quality = g[1:-1]
-			contact0 = torch.tensor(g[-1][0]).to(renderer.device)
-			contact1 = torch.tensor(g[-1][1]).to(renderer.device)
-			world_center = world_centers[g[0]]
-			world_axis = world_axes[g[0]]
+			quality = g[1:-2]
 
-			if save_grasp and i<num_samples:
-				# save object to visualize grasp
-				cls.logger.debug("saving new grasp visualization object")
-				f_name = save_grasp + "/grasp_" + str(i) +".obj"
-				renderer.grasp_sphere((contact0, contact1), mesh, f_name)
+			if quality[1] <= kwargs["max_qual"] and quality[1] >= kwargs["min_qual"]:
+				contact0 = torch.tensor(g[-2][0]).to(renderer.device)
+				contact1 = torch.tensor(g[-2][1]).to(renderer.device)
+				world_center = world_centers_batch[g[-1]][g[0]]
+				world_axis = world_axes_batch[g[-1]][g[0]]
 
-			grasp = Grasp(depth=world_center[:-1], world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality)
-			grasp.trans_world_to_im(renderer.camera)
+				if kwargs["save_grasp"] and i<num_samples:
+					# save object to visualize grasp
+					cls.logger.debug("saving new grasp visualization object")
+					f_name = kwargs["save_grasp"] + "/grasp_" + str(i) +".obj"
+					renderer.grasp_sphere((contact0, contact1), mesh, f_name)
 
-			cls.logger.info("image grasp: %s", str(grasp))
-			print("\tcontact0:", grasp.c0)
-			print("\tcontact1:", grasp.c1)
+				grasp = Grasp(world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality)
+				grasp.trans_world_to_im(renderer.camera)
 
-			ret_grasps.append(grasp)
+				ret_grasps.append(grasp)
+
+		# sort grasps in descending order of quality
+		ret_grasps.sort(key=lambda x: x.rfc_quality, reverse=True)
 
 		return ret_grasps[:num_samples]
 
