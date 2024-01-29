@@ -67,7 +67,7 @@ class KitModel(nn.Module):
         self.Conv2D_3 = self.__conv(2, name='Conv2D_3', in_channels=64, out_channels=64, kernel_size=(3, 3), stride=(1, 1), groups=1, bias=True, padding='same', device=device)
         self.pad = nn.ConstantPad2d(1, 0)
        
-        print("initalized!\n")
+        print("initalized model!\n")
 
     def forward(self, x1, x2):
         # x1 is pose_arr and x2 is im_arr
