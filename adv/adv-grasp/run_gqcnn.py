@@ -23,7 +23,7 @@ class Attack:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None, oracle_method="docker"):
+	def __init__(self, num_plots=0, steps_per_plot=0, model=None, renderer=None, oracle_method="dexnet", oracle_robust=True):
 		self.num_plots = num_plots
 		self.steps_per_plot = steps_per_plot
 		self.num_steps = num_plots * steps_per_plot
@@ -39,8 +39,9 @@ class Attack:
 			self.renderer = Renderer()
 
 		self.oracle_method = oracle_method
+		self.oracle_robust = oracle_robust
 		if oracle_method not in ["dexnet", "pytorch"]:
-			Attack.logger.error("Attack oracle evaluation method must be 'dexnet' or 'pytorch' -- defaulting to 'dexnet'.")
+			Attack.logger.debug("Attack oracle evaluation method must be 'dexnet' or 'pytorch' -- defaulting to 'dexnet'.")
 			self.oracle_method = "dexnet"
 
 		self.loss_weights = {
@@ -84,72 +85,6 @@ class Attack:
 		ax.set_title("Loss vs iterations", fontsize="18")
 		plt.show()
 		plt.savefig(dir+"losses.png")
-
-	def oracle_eval(self, grasp, obj_file):
-		"""
-		Get a final oracle evalution of a mesh object according to self.oracle_method
-
-		Parameters
-		----------
-		grasp: Grasp
-			The grasp that is being evaluated
-		obj_fil: String
-			The path to the .obj file of the mesh to evaluate
-
-		Returns
-		-------
-		List: [Boolean, float]
-			List[0]: Boolean quality from force_closure evaluation
-			List[1]: float quality from ferarri canny evaluation
-
-		"""
-		if self.oracle_method == "dexnet":
-			return self.oracle_eval_dexnet(grasp, obj_file)
-		
-		elif self.oracle_method == "pytorch":
-			return self.oracle_eval_pytorch(grasp, obj_file)
-
-		else:
-			Attack.logger.error("oracle evaluation method must be 'docker' or 'pytorch'.")
-
-	def oracle_eval_dexnet(self, grasp, obj_file):
-		"""
-		Get a final oracle evaluation of a mesh object via remote call to docker container.
-
-		Refer to `oracle_eval` method documentation for details on parameters and return values.
-		"""
-
-		# check if object file is already saved in shared directory and copy there if not
-		if not os.path.isfile(obj_file):
-			Attack.logger.error("Object for oracle evaluation does not exist.")
-			return None
-
-		obj_name = obj_file.split("/")[-1]
-		obj_shared = SHARED_DIR + "/" + obj_name
-		if not os.path.isfile(obj_shared):
-			Attack.logger.info("Saving object file to shared directory (%s) for oracle evaluation", SHARED_DIR)
-			shutil.copyfile(obj_file, obj_shared)
-
-		# save grasp info for oracle evaluation
-		Pyro4.config.COMMTIMEOUT = None
-		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
-		calc_axis = (grasp.c1 - grasp.c0) / torch.linalg.norm((grasp.c1 - grasp.c0))
-		save_nparr(grasp.world_center.detach().cpu().numpy(), "temp_center.npy")
-		save_nparr(calc_axis.detach().cpu().numpy(), "temp_axis.npy")
-		results = server.final_eval("temp_center.npy", "temp_axis.npy", obj_name)
-
-		print("ORACLE EVALUATION RESULTS:", results)
-		return results
-
-	def oracle_eval_pytorch(self, grasp, obj_file):
-		"""
-		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
-
-		Refer to `oracle_eval` method documentation for details on parameters and return values.
-		"""
-
-		Attack.logger.error("Attack.oracle_eval_pytorch not yet implemented.")
-		return None
 
 	def calc_loss(self, adv_mesh, grasp):
 		"""
@@ -257,9 +192,9 @@ class Attack:
 			loss, adv_mesh, model_pred = self.perturb(mesh, param, grasp)
 			loss.backward()
 			optimizer.step()
-			print(f"step {i}\t{loss.item()=:.4f}")
 
 			if i % self.steps_per_plot == 0:
+				print(f"step {i}\t{loss.item()=:.4f}")
 				title="step " + str(i) + " loss: " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item())
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
@@ -274,10 +209,10 @@ class Attack:
 		save_obj(final_mesh_file, verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
 
 		# get final oracle prediction
-		oracle = self.oracle_eval(grasp, final_mesh_file)
+		oracle = grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
 
 		# save final image and attack info, plot losses
-		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle[0]) + ", " + str(oracle[1])
+		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle)
 		if num_steps == 0:
 			filename = dir + "step" + str(self.num_steps) + ".png"
 		else:
@@ -289,8 +224,8 @@ class Attack:
 			"momentum": momentum,
 			"optimizer": "SGD",
 			"loss weights": list(self.loss_weights.items()), 
-			"final oracle fc": oracle[0],
-			"final oracle rfc": oracle[1]
+			"oracle ferrari_canny quality": oracle, 
+			"oracle robust": self.oracle_robust
 		}
 		with open(dir+"setup.txt", "w") as f:
 			json.dump(data, f, indent=4)
@@ -300,6 +235,8 @@ class Attack:
 
 def test_run():
 	"""Test prediction of gqcnn_pytorch model"""
+
+	Attack.logger.info("Running test_run...")
 
 	if torch.cuda.is_available():
 		device = torch.device("cuda:0")
@@ -357,10 +294,12 @@ def test_run():
 	print(pose6.shape, image6.shape)
 	print(run1.run(pose6, image6))
 	
-	return "success"
+	Attack.logger.info("Finished test_run.")
 
 def test_attack():
 	"""Test attack on gqcnn_pytorch model"""
+
+	Attack.logger.info("Running test_attack...")
 
 	# RENDER MESH AND DEPTH IMAGE
 	renderer = Renderer()
@@ -391,8 +330,8 @@ def test_attack():
 	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex07/", lr=1e-5, momentum=0.9)
 	renderer.display(final_pic, title="final_grasp", save=True, fname="experiment-results/ex07/final-grasp.png")
 
-	return "success"
+	Attack.logger.info("Finished running test_attack.")
 
 if __name__ == "__main__":
-	print(test_run())
-	# print(test_attack())
+	test_run()
+	test_attack()

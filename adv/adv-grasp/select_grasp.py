@@ -258,7 +258,6 @@ class Grasp:
 		if "save_grasp" not in keys:
 			kwargs["save_grasp"] = ""
 
-
 	@classmethod
 	def sample_grasps_dexnet(cls, obj_f, num_samples, renderer, **kwargs):
 		"""
@@ -366,7 +365,6 @@ class Grasp:
 
 		return ret_grasps[:num_samples]
 
-
 	def extract_tensors(self, d_im):
 		"""
 		Use grasp information and depth image to get image and pose tensors in form of GQCNN input
@@ -446,6 +444,73 @@ class Grasp:
 
 		return pose_tensor, image_tensor 
 
+	def oracle_eval(self, obj_file, oracle_method="dexnet", robust=True):
+		"""
+		Get a final oracle evalution of a mesh object according to oracle_method
+
+		Parameters
+		----------
+		obj_fil: String
+			The path to the .obj file of the mesh to evaluate
+		oracle_method: String
+			Options: "dexnet" or "pytorch"; defaults to "dexnet"
+			Indicates to use the dexnet oracle via remote call to docker, or local pytorch implementation
+		robust: Boolean
+			True: uses robust ferrari canny evaluation for oracle quality; default
+			False: uses (non robust) ferrari canny evaluation for oracle quality
+
+		Returns
+		-------
+		float: quality from ferarri canny evaluation
+
+		"""
+		if oracle_method == "dexnet":
+			return self.oracle_eval_dexnet(obj_file, robust=robust)
+		
+		elif self.oracle_method == "pytorch":
+			return self.oracle_eval_pytorch(obj_file)
+
+		else:
+			Grasp.logger.error("oracle evaluation method must be 'dexnet' or 'pytorch'.")
+
+	def oracle_eval_dexnet(self, obj_file, robust=True):
+		"""
+		Get a final oracle evaluation of a mesh object via remote call to docker container.
+
+		Refer to `oracle_eval` method documentation for details on parameters and return values.
+		"""
+
+		# check if object file is already saved in shared directory and copy there if not
+		if not os.path.isfile(obj_file):
+			Grasp.logger.error("Object for oracle evaluation does not exist.")
+			return None
+
+		obj_name = obj_file.split("/")[-1]
+		obj_shared = SHARED_DIR + "/" + obj_name
+		if not os.path.isfile(obj_shared):
+			Grasp.logger.info("Saving object file to shared directory (%s) for oracle evaluation", SHARED_DIR)
+			shutil.copyfile(obj_file, obj_shared)
+
+		# save grasp info for oracle evaluation
+		Pyro4.config.COMMTIMEOUT = None
+		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
+		calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))
+		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
+		save_nparr(calc_axis.detach().cpu().numpy(), "temp_axis.npy")
+		results = server.final_eval("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
+
+		return results
+
+	def oracle_eval_pytorch(self, obj_file):
+		"""
+		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
+
+		Refer to `oracle_eval` method documentation for details on parameters and return values.
+		"""
+
+		Grasp.logger.error("Grasp.oracle_eval_pytorch not yet implemented.")
+		return None
+
 def save_nparr(image, filename):
 	""" 
 	Save numpy.ndarray image in the shared dir
@@ -464,6 +529,8 @@ def save_nparr(image, filename):
 	np.save(filepath, image)
 
 def test_select_grasp():
+	Grasp.logger.info("Running test_select_grasp...")
+
 	model = KitModel("weights.npy")
 	model.eval()
 	run1 = Attack(model=model)
@@ -493,9 +560,10 @@ def test_select_grasp():
 		t = "id: " + str(i) + " prediction:" + str(prediction) + "\n" + grasp.title_str()
 		renderer1.display(image, title=t)
 
-	return "success"
+	Grasp.logger.info("Finished running test_select_grasp.")
 
 def test_save_and_load_grasps():
+	Grasp.logger.info("Running test_save_and_load_grasps...")
 
 	renderer1 = Renderer()
 
@@ -547,9 +615,11 @@ def test_save_and_load_grasps():
 	pose, image = g2.extract_tensors(d_im)
 	print("prediction:", run1.run(pose, image))		# gqcnn prediction
 
-	return "success"
+	Grasp.logger.info("Finished running test_save_and_load_grasps.")
 	
 def test_trans_world_to_im():
+	Grasp.logger.info("Running test_trans_world_to_im...")
+
 	r = Renderer()
 	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
 	dim = r.mesh_to_depth_im(mesh, display=False)
@@ -566,11 +636,13 @@ def test_trans_world_to_im():
 	model_out = run1.run(pose, image)[0][0].item()
 	r.display(image, title="processed dim\npred: "+str(model_out))
 
+	Grasp.logger.info("Finished running test_trans_world_to_im.")
+
 if __name__ == "__main__":
 
-	test_trans_world_to_im()
-	# print(test_select_grasp())
-	# print(test_save_and_load_grasps())
+	# test_trans_world_to_im()
+	# test_select_grasp()
+	test_save_and_load_grasps()
 
 	"""
 	renderer1 = Renderer()

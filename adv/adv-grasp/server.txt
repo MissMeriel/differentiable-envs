@@ -16,8 +16,9 @@ from gqcnn.grasping.policy import RgbdImageState
 Pyro4.config.COMMTIMEOUT = None
 
 CONFIG = YamlConfig('dex_shared_dir/config.yaml')
-GRASP_CONFIG = YamlConfig('/deps/gqcnn/cfg/examples/antipodal_grasp_sampling.yaml')
-GQCNN_CONFIG = YamlConfig('/deps/gqcnn/cfg/examples/replication/dex-net_2.1.yaml')
+ROBUST_CONFIG = YamlConfig('dex_shared_dir/config_robust.yaml')
+# GRASP_CONFIG = YamlConfig('/deps/gqcnn/cfg/examples/antipodal_grasp_sampling.yaml')
+# GQCNN_CONFIG = YamlConfig('/deps/gqcnn/cfg/examples/replication/dex-net_2.1.yaml')
 SHARED_DIR = "dex_shared_dir"
 
 
@@ -28,12 +29,16 @@ class Server(object):
 		"""add function just for testing"""
 		return a + b
 
-	def quality(self, grasp, obj):
-		"""returns ferrari canny quality"""
-		quality_config = GraspQualityConfigFactory.create_config(CONFIG['metrics']['robust_ferrari_canny'])
+	def quality(self, grasp, obj, robust=True):
+		"""returns ferrari canny quality, robust_quasi_static by default, quasi_static otherwise"""
+
+		if robust:
+			quality_config = GraspQualityConfigFactory.create_config(ROBUST_CONFIG['metrics']['robust_ferrari_canny'])
+		else:
+			quality_config = GraspQualityConfigFactory.create_config(CONFIG['metrics']['robust_ferrari_canny'])
+
 		quality_fn = GraspQualityFunctionFactory.create_quality_function(obj, quality_config)
-		ret = quality_fn(grasp).quality		 
-		return ret
+		return quality_fn(grasp).quality
 
 	def close_fingers(self, centerfile, axisfile, min_qual, max_qual, objfile="bar_clamp.obj"):
 
@@ -87,7 +92,7 @@ class Server(object):
 
 		return ret 
 
-	def final_eval(self, centerfile, axisfile, objfile):
+	def final_eval(self, centerfile, axisfile, objfile, robust=True):
 
 		# create GraspableObject3D
 		obj_path = os.path.join(SHARED_DIR, objfile)
@@ -108,10 +113,10 @@ class Server(object):
 		success, contacts = g.close_fingers(obj)
 
 		if success:
-			q = self.quality(g, obj)
-			return [success, q]
+			q = self.quality(g, obj, robust=robust)
+			return q
 
-		return [0, 0.0]
+		return 0.0
 
 # set up logger
 logger = logging.getLogger("dexnet_server")
