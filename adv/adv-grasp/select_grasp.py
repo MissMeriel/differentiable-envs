@@ -14,6 +14,8 @@ from pytorch3d.ops import sample_points_from_meshes
 from render import *
 from run_gqcnn import *
 
+from quality_fork import *
+
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
 if torch.cuda.is_available():
@@ -27,10 +29,10 @@ class Grasp:
 
 	# SET UP LOGGING
 	logger = logging.getLogger('select_grasp')
-	logger.setLevel(logging.DEBUG)
+	logger.setLevel(logging.INFO)
 	if not logger.handlers:
 		ch = logging.StreamHandler()
-		ch.setLevel(logging.DEBUG)
+		ch.setLevel(logging.INFO)
 		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
@@ -529,7 +531,7 @@ class Grasp:
 
 		return pose_tensor, image_tensor 
 
-	def oracle_eval(self, obj_file, oracle_method=None, robust=None):
+	def oracle_eval(self, obj_file, oracle_method=None, robust=None, renderer=None):
 		"""
 		Get a final oracle evalution of a mesh object according to oracle_method
 
@@ -560,8 +562,11 @@ class Grasp:
 				return self.oracle_eval_dexnet(obj_file, robust=self.oracle_robust)
 		
 		else:
-			Grasp.logger.debug("Oracle eval - pytorch")
-			return self.oracle_eval_pytorch(obj_file)
+			if not renderer:
+				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
+			else:
+				Grasp.logger.debug("Oracle eval - pytorch")
+				return self.oracle_eval_pytorch(obj_file, renderer)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
 		"""
@@ -591,15 +596,46 @@ class Grasp:
 
 		return results
 
-	def oracle_eval_pytorch(self, obj_file):
+	def oracle_eval_pytorch(self, obj_file, renderer):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
 
-		Grasp.logger.error("Grasp.oracle_eval_pytorch not yet implemented.")
-		return None
+		if (self.world_center == None or self.world_axis == None):
+			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
+			return None
+
+		# convert to GraspTorch object
+		width = torch.tensor([[0.05]], device=renderer.camera.device)
+		center3D = self.world_center.unsqueeze(0)
+		axis3D = self.world_axis.unsqueeze(0)
+		gt = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.camera)
+		gt.make2D(updateCamera=False)
+
+		# # check 2D information matches
+		# print("depth:", g.depth.item() == gt.depth.squeeze(0).item())
+		# print("angle diff:", g.im_angle.item() - gt.angle.item())
+		# print("axis2D diff:", g.im_axis - gt.axis[0].float())
+		# print("center2D:", g.im_center == gt.center[0].float())
+		# print("axis3D diff:", g.world_axis - gt.axis3D[0].float())
+		# print("center3D:", g.world_center == gt.center3D[0].float())
+
+		# get ferrari canny quality
+		config_dict = {
+			"torque_scaling":1000,
+			"soft_fingers":1,
+			"friction_coef": 0.8, 
+			"antipodality_pctile": 1.0 
+		}
+		mesh, _ = renderer.render_object(obj_file)
+
+		com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
+		force_closure_qual = com_qual_func.quality(mesh, gt)
+
+		com_qual_func = CannyFerrariQualityFunction(config_dict)
+		return com_qual_func.quality(mesh, gt)
 
 def save_nparr(image, filename):
 	""" 
@@ -809,6 +845,8 @@ def test_oracle_selection():
 	Grasp.logger.info("Running test_oracle_selection...")
 
 	grasp = Grasp.read("experiment-results/main/grasp-2/grasp.json")
+	r = Renderer()
+
 	print("\noracle_method:", grasp.oracle_method)
 	print("oracle_robust:", grasp.oracle_robust)
 	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj"))
@@ -817,9 +855,9 @@ def test_oracle_selection():
 	print("oracle_robust:", False)
 	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", robust=False))
 
-	print("\noracle_method: pytorch")
-	print("oracle_robust:", True)
-	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch"))
+	# print("\noracle_method: pytorch")
+	# print("oracle_robust:", True)
+	# print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r))
 
 	print("\noracle_method: blahblahblah")
 	print("oracle_robust:", grasp.oracle_robust)
@@ -835,12 +873,72 @@ def test_oracle_selection():
 
 	Grasp.logger.info("Finished running test_oracle_selection.")
 
+def test_oracle_eval():
+	Grasp.logger.info("Running test_oracle_eval...")
+
+	r = Renderer()
+	fixed_grasp = {
+		"quality": torch.tensor([0.00039880830039262474], device='cuda:0'),
+		"depth": torch.tensor([0.5824155807495117], device='cuda:0'),
+		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
+		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
+		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
+		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
+	}
+
+	g = Grasp.init_from_dict(fixed_grasp)
+	g.trans_world_to_im(camera=r.camera)
+	pytorch_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)[0].item()
+	dexnet_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
+	dexnet_qual_robust = g.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=True)
+
+	print("pytorch quality:", pytorch_qual)
+	print("dexnet quality:", dexnet_qual)
+	print("dexnet quality robust:", dexnet_qual_robust)
+	print("diff:", pytorch_qual - dexnet_qual)
+
+	# # iterate through dataset in data/data
+	# data_dir = "data/data/data"
+	# i = 0
+	# obj = "data/new_barclamp.obj"
+	# while True:
+	# 	datafile = data_dir + str(i) + ".json"
+	# 	if not os.path.isfile(datafile):
+	# 		break
+
+	# 	if i not in [0, 1]:
+	# 		with open(datafile) as f:
+	# 			grasp_dict = json.load(f)
+
+	# 		init_dict = {
+	# 			"world_center": grasp_dict["pytorch_w_center"],
+	# 			"world_axis": grasp_dict["pytorch_w_axis"], 
+	# 			"c0": grasp_dict["contact_points"][0],
+	# 			"c1": grasp_dict["contact_points"][1]
+	# 		}
+
+	# 		g = Grasp.init_from_dict(init_dict)
+	# 		g.trans_world_to_im(camera=r.camera)
+	# 		pytorch_qual = g.oracle_eval(obj, oracle_method="pytorch", renderer=r)[0].item()
+	# 		dexnet_qual = g.oracle_eval(obj, oracle_method="dexnet", robust=False)
+
+	# 		print("\ngrasp " + str(i))
+	# 		print("pytorch quality:", pytorch_qual)
+	# 		print("dexnet quality:", dexnet_qual)
+	# 		print("diff:", abs(pytorch_qual - dexnet_qual))
+
+	# 	i += 1
+
+	print("\n")
+	Grasp.logger.info("Finished running test_oracle_eval.")
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
 	# test_select_grasp()
-	test_save_and_load_grasps()
+	# test_save_and_load_grasps()
 	# test_oracle_selection()
+	test_oracle_eval()
 
 	"""
 	renderer1 = Renderer()
