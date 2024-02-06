@@ -564,5 +564,7 @@
         ]
     ],
     "ferrari_canny_fc08": 0.0020270951654606842,
-    "ferrari_canny_fc05": 0.0012593092536406236
+    "ferrari_canny_fc05": 0.0012593092536406236,
+    "ferrari_canny_robust_fc08": 0.0007609464172837274,
+    "ferrari_canny_robust_fc05": 0.00041927051867064036
 }
