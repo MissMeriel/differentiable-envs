@@ -35,55 +35,106 @@ class Grasp:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None):
+	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, oracle_method="dexnet", oracle_robust=True):
 		"""
 		Initialize a Grasp object
 		Paramters
 		---------
-		depth: float
+		depth: float or list or torch.tensor of size [batch, 1]			# or [batch_camera, batch_grasp, 1]?
 			Depth of grasp
-		im_center: torch.tensor of size 3
+		im_center: list or torch.tensor of size [batch, 2]		# or [batch_camera, batch_grasp, 2]?
 			Grasp center in image coordinates
-		im_angle: float
+		im_angle: float or list or torch.tensor of size [batch, 1]		# why not [batch_camera, batch_grasp, 1]?
 			Angle between grasp axis and camera x-axis; used for tensor extraction
-		im_axis: torch.tensor of size 3
+		im_axis: list or torch.tensor of size [batch, 2]		# or [batch_camera, batch_grasp, 1]?
 			Grasp axis in image coordinates
-		world_center: torch.tensor of size 3
+		world_center: list or torch.tensor of size [batch, 3]		# only [batch_grasp, 3]
 			Grasp center in world/mesh coordinates
-		world_axis: torch.tensor of size 3
+		world_axis: list or torch.tensor of size [batch, 3]		# or [batch_camera, batch_grasp, 3]?
 			Grasp axis in world/mesh coordinates
-		c0: torch.tensor of size 3
+		c0: list or torch.tensor of size 3
 			First contact point of grasp in world coordinates
-		c1: torch.tensor of size 3
+		c1: list or torch.tensor of size 3
 			Second contact point of grasp in world coordinates
-		quality: List of 2 oracle qualities of grasp
-			quality[0]: Boolean quality from force_closure
-			quality[1]: float quality value from robust_ferrari_canny
+		quality: float or list or torch.tensor of size [batch, 1]		# only [batch_grasp, 3]
+			quality value from robust_ferrari_canny
+		oracle_method: String
+			Options: "dexnet" (default) or "pytorch"
+			"dexnet": Oracle evaluation done via remote call to dex-net oracle on docker container
+			"pytorch": Oracle evaluation done via local pytorch implementaiton
+		oracle_robust: Boolean
+			True: robust ferrari canny oracle evaluation (default)
+			False: static ferrari canny oracle evaluation 
+
 		Returns
 		-------
 		None
 		"""
 
-		if quality:
-			self.fc_quality = quality[0]
-			self.rfc_quality = quality[1]
-		else:
-			self.fc_quality = None
-			self.rfc_quality = None
+		self.im_center = im_center
+		if isinstance(im_center, list):
+			self.im_center = torch.from_numpy(np.array(im_center)).to(device).float()
+
+		self.im_axis = im_axis
+		if isinstance(im_axis, list):
+			self.im_axis = torch.from_numpy(np.array(im_axis)).to(device).float()
+
+		self.world_center = world_center
+		if isinstance(world_center, list):
+			self.world_center = torch.from_numpy(np.array(world_center)).to(device).float()
+
+		self.world_axis = world_axis
+		if isinstance(world_axis, list):
+			self.world_axis = torch.from_numpy(np.array(world_axis)).to(device).float()
+
+		self.c0 = c0
+		if isinstance(c0, list):
+			self.c0 = torch.from_numpy(np.array(c0)).to(device).float()
+
+		self.c1 = c1
+		if isinstance(c1, list):
+			self.c1 = torch.from_numpy(np.array(c1)).to(device).float()
 
 		self.depth = depth
-		self.im_center = im_center
-		self.im_axis = im_axis
+		if isinstance(depth, float):
+			self.depth = torch.tensor([depth]).to(device).float()
+		elif isinstance(depth, list):
+			self.depth = torch.from_numpy(np.array(depth)).to(device).float()
+
 		self.im_angle = im_angle
-		self.world_center = world_center
-		self.world_axis = world_axis
-		self.c0 = c0
-		self.c1 = c1
+		if isinstance(im_angle, float):
+			self.im_angle = torch.tensor([im_angle]).to(device).float()
+		elif isinstance(im_angle, list):
+			self.im_angle = torch.from_numpy(np.array(im_angle)).to(device).float()
+
+		self.quality = quality
+		if isinstance(quality, float):
+			self.quality = torch.tensor([quality]).to(device).float()
+		elif isinstance(quality, list):
+			self.quality = torch.from_numpy(np.array(quality)).to(device).float()
+
+		self.oracle_method = oracle_method
+		if oracle_method not in ["dexnet", "pytorch"]:
+			self.oracle_method = "dexnet"
+
+		self.oracle_robust = oracle_robust
+		if isinstance(oracle_robust, bool):
+			self.oracle_robust = oracle_robust
 
 	@classmethod
 	def init_from_dict(cls, dict):
 		"""Initialize grasp object from a dictionary"""
-		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"])
+		init_keys = ["depth", "im_center", "im_angle", "im_axis", "world_center", "world_axis", "c0", "c1", "quality"]
+		dict_keys = dict.keys()
+		for key in init_keys:
+			if key not in dict_keys:
+				dict[key] = None
+		if "oracle_method" not in dict_keys:
+			dict["oracle_method"] = "dexnet"
+		if "oracle_robust" not in dict_keys:
+			dict["oracle_robust"] = True
+
+		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"])
 
 	@classmethod
 	def read(cls, fname):
@@ -95,25 +146,59 @@ class Grasp:
 
 		# convert lists to tensors
 		if dictionary["im_center"] and dictionary["im_axis"]:
-			dictionary["im_center"] = torch.from_numpy(np.array(dictionary["im_center"])).to(device)
-			dictionary["im_axis"] = torch.from_numpy(np.array(dictionary["im_axis"])).to(device)
+			dictionary["im_center"] = torch.from_numpy(np.array(dictionary["im_center"])).to(device).float()
+			dictionary["im_axis"] = torch.from_numpy(np.array(dictionary["im_axis"])).to(device).float()
+
+		if dictionary["depth"]:
+			if np.array(dictionary["depth"]).shape == ():
+				dictionary["depth"] = torch.from_numpy(np.array(dictionary["depth"])).to(device).unsqueeze(0).float()
+			else:
+				dictionary["depth"] = torch.from_numpy(np.array(dictionary["depth"])).to(device).float()
+		
 		if dictionary["world_center"] and dictionary["world_axis"]:
 			dictionary["world_center"] = torch.from_numpy(np.array(dictionary["world_center"])).to(device).float()
 			dictionary["world_axis"] = torch.from_numpy(np.array(dictionary["world_axis"])).to(device).float()
+		
 		if dictionary["c0"] and dictionary["c1"]:
-			dictionary["c0"] = torch.from_numpy(np.array(dictionary["c0"])).to(device)
-			dictionary["c1"] = torch.from_numpy(np.array(dictionary["c1"])).to(device)
+			dictionary["c0"] = torch.from_numpy(np.array(dictionary["c0"])).to(device).float()
+			dictionary["c1"] = torch.from_numpy(np.array(dictionary["c1"])).to(device).float()
+		
+		if isinstance(dictionary["quality"], list):
+			if isinstance(dictionary["quality"][0], bool):
+				dictionary["quality"] = torch.tensor([dictionary["quality"][1]]).to(device).float()
+			else:
+				dictionary["quality"] = torch.from_numpy(np.array(dictionary["quality"])).to(device).float()
 
 		return cls.init_from_dict(dictionary)
 
 	def __str__(self):
 		"""Returns a string with grasp information in image coordinates"""
-		p_str = "quality: " + str(self.fc_quality) + " , " + str(self.rfc_quality) + "\n\timage center: " + str(self.im_center) + "\n\timage angle: " + str(self.im_angle) + "\n\tdepth: " + str(self.depth) + "\n\tworld center: " + str(self.world_center) + "\n\tworld axis: " + str(self.world_axis)
+		p_str = ""
+		
+		if self.quality != None:
+			p_str += "quality: " + str(self.quality.item())
+		if self.im_center != None:
+			if p_str == "":
+				p_str = "image center: " + str(self.im_center)
+			else:
+				p_str +=  "\n\timage center: " + str(self.im_center)
+		if self.im_angle != None:
+			p_str += "\n\timage angle: " + str(self.im_angle.item()) 
+		if self.depth != None:
+			p_str += "\n\tdepth: " + str(self.depth.item()) 	
+		if self.world_center != None:
+			if p_str == "":
+				p_str += "world center: " + str(self.world_center) 
+			else:
+				p_str += "\n\tworld center: " + str(self.world_center) 
+		if self.world_axis != None:
+			p_str += "\n\tworld axis: " + str(self.world_axis)
+
 		return p_str
 
 	def title_str(self):
 		"""Retruns a string like __str__, but without tabs"""
-		p_str = "quality: " + str(self.rfc_quality) + "\nimage center: " + str(self.im_center) + "\nimage angle: " + str(self.im_angle) + "\ndepth: " + str(self.depth)
+		p_str = "quality: " + str(self.quality) + "\nimage center: " + str(self.im_center) + "\nimage angle: " + str(self.im_angle) + "\ndepth: " + str(self.depth)
 		return p_str
 
 	def save(self, fname):
@@ -130,12 +215,17 @@ class Grasp:
 		if (self.c0 is not None) and (self.c1 is not None):
 			c0_list = self.c0.clone().detach().cpu().numpy().tolist()
 			c1_list = self.c1.clone().detach().cpu().numpy().tolist()
+		# if depth is not None:
+		# 	depth = self.depth.clone().detach().cpu().numpy().tolist()
 		depth = self.depth
 		if isinstance(self.depth, torch.Tensor):
-			depth = self.depth.item()
+			depth = self.depth.clone().detach().cpu().numpy().tolist()
 		angle = self.im_angle
 		if isinstance(self.im_angle, torch.Tensor):
-			angle = self.im_angle.item()
+			angle = self.im_angle.clone().detach().cpu().numpy().tolist()
+		quality = self.quality
+		if isinstance(self.quality, torch.Tensor):
+			quality = self.quality.clone().detach().cpu().numpy().tolist()
 
 		grasp_data = {
 			"depth": depth,
@@ -145,13 +235,11 @@ class Grasp:
 			"world_center": wc_list,
 			"world_axis": was_list,
 			"c0": c0_list,
-			"c1": c1_list
+			"c1": c1_list, 
+			"oracle_method": self.oracle_method,
+			"oracle_robust": self.oracle_robust,
+			"quality": quality
 		}
-
-		if self.fc_quality and self.rfc_quality:
-			grasp_data["quality"] = [self.fc_quality, self.rfc_quality]
-		else:
-			grasp_data["quality"] = None
 
 		with open(fname, "w") as f:
 			json.dump(grasp_data, f, indent=4)
@@ -178,24 +266,28 @@ class Grasp:
 		for i in range(im_points.shape[0]):		# fix depth value
 			im_points[i][2] = 1/im_points[i][2]
 		self.im_center = im_points[0][:-1]
-		self.depth = im_points[0][2]
+		self.depth = im_points[0][2].unsqueeze(0)
 
-		# convert grasp axis (direction vector) to 2D camera space
-		R = camera.get_world_to_view_transform().get_matrix()[:, :3, :3]	# rotation matrix
-		axis = torch.matmul(R, self.world_axis.unsqueeze(-1)).squeeze(-1).squeeze()	# apply only rotation, not translation
+		# # convert grasp axis (direction vector) to 2D camera space
+		# R = camera.get_world_to_view_transform().get_matrix()[:, :3, :3]	# rotation matrix
+		# axis = torch.matmul(R, self.world_axis.unsqueeze(-1)).squeeze(-1).squeeze()	# apply only rotation, not translation
+		# axis[2] = 0
+
+		axis = camera.get_world_to_view_transform().transform_normals(self.world_axis.unsqueeze(0)).squeeze()
 		axis[2] = 0
+
 		axis = torch.nn.functional.normalize(axis, dim=-1)		# normalize axis without z-coord
 		self.im_axis = axis[:-1]
 
 		# convert normalized grasp axis back to world coordinates
 		axis = camera.get_world_to_view_transform().inverse().transform_normals(axis.unsqueeze(0))
-		self.world_axis = axis
+		self.world_axis = axis.squeeze(0)
 
 		# calculate angle of im_axis
-		self.im_angle = torch.atan2(self.im_axis[1], self.im_axis[0])
+		self.im_angle = torch.atan2(self.im_axis[1], self.im_axis[0]).unsqueeze(0)
 
 	@classmethod
-	def sample_grasps(cls, obj_f, num_samples, renderer, oracle_method="dexnet", **kwargs): # min_qual=0.002, max_qual=1.0, save_grasp="", oracle_method="dexnet"):
+	def sample_grasps(cls, obj_f, num_samples, renderer, **kwargs): # min_qual=0.002, max_qual=1.0, save_grasp=""):
 		"""
 		Samples grasps using oracle depending on oracle_method arg and returns grasps with qualities between min_qual and max_qual inclusive. 
 		Saves new grasp object with an added sphere to visualize grasp if desired (default: does not save new grasp object).
@@ -219,20 +311,13 @@ class Grasp:
 		save_grasp: String
 			If empty string, no new grasp objects are saved
 			If not empty, this is the path to the directory where to save new grasp objects that have a sphere added to visualize the grasp
-		oracle_method: String in ["dexnet", "pytorch"]
-			"dexnet": use dexnet docker implementation of oracle
-			"pytorch": use local implementation of oracle
 
 		Returns
 		-------
 		List of Grasp objects with quality between min_qual and max_qual inclusive in descending order of rfc_quality
 		"""
 
-		if oracle_method not in ["dexnet", "pytorch"]:
-			cls.logger.error("Grasp.sample_grasps argument `oracle_method` must be 'dexnet' or 'pytorch' -- defaulting to 'dexnet'.")
-			oracle_method = "dexnet"
-
-		if oracle_method == "dexnet":
+		if self.oracle_method == "dexnet":
 			return cls.sample_grasps_dexnet(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
 
 		else:
@@ -327,7 +412,7 @@ class Grasp:
 			server = Pyro4.Proxy("PYRO:Server@localhost:5000")
 			save_nparr(world_centers.detach().cpu().numpy(), "temp_centers.npy")
 			save_nparr(world_axes.detach().cpu().numpy(), "temp_axes.npy")
-			results = server.close_fingers("temp_centers.npy", "temp_axes.npy", kwargs["min_qual"], kwargs["max_qual"])
+			results = server.close_fingers("temp_centers.npy", "temp_axes.npy", kwargs["min_qual"], kwargs["max_qual"], robust=self.oracle_robust)
 			#	results returns list of lists of form [[int: index, Bool: force closure quality, float: rfc quality, (array, array): contact points], ...]
 			for res in results:
 				res.append(it)	# track which batch/iteration grasp is from (for access to world centers/axes)
@@ -341,9 +426,9 @@ class Grasp:
 		ret_grasps = []
 		for i in range(len(cands)):
 			g = cands[i]
-			quality = g[1:-2]
+			quality = g[2]
 
-			if quality[1] <= kwargs["max_qual"] and quality[1] >= kwargs["min_qual"]:
+			if quality <= kwargs["max_qual"] and quality >= kwargs["min_qual"]:
 				contact0 = torch.tensor(g[-2][0]).to(renderer.device)
 				contact1 = torch.tensor(g[-2][1]).to(renderer.device)
 				world_center = world_centers_batch[g[-1]][g[0]]
@@ -361,7 +446,7 @@ class Grasp:
 				ret_grasps.append(grasp)
 
 		# sort grasps in descending order of quality
-		ret_grasps.sort(key=lambda x: x.rfc_quality, reverse=True)
+		ret_grasps.sort(key=lambda x: x.quality, reverse=True)
 
 		return ret_grasps[:num_samples]
 
@@ -407,7 +492,7 @@ class Grasp:
 
 
 		# 2 - translate wrt to grasp angle and grasp center 
-		theta = math.degrees(self.im_angle)
+		theta = -1 * math.degrees(self.im_angle)	# -1 because PyTorch transform goes clockwise and autolab_core goes counter-clockwise
 		 
 		dim_cx = torch_dim.shape[2] // 2
 		dim_cy = torch_dim.shape[1] // 2	
@@ -444,7 +529,7 @@ class Grasp:
 
 		return pose_tensor, image_tensor 
 
-	def oracle_eval(self, obj_file, oracle_method="dexnet", robust=True):
+	def oracle_eval(self, obj_file, oracle_method=None, robust=None):
 		"""
 		Get a final oracle evalution of a mesh object according to oracle_method
 
@@ -453,25 +538,30 @@ class Grasp:
 		obj_fil: String
 			The path to the .obj file of the mesh to evaluate
 		oracle_method: String
-			Options: "dexnet" or "pytorch"; defaults to "dexnet"
+			Options: "dexnet" or "pytorch"; defaults to self.oracle_method
 			Indicates to use the dexnet oracle via remote call to docker, or local pytorch implementation
 		robust: Boolean
-			True: uses robust ferrari canny evaluation for oracle quality; default
+			True: uses robust ferrari canny evaluation for oracle quality
 			False: uses (non robust) ferrari canny evaluation for oracle quality
+			defaults to self.oracle_robust
 
 		Returns
 		-------
 		float: quality from ferarri canny evaluation
 
 		"""
-		if oracle_method == "dexnet":
-			return self.oracle_eval_dexnet(obj_file, robust=robust)
+		check_method = (oracle_method in ["dexnet", "pytorch"])
+		if oracle_method == "dexnet" or (not check_method and (self.oracle_method == "dexnet")):
+			if isinstance(robust, bool):
+				Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
+				return self.oracle_eval_dexnet(obj_file, robust=robust)
+			else:
+				Grasp.logger.debug("Oracle eval - dexnet, robust %r", self.oracle_robust)
+				return self.oracle_eval_dexnet(obj_file, robust=self.oracle_robust)
 		
-		elif self.oracle_method == "pytorch":
-			return self.oracle_eval_pytorch(obj_file)
-
 		else:
-			Grasp.logger.error("oracle evaluation method must be 'dexnet' or 'pytorch'.")
+			Grasp.logger.debug("Oracle eval - pytorch")
+			return self.oracle_eval_pytorch(obj_file)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
 		"""
@@ -565,56 +655,131 @@ def test_select_grasp():
 def test_save_and_load_grasps():
 	Grasp.logger.info("Running test_save_and_load_grasps...")
 
-	renderer1 = Renderer()
-
-	fg = {
-		'fc_q': 1,
-		'rfc_q': 0.00039880830039262474,
-        # image center: tensor([344.3808, 239.4164,   0.5824], device='cuda:0')
-        # image angle: 0.0
-		'depth': 0.5824155807495117,
+	r = Renderer()
+	fixed_grasp = {
+		"quality": torch.tensor([0.00039880830039262474], device='cuda:0'),
+		"depth": torch.tensor([0.5824155807495117], device='cuda:0'),
 		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
 		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
 		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
 		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
 	}
 
-	# DEBUGGING WORLD TO IMAGE AXIS TRANSFORMATION W fg2
-	grasp = Grasp(
-		quality=(fg['fc_q'], fg['rfc_q']), 
-		depth=fg['depth'], 
-		world_center=fg['world_center'], 
-		world_axis=fg['world_axis'], 
-		c0=fg['c0'], 
-		c1=fg['c1'])
+	fixed_grasp2 = {
+		"quality": 0.00039880830039262474,
+		"depth": 0.5824155807495117,
+		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
+		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
+		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
+		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
+	}
 
-	print("before saving...")
-	print(grasp)
-	grasp.save("test-grasp.json")
-	print("\nreading after saving...")
-	g2 = Grasp.read("test-grasp.json")
-	print(g2)
+	fixed_grasp3 = {
+		"quality": [0.00039880830039262474],
+		"depth": torch.tensor([0.5824155807495117], device='cuda:0'),
+		'world_center': [2.7602e-02,  1.7584e-02, -9.2734e-05],
+		'world_axis': [-0.9385,  0.2661, -0.2201],
+		'c0': [0.0441, 0.0129, 0.0038],
+		'c1': [ 0.0112,  0.0222, -0.0039]
+	}
+
+
+	# Test init_from_dict with tensors vs init_from_dict with lists vs init_from_dict with floats vs read from json
+	g = Grasp.init_from_dict(fixed_grasp)
+	s1 = str(g)
+	# print("\ns1:", s1)
+
+	g2 = Grasp.init_from_dict(fixed_grasp2)
+	s2 = str(g2)
+	# print("\ns2:", s2)
+
+	g3 = Grasp.init_from_dict(fixed_grasp3)
+	s3 = str(g3)
+	# print("\ns3:", s3)
+
+	print("\nEqual when using init_from_dict with tensors vs floats vs lists?", s1 == s2 == s3)
+
 	
-	grasp.trans_world_to_im(renderer1.camera)
-	print("\nafter transforming before saving...")
-	print(grasp)
-	grasp.save('test-grasp2.json')
-	print("\nreading after transforming and saving...")
-	g2 = Grasp.read("test-grasp2.json")
-	print(g2)
+	# Test with init_from_dict vs read from json
+	# print("\ns1:", s1)
+	g.save("test-grasp.json")
+	g4 = Grasp.read("test-grasp.json")
+	s4 = str(g4)
+	# print("\ns4:", s4)
+	print("\nEqual when using init_from_dict and read?", s1==s4, "\n")
 
-	# test model inference and trans_world_to_im on saved grasps
+
+	# Test trans_world_to_im from init_from_dict with tensors vs floats vs lists vs json
+	g.trans_world_to_im(r.camera)
+	s1 = str(g)
+	g2.trans_world_to_im(r.camera)
+	s2 = str(g2)
+	g3.trans_world_to_im(r.camera)
+	s3 = str(g3)
+	g4.trans_world_to_im(r.camera)
+	s4 = str(g4)
+	print("\nEqual for trans_world_to_im from init_from_dict with tensors vs floats vs lists vs from read?", s1 == s2 == s3 == s4)
+	
+
+	# Test equality before and after saving after using trans_world_to_im
+	# g.trans_world_to_im(r.camera)
+	# s1 = str(g)
+	# # print("\ns1:", s1)
+	g.save('test-grasp.json')
+
+	g5 = Grasp.read("test-grasp.json")
+	s5 = str(g5)
+	# print("\ns5:", s5)
+	print("\nEqual after reading after trans_world_to_im?", s1==s5, "\n")
+
+
+	# # Test dtypes and shapes of all attributes are equal
+	# for grasp in [g, g4, g5]:
+	# 	# print("im_angle:\t", grasp.im_angle.item())
+		# print("\ngrasp")
+		# print("\tquality:\t", type(grasp.quality), "\t", grasp.quality.dtype, "\t", grasp.quality)
+		# print("\tdepth:\t\t", type(grasp.depth), "\t", grasp.depth.dtype, "\t", grasp.depth)
+		# print("\tworld_center:\t", type(grasp.world_center), "\t", grasp.world_center.dtype, "\t", grasp.world_center)
+		# print("\tworld_axis:\t", type(grasp.world_axis), "\t", grasp.world_axis.dtype, "\t", grasp.world_axis)
+		# print("\tc0:\t\t", type(grasp.c0), "\t", grasp.c0.dtype, "\t", grasp.c0)
+		# print("\tc1:\t\t", type(grasp.c1), "\t", grasp.c1.dtype, "\t", grasp.c1)
+		# print("\tim_center:\t", type(grasp.im_center),"\t", grasp.im_center.dtype, "\t", grasp.im_center)
+		# print("\tim_angle:\t", type(grasp.im_angle), "\t", grasp.im_angle.dtype, "\t", grasp.im_angle)
+		# print("\tim_axis:\t", type(grasp.im_axis), "\t", grasp.im_axis.dtype, "\t", grasp.im_axis)
+
+
+	# Test model inference and trans_world_to_im on saved grasps
 	model = KitModel("weights.npy")
 	model.eval()
 	run1 = Attack(model=model)
 
-	mesh, im = renderer1.render_object("data/bar_clamp.obj", display=False)
-	d_im = renderer1.mesh_to_depth_im(mesh, display=False)
+	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
+	d_im = r.mesh_to_depth_im(mesh, display=False)
+	pose1, image1 = g.extract_tensors(d_im)
+	pose2, image2 = g4.extract_tensors(d_im)
+	pose3, image3 = g5.extract_tensors(d_im)
 
-	g2.trans_world_to_im(renderer1.camera)
-	pose, image = g2.extract_tensors(d_im)
-	print("prediction:", run1.run(pose, image))		# gqcnn prediction
+	pred1 = run1.run(pose1, image1)[0][0].item()	# gqcnn predictions
+	pred2 = run1.run(pose2, image2)[0][0].item()
+	pred3 = run1.run(pose3, image3)[0][0].item()
+	print("\nprediction 1:", pred1)
+	print("prediction 2:", pred2)
+	print("prediction 3:", pred3)
+	print("\nModel predictions the same on fixed and read grasps?", pred1 == pred2) # == pred3)
 
+
+	# Test using trans_to_im again
+	g.trans_world_to_im(r.camera)
+	s1 = str(g)
+	print("\nangle:", g.im_angle)
+	print("\tim_axis:", g.im_axis)
+	# print("\tworld_axis:", g.world_axis)
+	print("\nangle:", g2.im_angle)
+	print("\tim_axis:", g2.im_axis)
+	# print("\tworld_axis:", g2.world_axis)
+	print("\nEqual after using trans_to_im again?", s1 == s2)
+
+	print("")
 	Grasp.logger.info("Finished running test_save_and_load_grasps.")
 	
 def test_trans_world_to_im():
@@ -638,11 +803,44 @@ def test_trans_world_to_im():
 
 	Grasp.logger.info("Finished running test_trans_world_to_im.")
 
+def test_oracle_selection():
+	"""Test to ensure the correct oracle method is called based on grasp.oracle_method, grasp.oracle_robust, and argument methods"""
+
+	Grasp.logger.info("Running test_oracle_selection...")
+
+	grasp = Grasp.read("experiment-results/main/grasp-2/grasp.json")
+	print("\noracle_method:", grasp.oracle_method)
+	print("oracle_robust:", grasp.oracle_robust)
+	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj"))
+
+	print("\noracle_method:", grasp.oracle_method)
+	print("oracle_robust:", False)
+	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", robust=False))
+
+	print("\noracle_method: pytorch")
+	print("oracle_robust:", True)
+	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch"))
+
+	print("\noracle_method: blahblahblah")
+	print("oracle_robust:", grasp.oracle_robust)
+	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", oracle_method="blahblahlblah"))
+
+	print("\noracle_method: blahblahblah")
+	print("oracle_robust:", False)
+	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", oracle_method="blahblahlblah", robust=False))
+
+	print("\noracle_method:", grasp.oracle_method)
+	print("oracle_robust: blahblah")
+	print("oracle eval:", grasp.oracle_eval("data/new_barclamp.obj", robust="blahblah"), "\n")
+
+	Grasp.logger.info("Finished running test_oracle_selection.")
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
 	# test_select_grasp()
 	test_save_and_load_grasps()
+	# test_oracle_selection()
 
 	"""
 	renderer1 = Renderer()
