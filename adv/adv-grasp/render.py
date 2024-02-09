@@ -184,6 +184,43 @@ class Renderer:
 		else:
 			plt.show()
 
+	def draw_grasp(self, obj, contact0, contact1, title=None, save=""):
+
+		if isinstance(obj, Meshes):
+			image = self.render_mesh(obj, display=False)	
+			image = image[0, ..., :3].cpu().detach().numpy()
+		elif isinstance(obj, torch.Tensor):
+			image = obj.squeeze().cpu().detach().numpy()
+		elif isinstance(obj, np.ndarray):
+			image = obj
+		else:
+			print("display_im only takes Meshes object, pytorch tensor, or numpy array")
+			return None
+
+		# calculate grasp line from 3D contact points
+		contacts = torch.stack((contact0, contact1))
+		contacts = -1 * contacts	# multiply by -1 bc matplotlib has opposite 2D coordinate system
+		im_contacts = self.camera.transform_points(contacts)
+		for i in range(im_contacts.shape[0]):		# fix depth value
+			im_contacts[i][2] = 1/im_contacts[i][2]
+		im_contacts = im_contacts[..., :2]
+
+		# plot image
+		plt.imshow(image)
+		plt.axis("off")
+		if title:
+			plt.title(title)
+
+		# add grasp line
+		endpoint0 = im_contacts[0].cpu().detach().numpy()
+		endpoint1 = im_contacts[1].cpu().detach().numpy()
+		plt.plot([endpoint0[0], endpoint1[0]], [endpoint0[1], endpoint1[1]], color='red', linewidth=2)
+
+		if save:
+			plt.savefig(save)
+		else:
+			plt.show()
+
 	def mesh_to_depth_im(self, mesh, display=True, title=None, save=False, fname=None):
 		"""
 		Converts a Mesh to a noramlized 480 x 640 depth image and optionally displays it.
@@ -216,7 +253,7 @@ class Renderer:
 
 		return depth_im
 
-	def grasp_sphere(self, center, grasp_obj, fname):
+	def grasp_sphere(self, center, grasp_obj, fname, display=False):
 		"""Generate an ico_sphere mesh to visualize a particular grasp
 		Parameters
 		----------
@@ -250,9 +287,11 @@ class Renderer:
 			c0.offset_verts_(center[0])
 			c1.offset_verts_(center[1])
 			mesh = join_meshes_as_scene([grasp_obj, c0, c1])
-		
 
 		save_obj(fname, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+
+		if display:
+			self.display(mesh, title=fname)
 		
 		return mesh
 
@@ -279,11 +318,22 @@ def test_renderer():
 	depth_im = renderer1.mesh_to_depth_im(mesh, display=True, title="original barclamp obj")#title="testing mesh_to_depth_im")
 	depth_im2 = renderer1.mesh_to_depth_im(mesh2, display=True, title="new barclamp obj")#title="testing mesh_to_depth_im 2")
     
-
 	return "success"
 
+def test_draw_grasp():
+	# instantiate Renderer with default parameters
+	r = Renderer()
+	mesh, image = r.render_object("data/bar_clamp.obj", display=False)
+
+	# define a basic grasp axis and grasp center
+	c0 = torch.Tensor([0.0441, 0.0129, 0.0038]).to(r.device)
+	c1 = torch.Tensor([ 0.0112,  0.0222, -0.0039]).to(r.device)
+
+	r.draw_grasp(image, c0, c1, "testing...")
+
 if __name__ == "__main__":
-	print(test_renderer())
+	# print(test_renderer())
+	test_draw_grasp()
 
 	# renderer1 = Renderer()
 	# grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
