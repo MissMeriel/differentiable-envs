@@ -205,6 +205,9 @@ class Renderer:
 			im_contacts[i][2] = 1/im_contacts[i][2]
 		im_contacts = im_contacts[..., :2]
 
+		# show image before adding grasp line
+		self.display(np.copy(image), title=title)
+
 		# plot image
 		plt.imshow(image)
 		plt.axis("off")
@@ -218,8 +221,8 @@ class Renderer:
 
 		if save:
 			plt.savefig(save)
-		else:
-			plt.show()
+			
+		plt.show()
 
 	def mesh_to_depth_im(self, mesh, display=True, title=None, save=False, fname=None):
 		"""
@@ -328,8 +331,26 @@ def test_draw_grasp():
 	# define a basic grasp axis and grasp center
 	c0 = torch.Tensor([0.0441, 0.0129, 0.0038]).to(r.device)
 	c1 = torch.Tensor([ 0.0112,  0.0222, -0.0039]).to(r.device)
+	c2 = torch.Tensor([-0.037973009049892426, -0.04009656608104706, 0.02387666516005993]).to(r.device)
+	c3 = torch.Tensor([-0.020172616466879845, -0.02000114694237709, 0.015976890921592712]).to(r.device)
+	c4 = torch.Tensor([-0.036394111812114716, 0.029987281188368797, 0.0016563538229092956]).to(r.device)
+	c5 = torch.Tensor([-0.008031980134546757, 0.020576655864715576, -0.002032859018072486]).to(r.device)
+	contacts = [c0, c1, c2, c3, c4, c5]
 
-	r.draw_grasp(image, c0, c1, "testing...")
+	# testing on images
+	r.draw_grasp(image, c0, c1, title="testing...")
+	r.draw_grasp(image, c2, c3, title="testing2...")
+	r.draw_grasp(image, c4, c5, title="testing3..")
+
+	# testing on meshes
+	r.draw_grasp(mesh, c0, c1, title="testing4...")
+	r.draw_grasp(mesh, c2, c3, title="testing5...")
+	r.draw_grasp(mesh, c4, c5, title="testing6..")
+
+	for i in range(0, 6, 2):
+		c_0 = contacts[i]
+		c_1 = contacts[i+1]
+		r.draw_grasp(mesh, c_0, c_1, title="testing"+str(i))
 
 if __name__ == "__main__":
 	# print(test_renderer())
