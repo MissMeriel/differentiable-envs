@@ -684,12 +684,13 @@ class Grasp:
 		rotation[indices, 1, 0] = sin
 
 		#	center and uncenter matrices
-		center = torch.tensor([[[1, 0, -0.5], [0, 1, -0.5], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
-		uncenter = torch.tensor([[[1, 0, 0.5], [0, 1, 0.5], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
+		uncenter = torch.tensor([[[1, 0, -0.5], [0, 1, 0.5], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
+		center = torch.tensor([[[1, 0, 0.5], [0, 1, -0.5], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
 
 		#	combine transformations and apply them
 		if debug:
 			trans_rot_mat = torch.matmul(translate, rotation)[:, :2, :]
+			center_mat = center[:, :2, :]
 			translate_mat = translate[:, :2, :]
 			rotation_mat = rotation[:, :2, :]
 			
@@ -702,7 +703,10 @@ class Grasp:
 			trans_rot_grid = torch.nn.functional.affine_grid(trans_rot_mat, dims_resized.shape)
 			trans_rot = torch.nn.functional.grid_sample(dims_resized, trans_rot_grid)
 
-			return pose_tensor, dims_resized, trans_only, rot_only, trans_rot
+			center_grid = torch.nn.functional.affine_grid(center_mat, dims_resized.shape)
+			centered = torch.nn.functional.grid_sample(dims_resized, center_grid)
+
+			return pose_tensor, dims_resized, trans_only, rot_only, trans_rot, centered
 
 		# affine_mat = torch.matmul(torch.matmul(translate, uncenter), torch.matmul(rotation, uncenter))
 		affine_mat = torch.matmul(translate, rotation)
@@ -1223,7 +1227,7 @@ def test_processing_batching():
 	dim = r.mesh_to_depth_im(mesh, display=False)
 	dims = dim.repeat(4, 1, 1, 1)
 	pose, resized, trans, rot, trans_rot = g0.extract_tensors(dim, debug=True)
-	pose_batch, resized_batch, trans_batch, rot_batch, trans_rot_batch = gb.extract_tensors_batch(dims, debug=True)
+	pose_batch, resized_batch, trans_batch, rot_batch, trans_rot_batch, centered = gb.extract_tensors_batch(dims, debug=True)
 
 	pose0 = pose_batch[0]
 	pose_diff = torch.max(pose0 - pose)
@@ -1241,6 +1245,7 @@ def test_processing_batching():
 	rot_diff = torch.max(rot0 - rot)
 	print("rot_diff:", rot_diff.item(), "\n")
 
+	r.display(centered[0], "center translation only")	# NOT WORKING AS EXPECTED
 	r.display(trans0, "tensor_extraction translation only")
 	r.display(trans, "tensor_extraction_batch translation only")
 	r.display(trans-trans0, "diff translation only")
@@ -1248,8 +1253,8 @@ def test_processing_batching():
 	test = torch.from_numpy(np.load("data/grasp_test2.npy")).permute(0,3,1,2)
 	r.display(test, title="gqcnn grasp_to_tensors")
 
-	# save_dim = dim.unsqueeze(0).permute(0,2,3,1).cpu().detach().numpy()
-	# save_nparr(save_dim, "np_dim_test.npy")
+	save_dim = dim.unsqueeze(0).permute(0,2,3,1).cpu().detach().numpy()
+	save_nparr(save_dim, "np_dim_test.npy")
 
 	Grasp.logger.info("Finished running test_processing_batching.")
 
@@ -1260,6 +1265,6 @@ if __name__ == "__main__":
 	# test_save_and_load_grasps()
 	# test_oracle_selection()
 	# test_oracle_eval()
-	test_batching()
+	# test_batching()
 	test_processing_batching()
 
