@@ -206,7 +206,7 @@ class Renderer:
 		else:
 			cols = round(math.sqrt(num_ims))
 			rows = math.ceil(num_ims / cols)
-		fig = plt.figure(figsize=(min(8*cols, 20), min(8*rows, 20)))
+		fig = plt.figure(figsize=(8*cols, 8*rows))
 
 		# check titles
 		if isinstance(title, str):
@@ -366,7 +366,7 @@ class Renderer:
 			c1 = c0.clone()
 			c0.offset_verts_(center[0].squeeze(0))
 			c1.offset_verts_(center[1].squeeze(0))
-			mesh = join_meshes_as_scene([c0, c1, grasp_obj])
+			mesh = join_meshes_as_scene([grasp_obj, c0, c1])
 
 		if save:
 			save_obj(save, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
