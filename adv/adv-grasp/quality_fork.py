@@ -1,4 +1,5 @@
 import torch
+import torch.optim as optim
 import os
 from torch.masked import masked_tensor
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -1524,12 +1525,28 @@ def test_quality():
     center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
     axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
     axis3D.retain_grad() 
+    center3D.retain_grad()
     graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05).solveForIntersection(mesh)[0]
     print('before', axis3D.grad)
     qual_tensor = com_qual_func.quality(mesh, graspObj)
     print('quality', qual_tensor)
-    qual_tensor.backward(inputs=axis3D)
-    print('after', axis3D.grad)
+    #qual_tensor.backward(inputs=axis3D)
+    #print('after', axis3D.grad)
+    #print('value', axis3D)
+
+    optimizer = optim.SGD([axis3D,center3D], lr=0.0001)
+    for i in range(10):
+        optimizer.zero_grad()
+        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05).solveForIntersection(mesh)[0]
+        qual_tensor = -com_qual_func.quality(mesh, graspObj)
+        qual_tensor.backward()
+        print('quality:',-qual_tensor.squeeze().numpy(force=True))
+        # print('grad', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
+        # print('value', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+        optimizer.step()
+        
+
+        
 
 
     center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
