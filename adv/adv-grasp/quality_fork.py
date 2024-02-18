@@ -53,7 +53,6 @@ class GraspTorch(object):
     contact_normals : list of :obj:`numpy.ndarray`
         Pair of contact normals in image space.
     """
-
     def __init__(self,
                  center,
                  angle=0.0,
@@ -254,7 +253,7 @@ class GraspTorch(object):
         return G
 
 
-    def compute_friction_cone(self, state, num_cone_faces=8, friction_coef=0.5):
+    def compute_friction_cone(self, mesh, num_cone_faces=8, friction_coef=0.5):
         """ Computes the friction cone and normal for all contact points.
 
         Parameters
@@ -313,10 +312,9 @@ class GraspTorch(object):
         return self.friction_cone
 
         
-    def solveForIntersection(self, state): 
+    def solveForIntersection(self, mesh): 
         """Compute where grasp contacts a mesh, state is meshes pytorch3D object"""
-        # TODO
-        # for grasp in grasp 
+            # for grasp in grasp 
         # for each ray (2)
         # for each triangle (vectorize for parallel)
         #  compute intersection
@@ -328,7 +326,7 @@ class GraspTorch(object):
             # that intersection is contact_point
             # angle between ray and normal is contact_normal
         #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
-        mesh_unwrapped = multi_gather_tris(state.verts_packed(), state.faces_packed())
+        mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
         opposite_dir_rays = self.ray_directions
         ray_o = self.center3D - (opposite_dir_rays * self.width / 2)
         ray_d = opposite_dir_rays # [axis3d, -axis3d]
@@ -355,9 +353,9 @@ class GraspTorch(object):
         contactFound = torch.logical_not(torch.isinf(min_out.values))
         self.contact_points = intersectionPoints
         
-        verts = state.verts_packed()[state.faces_packed()[faces_index,:]]
+        verts = mesh.verts_packed()[mesh.faces_packed()[faces_index,:]]
         # experimental, weighted vertex normals
-        vertex_normals = state.verts_normals_packed()[state.faces_packed()[faces_index,:]]
+        vertex_normals = mesh.verts_normals_packed()[mesh.faces_packed()[faces_index,:]]
         u_vals = torch.gather(u, 2, faces_index).unsqueeze(3).unsqueeze(4)
         v_vals = torch.gather(v, 2, faces_index).unsqueeze(3).unsqueeze(4)
         w_vals = 1 - u_vals - v_vals
@@ -365,532 +363,302 @@ class GraspTorch(object):
         minReturn=torch.min(weights,dim=-2)
         normsVert = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
         verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
-        vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = state.faces_normals_packed()[faces_index,:]
-        bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
-        (idxs_face, masks, sphereDirs) = sphereSamples(self.contact_points, state)
-        normsContinuous = avgSphereArc(state, self.contact_points, ray_d)
-        # normsDexnet = svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
-        # normsSphereAvg = avgSpherePoints(state, idxs_face, masks, self.contact_points)
+        vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = mesh.faces_normals_packed()[faces_index,:]
+        (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(self.contact_points, mesh)
+        normsContinuous = GraspTorch.avgSphereArcNormal(mesh, self.contact_points, ray_d)
+        # normsDexnet = self.svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
+        # normsSphereAvg = self.avgSpherePoints(state, idxs_face, masks, self.contact_points)
         #torch.mean(verts, dim=-2,keepdim=True)
         #vertex_normals.scatter_( state.faces_normals_packed()[faces_index,:])
         # TODO, update to use built in https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/ops/interp_face_attrs.html
         #self.contact_normals = (torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2) + torch.squeeze(state.faces_normals_packed()[faces_index,:],-2))/2
-        # normsVertFace = torch.sum(torch.multiply(vertex_normals,bary),dim=-2).squeeze(-2)
-        normsFace = torch.squeeze(state.faces_normals_packed()[faces_index,:],-2)
+        normsFace = torch.squeeze(mesh.faces_normals_packed()[faces_index,:],-2)
         self.contact_normals = normsContinuous
 
-        # experimental, weighted adjacent face normals
-        #faces_edges = state.faces_packed_to_edges_packed()[faces_index,:]
-        # near the end, this has all edge (face) pairs, organized by edge index, so just need face to edge to get 6 normals, 3 the same as face
-        # so, for instance, we can sum each and subtract face to get non-face
-        #GraspTorch.mesh_normal_consistency(state)
-        #bary = Barycentric(self.contact_points.unsqueeze(1).unsqueeze(1).double(),verts.double())
         return self, faces_index, contactFound
 
-def dexnetRadius(mesh, gridDist=1.5):
-    # matches min scaling from:
-    # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/database/mesh_processor.py#L281
-    sdf_dim = 100
-    sdf_padding = 5
+    @staticmethod
+    def dexnetRadius(mesh, gridDist=1.5):
+        # matches min scaling from:
+        # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/database/mesh_processor.py#L281
+        sdf_dim = 100
+        sdf_padding = 5
 
-    maxDim = torch.max(torch.diff(mesh.get_bounding_boxes(),dim=-1))
-    scaling = (maxDim / (sdf_dim - sdf_padding * 2)) # box to meters
-    sphereRadius = scaling * gridDist
-    return sphereRadius, scaling
+        maxDim = torch.max(torch.diff(mesh.get_bounding_boxes(),dim=-1))
+        scaling = (maxDim / (sdf_dim - sdf_padding * 2)) # box to meters
+        sphereRadius = scaling * gridDist
+        return sphereRadius, scaling
 
-def sphereSamples(surface_point, mesh):
-    point = surface_point.unsqueeze(-2) # add dim for samples
+    @staticmethod
+    def sphereSamples(surface_point, mesh):
+        # rejection ish samples around surface_point that are on mesh
+        point = surface_point.unsqueeze(-2) # add dim for samples
 
-    steps = 3 # positive int, probably odd
-    steps_cubed = steps**3
-    obj_target_scale = 0.040
-    sphereRadius,scaling = dexnetRadius(mesh)
-    step_ends = (steps-1)/2
-    step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps,device=mesh.device,dtype=surface_point.dtype)
-    sphereDirsTuple = torch.meshgrid(step_tensor,step_tensor,step_tensor,indexing='ij')
-    sphereDirs = torch.cat((sphereDirsTuple[0].reshape(steps_cubed,1),sphereDirsTuple[1].reshape(steps_cubed,1),sphereDirsTuple[2].reshape(steps_cubed,1)),1)
-    sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * sphereRadius
-    sphereDirs = sphereDirs.reshape([1]*(len(point.shape)-2)+ [steps_cubed, 3])
-    pointSphere = sphereDirs + point
-    origShape = pointSphere.shape
-    pointSphereCloud = Pointclouds([pointSphere.reshape(-1,3)])
+        steps = 3 # positive int, probably odd
+        steps_cubed = steps**3
+        obj_target_scale = 0.040
+        sphereRadius,scaling = GraspTorch.dexnetRadius(mesh)
+        step_ends = (steps-1)/2
+        step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps,device=mesh.device,dtype=surface_point.dtype)
+        sphereDirsTuple = torch.meshgrid(step_tensor,step_tensor,step_tensor,indexing='ij')
+        sphereDirs = torch.cat((sphereDirsTuple[0].reshape(steps_cubed,1),sphereDirsTuple[1].reshape(steps_cubed,1),sphereDirsTuple[2].reshape(steps_cubed,1)),1)
+        sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * sphereRadius
+        sphereDirs = sphereDirs.reshape([1]*(len(point.shape)-2)+ [steps_cubed, 3])
+        pointSphere = sphereDirs + point
+        origShape = pointSphere.shape
+        pointSphereCloud = Pointclouds([pointSphere.reshape(-1,3)])
 
-    (idxs_face, dists, face_edge_shared) = checkSamples(pointSphereCloud, mesh)
+        (idxs_face, dists, face_edge_shared) = GraspTorch.checkSamplesAreOnMesh(pointSphereCloud, mesh)
 
-    dists = dists.reshape([-1, steps_cubed, 1])
-    face_edge_shared = face_edge_shared.reshape([-1, steps_cubed, 1])
-    idxs_face = idxs_face.reshape([-1, steps_cubed, 1])
-    minDist = (scaling * np.sqrt(2) / 2)**2  # square meters 
-    masks = torch.split(torch.logical_and(dists < minDist,face_edge_shared), dim=0, split_size_or_sections=1)
-    return idxs_face, masks, sphereDirs
+        dists = dists.reshape([-1, steps_cubed, 1])
+        face_edge_shared = face_edge_shared.reshape([-1, steps_cubed, 1])
+        idxs_face = idxs_face.reshape([-1, steps_cubed, 1])
+        minDist = (scaling * np.sqrt(2) / 2)**2  # square meters 
+        masks = torch.split(torch.logical_and(dists < minDist,face_edge_shared), dim=0, split_size_or_sections=1)
+        return idxs_face, masks, sphereDirs
 
-def checkSamples(samples, mesh):
-    verts_packed = mesh.verts_packed()
-    faces_packed = mesh.faces_packed()
-    tris = verts_packed[faces_packed]
-    edges_packed = mesh.edges_packed()
-    segms = verts_packed[edges_packed]
+    @staticmethod
+    def checkSamplesAreOnMesh(samples, mesh):
+        # check if sample points are near surface of mesh
+        verts_packed = mesh.verts_packed()
+        faces_packed = mesh.faces_packed()
+        tris = verts_packed[faces_packed]
+        edges_packed = mesh.edges_packed()
+        segms = verts_packed[edges_packed]
 
-    dists_face, idxs_face = _C.point_face_dist_forward(samples.points_packed().float(), 
-                                             samples.cloud_to_packed_first_idx(), 
-                                             tris.float(), 
-                                             mesh.mesh_to_faces_packed_first_idx(), 
-                                             samples.num_points_per_cloud().max().item(),
-                                             5e-6)
-    dists_edge, idxs_edge = _C.point_edge_dist_forward(samples.points_packed().float(), 
-                                             samples.cloud_to_packed_first_idx(), 
-                                             segms.float(), 
-                                             mesh.mesh_to_edges_packed_first_idx(), 
-                                             samples.num_points_per_cloud().max().item(),
-                                             )
-    dists = dists_edge
-    edges_to_check = mesh.faces_packed_to_edges_packed()[idxs_face,:]
-    face_edge_shared = torch.any(edges_to_check == idxs_edge.unsqueeze(1), dim=1)
-    dists[face_edge_shared] = dists_face[face_edge_shared] # TODO, double check barycentric
+        dists_face, idxs_face = _C.point_face_dist_forward(samples.points_packed().float(), 
+                                                samples.cloud_to_packed_first_idx(), 
+                                                tris.float(), 
+                                                mesh.mesh_to_faces_packed_first_idx(), 
+                                                samples.num_points_per_cloud().max().item(),
+                                                5e-6)
+        dists_edge, idxs_edge = _C.point_edge_dist_forward(samples.points_packed().float(), 
+                                                samples.cloud_to_packed_first_idx(), 
+                                                segms.float(), 
+                                                mesh.mesh_to_edges_packed_first_idx(), 
+                                                samples.num_points_per_cloud().max().item(),
+                                                )
+        dists = dists_edge
+        edges_to_check = mesh.faces_packed_to_edges_packed()[idxs_face,:]
+        face_edge_shared = torch.any(edges_to_check == idxs_edge.unsqueeze(1), dim=1)
+        dists[face_edge_shared] = dists_face[face_edge_shared]
+        
+        return idxs_face, dists, face_edge_shared
+
+    @staticmethod
+    def avgSphereArcNormal(mesh, surface_point, in_rays):
+        radius,_ = GraspTorch.dexnetRadius(mesh)
+        verts_packed = mesh.verts_packed()
+        faces_packed = mesh.faces_packed()
+        tris = verts_packed[faces_packed]
+
+        # find reference frame for each face
+        face_normals_unsqeeze = mesh.faces_normals_packed().unsqueeze(-1)
+        edge_dir = torch.nn.functional.normalize(tris[:,1,:]-tris[:,0,:],dim=-1).unsqueeze(-1)
+        face_rot_ms = torch.cat((edge_dir, torch.cross(face_normals_unsqeeze,edge_dir),face_normals_unsqeeze),-1)
+        
+        # rotate each face to that frame
+        tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
+        # rotate contacts to that frame
+        sp_shape = list(surface_point.shape[:-1]) + [1] * len(face_rot_ms.shape[:-1]) + [3]
+        rm_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [3,3]
+        surface_point_rot = torch.matmul(surface_point.reshape(sp_shape), face_rot_ms.double().reshape(rm_shape)).squeeze(-2)
+        tris_2D = tris_rot[...,:-1]
+        sphere_plane_dist = surface_point_rot[...,-1] - tris_rot[...,0,-1]
+        intersects_plane = torch.abs(sphere_plane_dist) < radius
+        sphere_center_2D = surface_point_rot[...,:-1]
+        # get radius of projection of sphere to triangle plane, 0 out all non-intersections
+        radius_2D = torch.zeros_like(sphere_plane_dist)
+        radius_compare = radius**2 - sphere_plane_dist**2
+        radius_compare_positive = radius_compare > 0
+        radius_2D[radius_compare_positive] = torch.sqrt( radius_compare[radius_compare_positive] )
+        radius_2D_inv = torch.zeros_like(radius_2D)
+        radius_2D_inv[intersects_plane] = 1 / radius_2D[intersects_plane]
+        # triangle centered at projection with radius 0 
+        tris_2D_unit = (tris_2D - sphere_center_2D.unsqueeze(-2)) * radius_2D_inv.unsqueeze(-1).unsqueeze(-1)
+    #    # masking to reduce computation, che 
+    #    tris_2D_unit = tris_2D_unit[intersects_plane]
+
+        # # can filter on mesh_on_contact_proj all less than face_radius
+
+        edge_dir_2D = tris_2D_unit[...,(1,2,0),:] - tris_2D_unit
+        # # mesh_on_contact_proj and edge_dir_2D define line segment
+        # # solve for intersection with unit circle
+        # https://mathworld.wolfram.com/Circle-LineIntersection.html
+        edge_length_2D_sq = torch.sum(edge_dir_2D**2,dim=-1)
+        # # x1y2 - x2y1
+        edge_det_2D = tris_2D_unit[...,0] * tris_2D_unit[...,(1,2,0),1] - tris_2D_unit[...,1] * tris_2D_unit[...,(1,2,0),0]
+        edge_disc_2D = edge_length_2D_sq - edge_det_2D ** 2
+        edge_length_2D_sq_finite = edge_length_2D_sq!=0
+        projection_contact_on_edge_2D = torch.zeros_like(edge_dir_2D[...,(1,0)])
+        projection_contact_on_edge_2D[edge_length_2D_sq_finite] = edge_dir_2D[...,(1,0)][edge_length_2D_sq_finite] * torch.cat((edge_det_2D[edge_length_2D_sq_finite].unsqueeze(-1),-edge_det_2D[edge_length_2D_sq_finite].unsqueeze(-1)),dim=-1) / edge_length_2D_sq[edge_length_2D_sq_finite].unsqueeze(-1)
+        projection_contact_on_edge_2D_norm = torch.sum((projection_contact_on_edge_2D - tris_2D_unit) * edge_dir_2D,dim=-1) / edge_length_2D_sq
+        edge_norm_2d = torch.cat((edge_dir_2D[...,(1)].unsqueeze(-1),-edge_dir_2D[...,(0)].unsqueeze(-1)),dim=-1)
+        contact_is_above_line = torch.sum(-tris_2D_unit * edge_norm_2d, dim = -1) < 0
+        contact_is_above = torch.all( contact_is_above_line, dim=-1)
+        proj_falls_in_seg = torch.all(
+            torch.logical_and(
+                projection_contact_on_edge_2D_norm > 0,
+                projection_contact_on_edge_2D_norm < 1,
+                ),dim=-1)
+        contains_projected_sphere = torch.logical_and(contact_is_above,
+            torch.all(torch.linalg.vector_norm(projection_contact_on_edge_2D,dim=-1) > 1,dim=-1))
+        contact_fully_contained = torch.logical_and(proj_falls_in_seg, contains_projected_sphere)
+        intersects_line = edge_disc_2D > 0
+        projection_contact_on_edge_2D[torch.isnan(projection_contact_on_edge_2D)] = 0
+        # filter out known bad lines
+        #edge_dir_2D = edge_dir_2D[intersects_line]
+        #edge_det_2D = edge_det_2D[intersects_line]
+        #edge_length_2D_sq = edge_length_2D_sq[intersects_line]
+        #edge_disc_2D = edge_disc_2D[intersects_line]
+        #tris_2D_unit = tris_2D_unit[intersects_line]
+        #projection_contact_on_edge_2D = projection_contact_on_edge_2D[intersects_line]
+        # can filter on disc, if neg, no intersection
+        edge_length_2D_sq = edge_length_2D_sq.unsqueeze(-1)
+        edge_length_2D_sq_non_zero = torch.abs(edge_length_2D_sq) != 0 # torch.finfo(torch.float32).eps
+        x_scale = (torch.sign(edge_dir_2D[...,1]) * edge_dir_2D[...,0]).unsqueeze(-1)
+        y_scale = abs(edge_dir_2D[...,1]).unsqueeze(-1)
+        offset_to_tri_sphere_inter_2D_num = torch.zeros_like(edge_disc_2D.unsqueeze(-1).expand(list(edge_disc_2D.shape)+[2]))
+        offset_to_tri_sphere_inter_2D_num[intersects_line] = torch.cat((x_scale[intersects_line],y_scale[intersects_line]),dim=-1) * torch.sqrt(edge_disc_2D[intersects_line]).unsqueeze(-1)
+        offset_to_tri_sphere_inter_2D = torch.zeros_like(offset_to_tri_sphere_inter_2D_num)
+        offset_to_tri_sphere_inter_2D[edge_length_2D_sq_non_zero.squeeze(-1)] = offset_to_tri_sphere_inter_2D_num[edge_length_2D_sq_non_zero.squeeze(-1)] / edge_length_2D_sq[edge_length_2D_sq_non_zero].unsqueeze(-1)
+        offset_to_tri_sphere_inter_2D=offset_to_tri_sphere_inter_2D.unsqueeze(-2)
+        intersection_sphere_edge_2D = projection_contact_on_edge_2D.unsqueeze(-2) + torch.cat((offset_to_tri_sphere_inter_2D,-offset_to_tri_sphere_inter_2D),dim=-2)
+        intersection_sphere_edge_2D_norm = torch.sum((intersection_sphere_edge_2D - tris_2D_unit.unsqueeze(-2)) * edge_dir_2D.unsqueeze(-2),dim=-1)[edge_length_2D_sq_non_zero.squeeze(-1)] / edge_length_2D_sq[edge_length_2D_sq_non_zero].unsqueeze(-1)
+        intersects_segment = torch.logical_and(intersection_sphere_edge_2D_norm > 0,intersection_sphere_edge_2D_norm < 1)
+        
+        intersection_sphere_edge_2D_finite = torch.logical_and(torch.all(torch.logical_not(torch.isnan(intersection_sphere_edge_2D)),dim=-1),intersection_sphere_edge_2D[...,0]!=0)
+        
+        intersects_tri = torch.any(torch.any(intersects_segment,dim=-1),dim=-1)
+        intersection_angles = torch.zeros_like(intersection_sphere_edge_2D[...,1])
+        intersection_angles[intersection_sphere_edge_2D_finite] = torch.atan2(intersection_sphere_edge_2D[intersection_sphere_edge_2D_finite][:,1],intersection_sphere_edge_2D[intersection_sphere_edge_2D_finite][:,0])
+        #
+
+        ## sort (or mask, seems equivalent?) intersections on angle, filling missing with pi, append the -pi,pi
+        
+        #intersection_angles[torch.logical_not(intersects_segment)] = float('nan')
+        intersection_angles_shape = list(intersection_angles.shape[:-2]) + [-1]
+        intersection_angles = torch.reshape(intersection_angles, intersection_angles_shape)
+        pad_size = list(intersection_angles.shape[:-1]) + [1]
+        #start_pad = -math.pi * torch.ones(pad_size, dtype=intersection_angles.dtype, device=intersection_angles.device)
+        #end_pad = math.pi * torch.ones(pad_size, dtype=intersection_angles.dtype, device=intersection_angles.device)
+        #intersection_angles = torch.cat((start_pad, intersection_angles, end_pad),dim=-1)
+        intersection_angles = torch.sort(intersection_angles, dim=-1).values
+        
+        ## for each pair of interesections, check if point at intermediate angle is inside triangle
+        
+        dif_angles = torch.cat((torch.diff(intersection_angles, dim=-1), torch.full_like(intersection_angles[...,0:1],torch.nan)),dim=-1)
+        dif_wrap = intersection_angles[...,0:1] - intersection_angles
+        dif_wrap[torch.isnan(dif_wrap)] = 0
+        dif_wrap = torch.min(dif_wrap,keepdim=True, dim=-1)
+        dif_angles = dif_angles.scatter_(-1, dif_wrap.indices, dif_wrap.values + 2 * math.pi )
+        intersection_angles[intersection_angles.isnan()] = 0
+
+        dif_angles_nan=torch.isnan(dif_angles)
+        dif_angles_finite = torch.logical_and(torch.logical_not(dif_angles_nan), dif_angles!=0)
+        dif_angles_clean = dif_angles[dif_angles_finite]
+        dif_angles[dif_angles_nan] = 0
+
+        mid_angles = intersection_angles + dif_angles/2
+
+        mid_points = torch.cat((torch.cos(mid_angles).unsqueeze(-1),torch.sin(mid_angles).unsqueeze(-1)),dim=-1)
+        mid_points[torch.isnan(mid_points)] = 0
+        dif_angles_half = torch.zeros_like(dif_angles)
+        dif_angles_half = dif_angles_clean/2
+
+        arc_com_2D_unit_scale = torch.zeros_like(dif_angles)
+        arc_com_2D_unit_scale[dif_angles_finite] = (torch.sin(dif_angles_half)/(dif_angles_half))
+        arc_com_2D_unit = arc_com_2D_unit_scale.unsqueeze(-1) * mid_points
+        arc_com_2D = arc_com_2D_unit * radius_2D.unsqueeze(-1).unsqueeze(-1) + sphere_center_2D.unsqueeze(-2)
+
+        mid_points = mid_points.unsqueeze(-2)
+        edge_dir_2D = edge_dir_2D.unsqueeze(-3)
+        tris_2D_unit = tris_2D_unit.unsqueeze(-3)
+        # ## if inside of triangle, add the angle between them to count for that triangle/circle combo
+        # ## check if midpoints is inside triangle by checking if it is on same side of all edges
+        # ## https://stackoverflow.com/a/3461533
+        mid_point_in_tri = torch.all(edge_dir_2D[...,0] * (mid_points[...,1]-tris_2D_unit[...,1]) - edge_dir_2D[...,1] * (mid_points[...,0]-tris_2D_unit[...,0]) > 0,dim=-1)   
+
+
+        sin_dif_over_dif = torch.sin(dif_angles_clean)/dif_angles_clean
     
-    return idxs_face, dists, face_edge_shared
-
-def avgSphereArc(mesh, surface_point, in_rays):
-    radius,_ = dexnetRadius(mesh)
-    verts_packed = mesh.verts_packed()
-    faces_packed = mesh.faces_packed()
-    tris = verts_packed[faces_packed]
-
-    # find reference frame for each face
-    face_normals_unsqeeze = mesh.faces_normals_packed().unsqueeze(-1)
-    edge_dir = torch.nn.functional.normalize(tris[:,1,:]-tris[:,0,:],dim=-1).unsqueeze(-1)
-    face_rot_ms = torch.cat((edge_dir, torch.cross(face_normals_unsqeeze,edge_dir),face_normals_unsqeeze),-1)
-    
-    # rotate each face to that frame
-    tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
-    # rotate contacts to that frame
-    sp_shape = list(surface_point.shape[:-1]) + [1] * len(face_rot_ms.shape[:-1]) + [3]
-    rm_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [3,3]
-    surface_point_rot = torch.matmul(surface_point.reshape(sp_shape), face_rot_ms.double().reshape(rm_shape)).squeeze(-2)
-    tris_2D = tris_rot[...,:-1]
-    sphere_plane_dist = surface_point_rot[...,-1] - tris_rot[...,0,-1]
-    intersects_plane = torch.abs(sphere_plane_dist) < radius
-    sphere_center_2D = surface_point_rot[...,:-1]
-    # get radius of projection of sphere to triangle plane, 0 out all non-intersections
-    radius_2D = torch.zeros_like(sphere_plane_dist)
-    radius_compare = radius**2 - sphere_plane_dist**2
-    radius_compare_positive = radius_compare > 0
-    radius_2D[radius_compare_positive] = torch.sqrt( radius_compare[radius_compare_positive] )
-    radius_2D_inv = torch.zeros_like(radius_2D)
-    radius_2D_inv[intersects_plane] = 1 / radius_2D[intersects_plane]
-    # triangle centered at projection with radius 0 
-    tris_2D_unit = (tris_2D - sphere_center_2D.unsqueeze(-2)) * radius_2D_inv.unsqueeze(-1).unsqueeze(-1)
-#    # masking to reduce computation, che 
-#    tris_2D_unit = tris_2D_unit[intersects_plane]
-
-    # # can filter on mesh_on_contact_proj all less than face_radius
-
-    edge_dir_2D = tris_2D_unit[...,(1,2,0),:] - tris_2D_unit
-    # # mesh_on_contact_proj and edge_dir_2D define line segment
-    # # solve for intersection with unit circle
-    # https://mathworld.wolfram.com/Circle-LineIntersection.html
-    edge_length_2D_sq = torch.sum(edge_dir_2D**2,dim=-1)
-    # # x1y2 - x2y1
-    edge_det_2D = tris_2D_unit[...,0] * tris_2D_unit[...,(1,2,0),1] - tris_2D_unit[...,1] * tris_2D_unit[...,(1,2,0),0]
-    edge_disc_2D = edge_length_2D_sq - edge_det_2D ** 2
-    edge_length_2D_sq_finite = edge_length_2D_sq!=0
-    projection_contact_on_edge_2D = torch.zeros_like(edge_dir_2D[...,(1,0)])
-    projection_contact_on_edge_2D[edge_length_2D_sq_finite] = edge_dir_2D[...,(1,0)][edge_length_2D_sq_finite] * torch.cat((edge_det_2D[edge_length_2D_sq_finite].unsqueeze(-1),-edge_det_2D[edge_length_2D_sq_finite].unsqueeze(-1)),dim=-1) / edge_length_2D_sq[edge_length_2D_sq_finite].unsqueeze(-1)
-    projection_contact_on_edge_2D_norm = torch.sum((projection_contact_on_edge_2D - tris_2D_unit) * edge_dir_2D,dim=-1) / edge_length_2D_sq
-    edge_norm_2d = torch.cat((edge_dir_2D[...,(1)].unsqueeze(-1),-edge_dir_2D[...,(0)].unsqueeze(-1)),dim=-1)
-    contact_is_above_line = torch.sum(-tris_2D_unit * edge_norm_2d, dim = -1) < 0
-    contact_is_above = torch.all( contact_is_above_line, dim=-1)
-    proj_falls_in_seg = torch.all(
-        torch.logical_and(
-            projection_contact_on_edge_2D_norm > 0,
-            projection_contact_on_edge_2D_norm < 1,
-            ),dim=-1)
-    contains_projected_sphere = torch.logical_and(contact_is_above,
-        torch.all(torch.linalg.vector_norm(projection_contact_on_edge_2D,dim=-1) > 1,dim=-1))
-    contact_fully_contained = torch.logical_and(proj_falls_in_seg, contains_projected_sphere)
-    intersects_line = edge_disc_2D > 0
-    projection_contact_on_edge_2D[torch.isnan(projection_contact_on_edge_2D)] = 0
-    # filter out known bad lines
-    #edge_dir_2D = edge_dir_2D[intersects_line]
-    #edge_det_2D = edge_det_2D[intersects_line]
-    #edge_length_2D_sq = edge_length_2D_sq[intersects_line]
-    #edge_disc_2D = edge_disc_2D[intersects_line]
-    #tris_2D_unit = tris_2D_unit[intersects_line]
-    #projection_contact_on_edge_2D = projection_contact_on_edge_2D[intersects_line]
-    # can filter on disc, if neg, no intersection
-    edge_length_2D_sq = edge_length_2D_sq.unsqueeze(-1)
-    edge_length_2D_sq_non_zero = torch.abs(edge_length_2D_sq) != 0 # torch.finfo(torch.float32).eps
-    x_scale = (torch.sign(edge_dir_2D[...,1]) * edge_dir_2D[...,0]).unsqueeze(-1)
-    y_scale = abs(edge_dir_2D[...,1]).unsqueeze(-1)
-    offset_to_tri_sphere_inter_2D_num = torch.zeros_like(edge_disc_2D.unsqueeze(-1).expand(list(edge_disc_2D.shape)+[2]))
-    offset_to_tri_sphere_inter_2D_num[intersects_line] = torch.cat((x_scale[intersects_line],y_scale[intersects_line]),dim=-1) * torch.sqrt(edge_disc_2D[intersects_line]).unsqueeze(-1)
-    offset_to_tri_sphere_inter_2D = torch.zeros_like(offset_to_tri_sphere_inter_2D_num)
-    offset_to_tri_sphere_inter_2D[edge_length_2D_sq_non_zero.squeeze(-1)] = offset_to_tri_sphere_inter_2D_num[edge_length_2D_sq_non_zero.squeeze(-1)] / edge_length_2D_sq[edge_length_2D_sq_non_zero].unsqueeze(-1)
-    offset_to_tri_sphere_inter_2D=offset_to_tri_sphere_inter_2D.unsqueeze(-2)
-    intersection_sphere_edge_2D = projection_contact_on_edge_2D.unsqueeze(-2) + torch.cat((offset_to_tri_sphere_inter_2D,-offset_to_tri_sphere_inter_2D),dim=-2)
-    intersection_sphere_edge_2D_norm = torch.sum((intersection_sphere_edge_2D - tris_2D_unit.unsqueeze(-2)) * edge_dir_2D.unsqueeze(-2),dim=-1)[edge_length_2D_sq_non_zero.squeeze(-1)] / edge_length_2D_sq[edge_length_2D_sq_non_zero].unsqueeze(-1)
-    intersects_segment = torch.logical_and(intersection_sphere_edge_2D_norm > 0,intersection_sphere_edge_2D_norm < 1)
-    
-    intersection_sphere_edge_2D_finite = torch.logical_and(torch.all(torch.logical_not(torch.isnan(intersection_sphere_edge_2D)),dim=-1),intersection_sphere_edge_2D[...,0]!=0)
-    
-    intersects_tri = torch.any(torch.any(intersects_segment,dim=-1),dim=-1)
-    intersection_angles = torch.zeros_like(intersection_sphere_edge_2D[...,1])
-    intersection_angles[intersection_sphere_edge_2D_finite] = torch.atan2(intersection_sphere_edge_2D[intersection_sphere_edge_2D_finite][:,1],intersection_sphere_edge_2D[intersection_sphere_edge_2D_finite][:,0])
-    #
-
-    ## sort (or mask, seems equivalent?) intersections on angle, filling missing with pi, append the -pi,pi
-    
-    #intersection_angles[torch.logical_not(intersects_segment)] = float('nan')
-    intersection_angles_shape = list(intersection_angles.shape[:-2]) + [-1]
-    intersection_angles = torch.reshape(intersection_angles, intersection_angles_shape)
-    pad_size = list(intersection_angles.shape[:-1]) + [1]
-    #start_pad = -math.pi * torch.ones(pad_size, dtype=intersection_angles.dtype, device=intersection_angles.device)
-    #end_pad = math.pi * torch.ones(pad_size, dtype=intersection_angles.dtype, device=intersection_angles.device)
-    #intersection_angles = torch.cat((start_pad, intersection_angles, end_pad),dim=-1)
-    intersection_angles = torch.sort(intersection_angles, dim=-1).values
-    
-    ## for each pair of interesections, check if point at intermediate angle is inside triangle
-    
-    dif_angles = torch.cat((torch.diff(intersection_angles, dim=-1), torch.full_like(intersection_angles[...,0:1],torch.nan)),dim=-1)
-    dif_wrap = intersection_angles[...,0:1] - intersection_angles
-    dif_wrap[torch.isnan(dif_wrap)] = 0
-    dif_wrap = torch.min(dif_wrap,keepdim=True, dim=-1)
-    dif_angles = dif_angles.scatter_(-1, dif_wrap.indices, dif_wrap.values + 2 * math.pi )
-    intersection_angles[intersection_angles.isnan()] = 0
-
-    dif_angles_nan=torch.isnan(dif_angles)
-    dif_angles_finite = torch.logical_and(torch.logical_not(dif_angles_nan), dif_angles!=0)
-    dif_angles_clean = dif_angles[dif_angles_finite]
-    dif_angles[dif_angles_nan] = 0
-
-    mid_angles = intersection_angles + dif_angles/2
-
-    mid_points = torch.cat((torch.cos(mid_angles).unsqueeze(-1),torch.sin(mid_angles).unsqueeze(-1)),dim=-1)
-    mid_points[torch.isnan(mid_points)] = 0
-    dif_angles_half = torch.zeros_like(dif_angles)
-    dif_angles_half = dif_angles_clean/2
-
-    arc_com_2D_unit_scale = torch.zeros_like(dif_angles)
-    arc_com_2D_unit_scale[dif_angles_finite] = (torch.sin(dif_angles_half)/(dif_angles_half))
-    arc_com_2D_unit = arc_com_2D_unit_scale.unsqueeze(-1) * mid_points
-    arc_com_2D = arc_com_2D_unit * radius_2D.unsqueeze(-1).unsqueeze(-1) + sphere_center_2D.unsqueeze(-2)
-
-    mid_points = mid_points.unsqueeze(-2)
-    edge_dir_2D = edge_dir_2D.unsqueeze(-3)
-    tris_2D_unit = tris_2D_unit.unsqueeze(-3)
-    # ## if inside of triangle, add the angle between them to count for that triangle/circle combo
-    # ## check if midpoints is inside triangle by checking if it is on same side of all edges
-    # ## https://stackoverflow.com/a/3461533
-    mid_point_in_tri = torch.all(edge_dir_2D[...,0] * (mid_points[...,1]-tris_2D_unit[...,1]) - edge_dir_2D[...,1] * (mid_points[...,0]-tris_2D_unit[...,0]) > 0,dim=-1)   
+        moment_of_inertia_1 = torch.zeros_like(dif_angles)
+        moment_of_inertia_2 = torch.zeros_like(dif_angles)
+        # only compute where dif angle exists
+        moment_of_inertia_1[dif_angles_finite] = 0.5 * (1 + sin_dif_over_dif - 2 * torch.square(torch.sin(dif_angles_clean))/torch.square(dif_angles_clean))
+        moment_of_inertia_2[dif_angles_finite] = 0.5 * (1 - sin_dif_over_dif)
+        moment_of_inertia_3 = moment_of_inertia_1+moment_of_inertia_2
+        # match size back up
 
 
-    sin_dif_over_dif = torch.sin(dif_angles_clean)/dif_angles_clean
- 
-    moment_of_inertia_1 = torch.zeros_like(dif_angles)
-    moment_of_inertia_2 = torch.zeros_like(dif_angles)
-    # only compute where dif angle exists
-    moment_of_inertia_1[dif_angles_finite] = 0.5 * (1 + sin_dif_over_dif - 2 * torch.square(torch.sin(dif_angles_clean))/torch.square(dif_angles_clean))
-    moment_of_inertia_2[dif_angles_finite] = 0.5 * (1 - sin_dif_over_dif)
-    moment_of_inertia_3 = moment_of_inertia_1+moment_of_inertia_2
-    # match size back up
+        moment_of_inertia_vec = torch.cat((moment_of_inertia_1.unsqueeze(-1),moment_of_inertia_2.unsqueeze(-1),moment_of_inertia_3.unsqueeze(-1)),dim=-1)
+        moment_of_inertia_local = torch.diag_embed(moment_of_inertia_vec)
+        moment_of_inertia_local[torch.logical_not(mid_point_in_tri)] = 0
+        moment_of_inertia_local = moment_of_inertia_local * (radius_2D*radius_2D).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
 
+        # rotation matrix used a couple places
+        face_rot_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [1] + [3] * 2
+        # rotate stuff back to 3D
+        # tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
+        fac_rot = face_rot_ms.double().reshape(face_rot_shape)
+        fac_rot_inverse = fac_rot.transpose(-2,-1)
 
-    moment_of_inertia_vec = torch.cat((moment_of_inertia_1.unsqueeze(-1),moment_of_inertia_2.unsqueeze(-1),moment_of_inertia_3.unsqueeze(-1)),dim=-1)
-    moment_of_inertia_local = torch.diag_embed(moment_of_inertia_vec)
-    moment_of_inertia_local[torch.logical_not(mid_point_in_tri)] = 0
-    moment_of_inertia_local = moment_of_inertia_local * (radius_2D*radius_2D).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # get arc center of mass into mesh coordinates
+        dim_3 =  torch.zeros_like(arc_com_2D[...,0:1])
+        tri_shape = len(surface_point.shape[:-1]) * [1] + [-1] + 2 * [1]
+        center_local_3D = torch.cat((arc_com_2D,dim_3+tris_rot[...,0,2:3].reshape(tri_shape)),-1).unsqueeze(-2)
+        arc_com_3D = torch.matmul(center_local_3D, fac_rot_inverse).squeeze(-2)
+        arc_com_3D[torch.logical_not(mid_point_in_tri)] = 0
 
-    # rotation matrix used a couple places
-    face_rot_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [1] + [3] * 2
-    # rotate stuff back to 3D
-    # tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
-    fac_rot = face_rot_ms.double().reshape(face_rot_shape)
-    fac_rot_inverse = fac_rot.transpose(-2,-1)
+        # get overall center of mass from weighted average
+        arc_mass = radius_2D.unsqueeze(-1) * dif_angles
+        arc_mass[torch.logical_not(mid_point_in_tri)] = 0
+        arc_com_total = torch.sum(arc_mass.unsqueeze(-1) * arc_com_3D,dim=(-3,-2)) / torch.sum(arc_mass,dim=(-1,-2)).unsqueeze(-1) 
+        #arc_com_total = surface_point
 
-    # get arc center of mass into mesh coordinates
-    dim_3 =  torch.zeros_like(arc_com_2D[...,0:1])
-    tri_shape = len(surface_point.shape[:-1]) * [1] + [-1] + 2 * [1]
-    center_local_3D = torch.cat((arc_com_2D,dim_3+tris_rot[...,0,2:3].reshape(tri_shape)),-1).unsqueeze(-2)
-    arc_com_3D = torch.matmul(center_local_3D, fac_rot_inverse).squeeze(-2)
-    arc_com_3D[torch.logical_not(mid_point_in_tri)] = 0
+        # transform to shared CoM 
+        # https://en.m.wikipedia.org/wiki/Moment_of_inertia#Inertia_tensor_of_rotation
+        arc_displacement = (arc_com_total.unsqueeze(-2).unsqueeze(-2) - arc_com_3D)
+        moment_of_inertia_local_aligned = torch.matmul(torch.matmul(fac_rot, moment_of_inertia_local),  fac_rot_inverse)
+        # outter product
+        m_o_i_2 = torch.matmul(arc_displacement.unsqueeze(-1), arc_displacement.unsqueeze(-2))
+        # inner product
+        m_o_i_1 = torch.matmul(arc_displacement.unsqueeze(-2), arc_displacement.unsqueeze(-1)).squeeze(-1)
+        m_o_i_1 = torch.diag_embed(m_o_i_1.expand(list(m_o_i_1.shape)[:-1]+[3]))
+        moment_of_inertia_global = moment_of_inertia_local_aligned + m_o_i_1 - m_o_i_2
+        moment_of_inertia_global[torch.logical_not(mid_point_in_tri)] = 0
 
-    # get overall center of mass from weighted average
-    arc_mass = radius_2D.unsqueeze(-1) * dif_angles
-    arc_mass[torch.logical_not(mid_point_in_tri)] = 0
-    arc_com_total = torch.sum(arc_mass.unsqueeze(-1) * arc_com_3D,dim=(-3,-2)) / torch.sum(arc_mass,dim=(-1,-2)).unsqueeze(-1) 
-    #arc_com_total = surface_point
+        moment_of_inertia_total = torch.sum(moment_of_inertia_global,dim=(-4,-3))
+        moment_of_inertia_total_diag = torch.diagonal(moment_of_inertia_total,dim1=-1,dim2=-2)
+        moment_of_inertia_total_trace = torch.sum(moment_of_inertia_total_diag,keepdim=True,dim=-1)
+        moment_of_inertia_total_trace_mat = torch.diag_embed(moment_of_inertia_total_trace.expand(list(moment_of_inertia_total_trace.shape)[:-1]+[3]))
+        cov = moment_of_inertia_total_trace_mat/2-moment_of_inertia_total
+        eig_return = torch.linalg.eigh(cov)
+        surface_normals = torch.real(eig_return.eigenvectors[...,0])
 
-    # transform to shared CoM 
-    # https://en.m.wikipedia.org/wiki/Moment_of_inertia#Inertia_tensor_of_rotation
-    arc_displacement = (arc_com_total.unsqueeze(-2).unsqueeze(-2) - arc_com_3D)
-    moment_of_inertia_local_aligned = torch.matmul(torch.matmul(fac_rot, moment_of_inertia_local),  fac_rot_inverse)
-    # outter product
-    m_o_i_2 = torch.matmul(arc_displacement.unsqueeze(-1), arc_displacement.unsqueeze(-2))
-    # inner product
-    m_o_i_1 = torch.matmul(arc_displacement.unsqueeze(-2), arc_displacement.unsqueeze(-1)).squeeze(-1)
-    m_o_i_1 = torch.diag_embed(m_o_i_1.expand(list(m_o_i_1.shape)[:-1]+[3]))
-    moment_of_inertia_global = moment_of_inertia_local_aligned + m_o_i_1 - m_o_i_2
-    moment_of_inertia_global[torch.logical_not(mid_point_in_tri)] = 0
+       
 
-    moment_of_inertia_total = torch.sum(moment_of_inertia_global,dim=(-4,-3))
-    moment_of_inertia_total_diag = torch.diagonal(moment_of_inertia_total,dim1=-1,dim2=-2)
-    moment_of_inertia_total_trace = torch.sum(moment_of_inertia_total_diag,keepdim=True,dim=-1)
-    moment_of_inertia_total_trace_mat = torch.diag_embed(moment_of_inertia_total_trace.expand(list(moment_of_inertia_total_trace.shape)[:-1]+[3]))
-    cov = moment_of_inertia_total_trace_mat/2-moment_of_inertia_total
-    eig_return = torch.linalg.eigh(cov)
-    surface_normals = torch.real(eig_return.eigenvectors[...,0])
+        # savemat('segments.mat',{'segments':segments_3D[linearized_segments_mask].numpy(force=True),'eigvec':torch.real(eig_return[1]).numpy(force=True),'eigval':torch.real(eig_return[0]).numpy(force=True)})
 
-    # # linearize and fit segments    
-    # mag_towa_mid = radius_2D.unsqueeze(-1) * (dif_angles_half-torch.sin(dif_angles_half))
-    # vec_towa_mid_2D = mag_towa_mid.unsqueeze(-1) * mid_points
-    # # contribution orthogonal to mid
-    # mag_orth_mid = radius_2D.unsqueeze(-1) * (1-torch.cos(dif_angles_half))
-    # vec_orth_mid_2D = mag_orth_mid.unsqueeze(-1) * torch.cat((-mid_points[...,1:2],mid_points[...,0:1]),dim=-1)
-    
-    # segments = center.unsqueeze(-2).unsqueeze(-2) + torch.cat((torch.cat(
-    #     (vec_towa_mid_2D.unsqueeze(-2).unsqueeze(-2),
-    #      -vec_towa_mid_2D.unsqueeze(-2).unsqueeze(-2)),dim=-2),torch.cat((
-    #          vec_orth_mid_2D.unsqueeze(-2).unsqueeze(-2),
-    #          -vec_orth_mid_2D.unsqueeze(-2).unsqueeze(-2)),dim=-2)),dim=-3)
-    # dim_3 =  torch.zeros_like(segments[...,0:1])
-    # tri_shape = len(surface_point.shape[:-1]) * [1] + [-1] + 4 * [1]
-    # segments = torch.cat((segments,dim_3+tris_rot[...,0,2:3].reshape(tri_shape)),-1).unsqueeze(-2)
-    
-    # face_rot_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [1] * 3 + [3] * 2
-    # # rotate segments back to 3D
-    # # tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
-    # fac_rot_inverse = face_rot_ms.double().reshape(face_rot_shape).transpose(-2,-1)
-    # segments_3D = torch.matmul(segments, fac_rot_inverse).squeeze(-2)
-    
-    # #segments_3D[...,-1] = segments_3D[...,-1] + 
-    # mid_points = mid_points.unsqueeze(-2)
-    # edge_dir_2D = edge_dir_2D.unsqueeze(-3)
-    # tris_2D_unit = tris_2D_unit.unsqueeze(-3)
-    # ## if inside of triangle, add the angle between them to count for that triangle/circle combo
-    # ## check if midpoints is inside triangle by checking if it is on same side of all edges
-    # ## https://stackoverflow.com/a/3461533
-    # mid_point_in_tri = torch.all(edge_dir_2D[...,0] * (mid_points[...,1]-tris_2D_unit[...,1]) - edge_dir_2D[...,1] * (mid_points[...,0]-tris_2D_unit[...,0]) > 0,dim=-1)   
-    # segments_3D[torch.logical_not(mid_point_in_tri)] = 0
-    
-    # # least squares plane from line segments 
-    # # https://www.geometrictools.com/Documentation/FitSegmentsByLineOrPlane.pdf
-    # segments_3D_shape = list(surface_point.shape[:-1]) + [-1] + [2,3]
-    # segments_3D = segments_3D.reshape(segments_3D_shape)
-    # segments_3D_mean = torch.mean(segments_3D, dim=-2)
-    # segments_3D_mean = segments_3D_mean.sum(dim=-2,keepdim=True) / segments_3D_mean.count_nonzero(dim=-2).unsqueeze(-2)
-    # segments_3D_dir = torch.diff(segments_3D, dim=-2)[...,0,:]
-    # segments_3D_mean_dir = segments_3D[...,0,:] - segments_3D_mean 
+        return surface_normals * -torch.sign(torch.sum(surface_normals * in_rays, dim=-1,keepdim=True))
 
-    # mask_shape = list(mid_point_in_tri.shape) + [2]
-    # linearized_segments_mask = mid_point_in_tri.unsqueeze(-1).expand(mask_shape).reshape(segments_3D_shape[:-2])
-    # segments_3D_mean_dir[torch.logical_not(linearized_segments_mask)] = 0 # should not contribute to outer product
-    
-    # # weighted sum of 3 outer products: 1/3 segments_3D_dir^2 + segments_3D_dir segments_3D_mean_dir + segments_3D_mean_dir^2
-    # segments_3D_dir_mat = 1/3 * torch.sum(torch.matmul(segments_3D_dir.unsqueeze(-1),segments_3D_dir.unsqueeze(-2)),dim=-3)
-    # segments_3D_dir_mean_dir_mat = 1/2 * torch.matmul(segments_3D_dir.unsqueeze(-1),segments_3D_mean_dir.unsqueeze(-2))
-    # segments_3D_dir_mean_dir_mat = torch.sum(segments_3D_dir_mean_dir_mat + segments_3D_dir_mean_dir_mat.transpose(-1,-2),dim=-3)
-    # segments_3D_mean_dir_mat = torch.sum(torch.matmul(segments_3D_mean_dir.unsqueeze(-1),segments_3D_mean_dir.unsqueeze(-2)),dim=-3)
-    
-    # norm_mat = segments_3D_dir_mat + segments_3D_dir_mean_dir_mat + segments_3D_mean_dir_mat
+    @staticmethod
+    def avgSpherePointsNormal(self, mesh, idxs_face, masks, surface_point):
+        normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+        for maskInd in range(len(masks)):
+            normals[maskInd,:] = torch.mean(mesh.faces_normals_packed()[idxs_face.squeeze()[maskInd, masks[maskInd].squeeze()],:], dim=0)
+        normals = normals.reshape(surface_point.shape)
+        return normals
 
-    # eig_return = torch.linalg.eigh(norm_mat)
-    # surface_normals = torch.real(eig_return.eigenvectors[...,0])
-    # # dif_angles_masked = masked_tensor(dif_angles, mid_point_in_tri )
-    # # angle_sum = torch.sum(dif_angles_masked,dim = -1)
-    # # # Assume that arc contributes face normal, which is not true
-    # # angle_sum_scaled = torch.nn.functional.normalize(angle_sum.to_tensor(0) * radius_2D,p=1,dim=-1).unsqueeze(-1)
-    # # normal_shape = [1]*len(angle_sum_scaled.shape[:-2]) + list(mesh.faces_normals_packed().shape)
-    # # normal_face = mesh.faces_normals_packed().reshape(normal_shape)
-    # # surface_normals = torch.sum(normal_face * angle_sum_scaled,dim=-2)
-    # print('values:',torch.real(eig_return[0]))
-    # print('vectos:',torch.real(eig_return[1]))
+    @staticmethod
+    def svdSpherePointsNormal(self, surface_point, sphereDirs, masks, in_rays):
 
-    # savemat('segments.mat',{'segments':segments_3D[linearized_segments_mask].numpy(force=True),'eigvec':torch.real(eig_return[1]).numpy(force=True),'eigval':torch.real(eig_return[0]).numpy(force=True)})
-
-    return surface_normals * -torch.sign(torch.sum(surface_normals * in_rays, dim=-1,keepdim=True))
-
-
-def avgSpherePoints(mesh, idxs_face, masks, surface_point):
-    normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-    for maskInd in range(len(masks)):
-        normals[maskInd,:] = torch.mean(mesh.faces_normals_packed()[idxs_face.squeeze()[maskInd, masks[maskInd].squeeze()],:], dim=0)
-    normals = normals.reshape(surface_point.shape)
-    return normals
-
-def svdSpherePoints(surface_point, sphereDirs, masks, in_rays):
-
-    normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-    for maskInd in range(len(masks)):
-        (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
-        normals[maskInd,:] = V[:, -1]
-    normals = normals.reshape(surface_point.shape)
-    return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
-
-
-
-def Barycentric(p,  tri):
-    a = torch.select(tri, -2, torch.tensor(0) ).unsqueeze(-2)
-    b = torch.select(tri, -2, torch.tensor(1) ).unsqueeze(-2)
-    c = torch.select(tri, -2, torch.tensor(2) ).unsqueeze(-2)
-    v0 = b - a
-    v1 = c - a
-    v2 = p - a
-    d00 = torch.sum(v0* v0,dim=-1)
-    d01 = torch.sum(v0* v1,dim=-1)
-    d11 = torch.sum(v1* v1,dim=-1)
-    d20 = torch.sum(v2* v0,dim=-1)
-    d21 = torch.sum(v2* v1,dim=-1)
-    denom = d00 * d11 - d01 * d01
-    
-    v = (d11 * d20 - d01 * d21) / denom
-    w = (d00 * d21 - d01 * d20) / denom
-    u = 1 - v - w
-    return  torch.cat((u.unsqueeze(-1),v.unsqueeze(-1),w.unsqueeze(-1)),dim=-2)
-
-
-    def mesh_normal_consistency(meshes):
-        """
-        Computes the normal consistency of each mesh in meshes.
-        We compute the normal consistency for each pair of neighboring faces.
-        If e = (v0, v1) is the connecting edge of two neighboring faces f0 and f1,
-        then the normal consistency between f0 and f1
-
-        .. code-block:: python
-
-                        a
-                        /\
-                    /  \
-                    / f0 \
-                    /      \
-                v0  /____e___\ v1
-                    \        /
-                    \      /
-                    \ f1 /
-                    \  /
-                        \/
-                        b
-
-        The normal consistency is
-
-        .. code-block:: python
-
-            nc(f0, f1) = 1 - cos(n0, n1)
-
-            where cos(n0, n1) = n0^n1 / ||n0|| / ||n1|| is the cosine of the angle
-            between the normals n0 and n1, and
-
-            n0 = (v1 - v0) x (a - v0)
-            n1 = - (v1 - v0) x (b - v0) = (b - v0) x (v1 - v0)
-
-        This means that if nc(f0, f1) = 0 then n0 and n1 point to the same
-        direction, while if nc(f0, f1) = 2 then n0 and n1 point opposite direction.
-
-        .. note::
-            For well-constructed meshes the assumption that only two faces share an
-            edge is true. This assumption could make the implementation easier and faster.
-            This implementation does not follow this assumption. All the faces sharing e,
-            which can be any in number, are discovered.
-
-        Args:
-            meshes: Meshes object with a batch of meshes.
-
-        Returns:
-            loss: Average normal consistency across the batch.
-            Returns 0 if meshes contains no meshes or all empty meshes.
-        """
-        if meshes.isempty():
-            return torch.tensor(
-                [0.0], dtype=torch.float32, device=meshes.device, requires_grad=True
-            )
-
-        N = len(meshes)
-        verts_packed = meshes.verts_packed()  # (sum(V_n), 3)
-        faces_packed = meshes.faces_packed()  # (sum(F_n), 3)
-        edges_packed = meshes.edges_packed()  # (sum(E_n), 2)
-        verts_packed_to_mesh_idx = meshes.verts_packed_to_mesh_idx()  # (sum(V_n),)
-        face_to_edge = meshes.faces_packed_to_edges_packed()  # (sum(F_n), 3)
-        E = edges_packed.shape[0]  # sum(E_n)
-        F = faces_packed.shape[0]  # sum(F_n)
-
-        # We don't want gradients for the following operation. The goal is to
-        # find for each edge e all the vertices associated with e. In the example
-        # above, the vertices associated with e are (a, b), i.e. the points connected
-        # on faces to e.
-        with torch.no_grad():
-            edge_idx = face_to_edge.reshape(F * 3)  # (3 * F,) indexes into edges
-            vert_idx = (
-                faces_packed.view(1, F, 3).expand(3, F, 3).transpose(0, 1).reshape(3 * F, 3)
-            )
-            edge_idx, edge_sort_idx = edge_idx.sort()
-            vert_idx = vert_idx[edge_sort_idx]
-
-            # In well constructed meshes each edge is shared by precisely 2 faces
-            # However, in many meshes, this assumption is not always satisfied.
-            # We want to find all faces that share an edge, a number which can
-            # vary and which depends on the topology.
-            # In particular, we find the vertices not on the edge on the shared faces.
-            # In the example above, we want to associate edge e with vertices a and b.
-            # This operation is done more efficiently in cpu with lists.
-            # TODO(gkioxari) find a better way to do this.
-
-            # edge_idx represents the index of the edge for each vertex. We can count
-            # the number of vertices which are associated with each edge.
-            # There can be a different number for each edge.
-            edge_num = edge_idx.bincount(minlength=E)
-
-            # This calculates all pairs of vertices which are opposite to the same edge.
-            vert_edge_pair_idx = _C.mesh_normal_consistency_find_verts(edge_num.cpu()).to(
-                edge_num.device
-            )
-
-        if vert_edge_pair_idx.shape[0] == 0:
-            return torch.tensor(
-                [0.0], dtype=torch.float32, device=meshes.device, requires_grad=True
-            )
-
-        v0_idx = edges_packed[edge_idx, 0]
-        v0 = verts_packed[v0_idx]
-        v1_idx = edges_packed[edge_idx, 1]
-        v1 = verts_packed[v1_idx]
-
-        # two of the following cross products are zeros as they are cross product
-        # with either (v1-v0)x(v1-v0) or (v1-v0)x(v0-v0)
-        n_temp0 = (v1 - v0).cross(verts_packed[vert_idx[:, 0]] - v0, dim=1)
-        n_temp1 = (v1 - v0).cross(verts_packed[vert_idx[:, 1]] - v0, dim=1)
-        n_temp2 = (v1 - v0).cross(verts_packed[vert_idx[:, 2]] - v0, dim=1)
-        n = n_temp0 + n_temp1 + n_temp2
-        n0 = n[vert_edge_pair_idx[:, 0]]
-        n1 = -n[vert_edge_pair_idx[:, 1]]
-        loss = 1 - torch.cosine_similarity(n0, n1, dim=1)
-
-        verts_packed_to_mesh_idx = verts_packed_to_mesh_idx[vert_idx[:, 0]]
-        verts_packed_to_mesh_idx = verts_packed_to_mesh_idx[vert_edge_pair_idx[:, 0]]
-        num_normals = verts_packed_to_mesh_idx.bincount(minlength=N)
-        weights = 1.0 / num_normals[verts_packed_to_mesh_idx].float()
-
-        loss = loss * weights
-        return loss.sum() / N
-
-    # @property
-    # def approach_axis(self):
-    #     return np.array([0, 0, 1])
-
-    # @property
-    # def approach_angle(self):
-    #     """The angle between the grasp approach axis and camera optical axis.
-    #     """
-    #     return 0.0
-
-    # @property
-    # def frame(self):
-    #     """The name of the frame of reference for the grasp."""
-    #     if self.camera_intr is None:
-
-    #         raise ValueError("Must specify camera intrinsics")
-    #     return self.camera_intr.frame
-
-
-
+        normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+        for maskInd in range(len(masks)):
+            (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
+            normals[maskInd,:] = V[:, -1]
+        normals = normals.reshape(surface_point.shape)
+        return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
 
 
     @property
@@ -1010,7 +778,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
 
     def compute_grasp_matrix(self, state, actions):
                 # Compute object center of mass.
-        object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
+        self.object_com = ParallelJawQualityFunction.compute_mesh_COM(state)
 
         bounding_box = state.get_bounding_boxes()
         bounding_lengths = torch.diff(bounding_box, dim=-1 )
@@ -1025,7 +793,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
 
         n_force = n_force.unsqueeze(0)
         cone = torch.mul(actions.compute_friction_cone(state,friction_coef=self._friction_coef), n_force)
-        torques = torch.mul(actions.torques(cone, object_com), n_force)
+        torques = torch.mul(actions.torques(cone, self.object_com), n_force)
 
             # def grasp_matrix(forces, torques, normals, torque_scaling, soft_fingers=False,
             #          finger_radius=0.005, friction_coef=0.5):
@@ -1055,26 +823,12 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
             with record_function("solveForIntersection"):
                 actions, faces_index, contactFound = actions.solveForIntersection(state)
         
-        G = self.compute_grasp_matrix(state,actions)
+        self.G = self.compute_grasp_matrix(state,actions)
         with record_function("minHull"):
-            closest = minHull.apply(G)
+            closest = CannyFerrariQualityFunction.find_min_dist_to_hull(self.G)
 
         return closest
-
-class qHullTorch(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, miniG):
-        miniGnumpy = miniG.numpy(force=True)
-        hull = ConvexHull(miniGnumpy)  
-        return torch.tensor(hull.simplices,dtype=torch.long)
-    @staticmethod
-    def backward(ctx, grad_output):
-        # miniG, = ctx.saved_tensors
-        # grad = torch.zeros(size=)
-        return None
-
-    # taken from: https://gist.github.com/dendenxu/ee5008acb5607195582e7983a384e644#file-moller_trumbore_winding_number_inside_mesh-py-L318
-class minHull():
+    
     @staticmethod
     def qp_wrap(facets):
         ### TODO solve QP over G to figure out sign
@@ -1094,6 +848,7 @@ class minHull():
         x = QPFunction(check_Q_spd=True)(P, q, G, h, A , b)
         dist = torch.sqrt(torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))/2)
         return dist, x, P
+    
     @staticmethod
     def min_norm_vector_in_facet(facet, wrench_regularizer=1e-10):
         """ Finds the minimum norm point in the convex hull of a given facet (aka simplex) by solving a QP.
@@ -1132,37 +887,8 @@ class minHull():
 
         return abs(min_norm), v, 2 * grasp_matrix
 
-    def forward_single_np(Q, p, G, h, A, b):
-        nz, neq, nineq = p.shape[0], A.shape[0] if A is not None else 0, G.shape[0]
-
-        z_ = cp.Variable(nz)
-
-        obj = cp.Minimize(0.5 * cp.quad_form(z_, Q) + p.T @ z_)
-        eqCon = A @ z_ == b if neq > 0 else None
-        if nineq > 0:
-            slacks = cp.Variable(nineq)
-            ineqCon = G @ z_ + slacks == h
-            slacksCon = slacks >= 0
-        else:
-            ineqCon = slacks = slacksCon = None
-        cons = [x for x in [eqCon, ineqCon, slacksCon] if x is not None]
-        prob = cp.Problem(obj, cons)
-        prob.solve()  # solver=cp.SCS, max_iters=5000, verbose=False)
-        # prob.solve(solver=cp.SCS, max_iters=10000, verbose=True)
-        assert('optimal' in prob.status)
-        zhat = np.array(z_.value).ravel()
-        nu = np.array(eqCon.dual_value).ravel() if eqCon is not None else None
-        if ineqCon is not None:
-            lam = np.array(ineqCon.dual_value).ravel()
-            slacks = np.array(slacks.value).ravel()
-        else:
-            lam = slacks = None
-
-        return prob.value, zhat, nu, lam, slacks
     @staticmethod
     def distWrap(G_unwrapped):
-      
-  
         facets_local = []
         lengths = []
         with record_function("ConvexHull-Loop"):
@@ -1176,39 +902,38 @@ class minHull():
         ### reassemble simplices into batch may be too many and need to serialize
         ## maybe we only (re)compute the important one in pytorch, drop others for memory
         with record_function("qp_wrap"):
-            dist,x,P = minHull.qp_wrap(facets)
+            dist,x,P = CannyFerrariQualityFunction.qp_wrap(facets)
         return dist, lengths, x, facets
     
     @staticmethod
-    def apply(G):
-        """
-        In the forward pass we receive a Tensor containing the input and return
-        a Tensor containing the output. ctx is a context object that can be used
-        to stash information for backward computation. You can cache arbitrary
-        objects for use in the backward pass using the ctx.save_for_backward method.
-        """
-        
+    def find_min_dist_to_hull(G):       
         original_shape = G.shape
         G_unwrapped = G.view((original_shape[0]*original_shape[1], -1, 6))
-        dist, lengths, x, facets = minHull.distWrap(G_unwrapped)
-
+        dist, lengths, x, facets = CannyFerrariQualityFunction.distWrap(G_unwrapped)
 
         start_ind = 0
         closest = torch.zeros(len(lengths),1, dtype=torch.float64)
         for index,length in enumerate(lengths):
-        # todo reshape back to batch dim
             end_ind = start_ind + length
             dist_local = dist[start_ind:end_ind]
             minReturn = torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0)
             closest[index] = minReturn.values
             start_ind = end_ind
-
-        # print("closest point: ", x[minReturn.indices])
-        # print("vert vals: ",facets[minReturn.indices])
         return closest
-    
 
     dtype=torch.float64
+
+class qHullTorch(torch.autograd.Function):
+    @staticmethod
+    def forward(_, miniG):
+        miniGnumpy = miniG.numpy(force=True)
+        hull = ConvexHull(miniGnumpy)  
+        return torch.tensor(hull.simplices,dtype=torch.long)
+    @staticmethod
+    def backward(_, grad_output):
+        # miniG, = ctx.saved_tensors
+        # grad = torch.zeros(size=)
+        return None
     
 class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
     """Measures the distance to the estimated center of mass for antipodal
@@ -1285,58 +1010,6 @@ def multi_gather_tris(v: torch.Tensor, f: torch.Tensor, dim=-2) -> torch.Tensor:
     remainder = shape.flip(0)[:(len(shape) - dim - 1) % len(shape)]
     return multi_gather(v, f.view(*f.shape[:-2], -1), dim=dim).view(*f.shape, *remainder)  # B, F, 3, 3
 
-
-def linear_indexing(index: torch.Tensor, shape: torch.Size, dim=0):
-    assert index.ndim == 1
-    shape = list(shape)
-    dim = dim if dim >= 0 else len(shape) + dim
-    front_pad = dim
-    back_pad = len(shape) - dim - 1
-    for _ in range(front_pad):
-        index = index.unsqueeze(0)
-    for _ in range(back_pad):
-        index = index.unsqueeze(-1)
-    expand_shape = shape
-    expand_shape[dim] = -1
-    return index.expand(*expand_shape)
-
-
-def linear_gather(values: torch.Tensor, index: torch.Tensor, dim=0):
-    # only taking linea indices as input
-    return values.gather(dim, linear_indexing(index, values.shape, dim))
-
-
-def linear_scatter(target: torch.Tensor, index: torch.Tensor, values: torch.Tensor, dim=0):
-    return target.scatter(dim, linear_indexing(index, values.shape, dim), values)
-
-
-def linear_scatter_(target: torch.Tensor, index: torch.Tensor, values: torch.Tensor, dim=0):
-    return target.scatter_(dim, linear_indexing(index, values.shape, dim), values)
-
-def ray_stabbing(pts: torch.Tensor, verts: torch.Tensor, faces: torch.Tensor, multiplier: int = 1):
-    """
-    Check whether a bunch of points is inside the mesh defined by verts and faces
-    effectively calculating their occupancy values
-    Parameters
-    ----------
-    ray_o : torch.Tensor(float), (n_rays, 3)
-    verts : torch.Tensor(float), (n_verts, 3)
-    faces : torch.Tensor(long), (n_faces, 3)
-    """
-    n_rays = pts.shape[0]
-    pts = pts[None].expand(multiplier, n_rays, -1)
-    pts = pts.reshape(-1, 3)
-    ray_d = torch.rand_like(pts)  # (n_rays, 3)
-    ray_d = normalize(ray_d)  # (n_rays, 3)
-    # 251,252
-    u, v, t = moller_trumbore(pts, ray_d, multi_gather_tris(verts, faces))  # (n_rays, n_faces, 3)
-    inside = ((t >= 0.0) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
-    inside = (inside.count_nonzero(dim=-1) % 2).bool()  # if mod 2 is 0, even, outside, inside is odd
-    inside = inside.view(multiplier, n_rays, -1)
-    inside = inside.sum(dim=0) / multiplier  # any show inside mesh
-    return inside
-
-
 def moller_trumbore(ray_o, ray_d, tris , eps=1e-8):
     """
     The Moller Trumbore algorithm for fast ray triangle intersection
@@ -1366,7 +1039,6 @@ def moller_trumbore(ray_o, ray_d, tris , eps=1e-8):
     return u, v, t
 
 # Our code
-
 def pytorch_setup():
         # set PyTorch device, use cuda if available
         if torch.cuda.is_available():
