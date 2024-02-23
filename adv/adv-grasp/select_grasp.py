@@ -30,10 +30,10 @@ class Grasp:
 
 	# SET UP LOGGING
 	logger = logging.getLogger('select_grasp')
-	logger.setLevel(logging.INFO)
+	logger.setLevel(logging.DEBUG)
 	if not logger.handlers:
 		ch = logging.StreamHandler()
-		ch.setLevel(logging.INFO)
+		ch.setLevel(logging.DEBUG)
 		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
@@ -131,8 +131,8 @@ class Grasp:
 			self.quality = torch.tensor([quality]).to(device).float().unsqueeze(0)
 		elif isinstance(quality, list):
 			self.quality = torch.from_numpy(np.array(quality)).to(device).float()
-		if self.im_axis != None and self.im_axis.dim() == 1:
-			self.im_axis = self.im_axis.unsqueeze(0)
+		if self.quality != None and self.quality.dim() == 1:
+			self.qualilty = self.quality.unsqueeze(0)
 
 		self.prediction = prediction
 		if isinstance(prediction, float):
@@ -446,8 +446,8 @@ class Grasp:
 		while len(cands) < num_samples:
 
 			# randomly sample surface points for possible grasps
-			samples_c0 = sample_points_from_meshes(mesh, num_samples*1500)[0]
-			samples_c1 = sample_points_from_meshes(mesh, num_samples*1500)[0]
+			samples_c0 = sample_points_from_meshes(mesh, num_samples*1000)[0]
+			samples_c1 = sample_points_from_meshes(mesh, num_samples*1000)[0]
 			norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
 
 			# mask to eliminate grasps that don't fit in the gripper
@@ -497,43 +497,65 @@ class Grasp:
 			if len(results) > 0:
 				it += 1
 
-		# transform successful grasps to image space
-		ret_grasps = []
+		# transform successful grasps to image space and convert to Grasp object
+
+		grasp_dict = {"world_center": [], "world_axis": [], "c0": [], "c1": [], "quality": []}
 		for i in range(len(cands)):
-			if len(ret_grasps) >= num_samples:
-				break
+
+			# return final grasp batch
+			if len(grasp_dict["c0"]) >= num_samples:
+				for key in ["c0", "c1", "quality"]:
+					grasp_dict[key] = torch.tensor(grasp_dict[key]).to(renderer.device).float()
+					print("key:", key, "\tshape:", grasp_dict[key].shape)
+
+				grasp = cls.init_from_dict(grasp_dict)
+
+				if kwargs["sort"]:
+					sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
+					grasp.world_center = torch.index_select(grasp.world_center, 0, sort_indices)
+					grasp.world_axis = torch.index_select(grasp.world_axis, 0, sort_indices)
+					grasp.c0 = torch.index_select(grasp.c0, 0, sort_indices)
+					grasp.c1 = torch.index_select(grasp.c1, 0, sort_indices)
+					grasp.quality = torch.index_select(grasp.quality, 0, sort_indices)
+
+				grasp.trans_world_to_im(renderer.camera)
+
+				if kwargs["save_grasp"]:
+					json_name = kwargs["save_grasp"] + ".json"
+					grasp.save(json_name)
+
+				return grasp
 
 			g = cands[i]
 			quality = g[2]
 
-			# if quality <= kwargs["max_qual"] and quality >= kwargs["min_qual"]:	# server.py checks quality
-			contact0 = torch.tensor(g[-2][0]).to(renderer.device)
-			contact1 = torch.tensor(g[-2][1]).to(renderer.device)
-			world_center = world_centers_batch[g[-1]][g[0]]
-			world_axis = world_axes_batch[g[-1]][g[0]]
+			wc, wa = grasp_dict["world_center"], grasp_dict["world_axis"]
+			if i == 0:
+				grasp_dict["world_center"] = world_centers_batch[g[-1]][g[0]].unsqueeze(0)
+				grasp_dict["world_axis"] = world_axes_batch[g[-1]][g[0]].unsqueeze(0)
+			else:
+				grasp_dict["world_center"] = torch.cat((wc, world_centers_batch[g[-1]][g[0]].unsqueeze(0)), 0)
+				grasp_dict["world_axis"] = torch.cat((wa, world_axes_batch[g[-1]][g[0]].unsqueeze(0)), 0)
+			grasp_dict["c0"] += [g[-2][0]]
+			grasp_dict["c1"] += [g[-2][1]]
+			grasp_dict["quality"] += [quality]
 
-			grasp = Grasp(world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality, oracle_method="dexnet", oracle_robust=kwargs["oracle_robust"])
-			grasp.trans_world_to_im(renderer.camera)
 
 			if kwargs["save_grasp"]: 	# and i<num_samples:
 				# save object to visualize grasp, grasp json, and approx. image of grasp
+				contact0, contact1 = torch.tensor(g[-2][0]).unsqueeze(0).to(renderer.device).float(), torch.tensor(g[-2][1]).unsqueeze(0).to(renderer.device).float()
 				if kwargs["save_grasp"][-1] == "/":
 					kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
-				cls.logger.info("\nsaving new grasp visualization object")
+				cls.logger.info("saving new grasp visualization object")
 				obj_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".obj"
 				json_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".json"
 				img_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".png"
 				renderer.grasp_sphere((contact0, contact1), mesh, obj_name)
-				grasp.save(json_name)
-				renderer.draw_grasp(mesh, grasp.c0, grasp.c1, title=img_name, save=img_name)
+				temp_grasp = Grasp(world_center=world_centers_batch[g[-1]][g[0]].unsqueeze(0), world_axis=world_axes_batch[g[-1]][g[0]].unsqueeze(0), c0=contact0, c1=contact1, quality=quality)
+				temp_grasp.save(json_name)
+				renderer.draw_grasp(mesh, contact0, contact1, title=img_name, save=img_name)
 
-			ret_grasps.append(grasp)
-
-		if kwargs["sort"]:
-			# sort grasps in descending order of quality
-			ret_grasps.sort(key=lambda x: x.quality, reverse=True)
-
-		return ret_grasps[:num_samples]
+		cls.logger.error("Error - sample_grasps with batching isn't working.")
 
 	def extract_tensors(self, d_im):
 		"""
@@ -607,32 +629,33 @@ class Grasp:
 			center=(cx, cy)
 		)
 
-		torch_rotated2 = transforms.functional.affine(
-			translated_only,
-			theta,
-			translate=(0, 0),
-			scale=1,
-			shear=0, 
-			interpolation=transforms.InterpolationMode.BILINEAR,
-			center=(torch_image_tensor.shape[2] / 2, torch_image_tensor.shape[1] / 2)
-		)
+		# torch_rotated2 = transforms.functional.affine(
+		# 	translated_only,
+		# 	theta,
+		# 	translate=(0, 0),
+		# 	scale=1,
+		# 	shear=0, 
+		# 	interpolation=transforms.InterpolationMode.BILINEAR,
+		# 	center=(torch_image_tensor.shape[2] / 2, torch_image_tensor.shape[1] / 2)
+		# )
 
-		# for debugging - rotation only, no translation
-		rotated_only = transforms.functional.affine(
-			torch_image_tensor,
-			theta,
-			translate=(0,0),
-			scale=1,
-			shear=0,
-			interpolation=transforms.InterpolationMode.BILINEAR,
-			center=(cx, cy)
-		)
+		# # for debugging - rotation only, no translation
+		# rotated_only = transforms.functional.affine(
+		# 	torch_image_tensor,
+		# 	theta,
+		# 	translate=(0,0),
+		# 	scale=1,
+		# 	shear=0,
+		# 	interpolation=transforms.InterpolationMode.BILINEAR,
+		# 	center=(cx, cy)
+		# )
 
 		# 3 - crop image to size (32, 32)
 		torch_cropped = transforms.functional.crop(torch_rotated, cy-17, cx-17, 32, 32)
 		image_tensor = torch_cropped.unsqueeze(0)
 
-		return pose_tensor, torch_image_tensor, translated_only, rotated_only, torch_rotated, image_tensor, torch_rotated2
+		return pose_tensor, image_tensor
+		# return pose_tensor, torch_image_tensor, translated_only, rotated_only, torch_rotated, image_tensor, torch_rotated2
 
 	def extract_tensors_batch(self, dims):
 
@@ -648,7 +671,17 @@ class Grasp:
 			Grasp.logger.error("Grasp is not in 2D, must convert with camera intrinsics before tensor extraction.")
 			return None, None
 
-		batch_size = dims.shape[0]	# dims.shape: [batch_size, 1, 480, 640] = [batch_size, channels, H, W]
+		# dims.shape: [batch_size, 1, 480, 640] = [batch_size, channels, H, W]
+		if self.c0.dim() == 4:
+			batch_size = self.c0.shape
+			if dims.dim() == 3:
+				dims = dims.repeat(batch_size, 1, 1, 1)
+			elif dims.shape[0] != batch_size:
+				dims = dims[0].repeat(batch_size, 1, 1, 1)
+		else:
+			batch_size = 1
+			if dims.dim() == 4:
+				dims = dims.squeeze(0)
 
 		# construct pose tensor from grasp depth
 		pose_tensor = self.depth
@@ -680,7 +713,6 @@ class Grasp:
 
 		#	rotation matrix
 		theta = self.im_angle.squeeze()	# no -1 for counter-clockwise, stay in radians
-		print("angle:", theta[0])
 		cos = torch.cos(theta)
 		sin = torch.sin(theta)
 
@@ -689,21 +721,10 @@ class Grasp:
 		rotation[indices, 1, 1] = cos
 		rotation[indices, 0, 1] = -1 * sin
 		rotation[indices, 1, 0] = sin
-		print("rotation matrix:", rotation[0])
-
-		# based on https://github.com/pytorch/vision/blob/f21c6bd8ca5cd057fc3d1e0dc5ea8f6403dc144f/torchvision/transforms/functional.py#L1039
-		# 	and https://github.com/pytorch/vision/blob/f21c6bd8ca5cd057fc3d1e0dc5ea8f6403dc144f/torchvision/transforms/functional.py#L1225 
-		rotation2 = rotation.clone()
-		rotation2[indices, 0, 2] = 2 * ((rotation2[indices, 0, 0] * -0.5) + (rotation2[indices, 0, 1]) - 0.5) / dims_resized.shape[-1]
-		rotation2[indices, 1, 2] = 2 * ((rotation2[indices, 1, 0] * -0.5) + (rotation2[indices, 1, 1])) / dims_resized.shape[-2]
-		print("rotation2 matrix:", rotation2[0])
 
 		#	apply transformations
-		# 		translation then rotation (combined)
-		# 		trans_rot_mat = torch.matmul(rotation, translate)[:, :2, :]
 		translate_mat = translate[:, :2, :]
 		rotation_mat = rotation[:, :2, :]
-		rotation2_mat = rotation2[:, :2, :]
 		
 		# 	translation only
 		trans_grid = torch.nn.functional.affine_grid(translate_mat, dims_resized.shape)
@@ -713,33 +734,15 @@ class Grasp:
 		rot_grid = torch.nn.functional.affine_grid(rotation_mat, dims_resized.shape)
 		rot_only = torch.nn.functional.grid_sample(dims_resized, rot_grid)
 
-		#	rotation2 only
-		rot2_grid = torch.nn.functional.affine_grid(rotation2_mat, dims_resized.shape)
-		rot2_only = torch.nn.functional.grid_sample(dims_resized, rot2_grid)
-
-		# 	translation then rotation (both applied separately )
+		# 	translation then rotation (applied separately)
 		trans_then_rot = torch.nn.functional.grid_sample(trans_only, rot_grid)
-		trans_then_rot2 = torch.nn.functional.grid_sample(trans_only, rot2_grid)
-
-		# another potential way to apply tranlsation then rotation separately
-		# trans_then_rot_grid = torch.nn.functional.grid_sample(trans_grid, rot_grid)
-		# trans_then_rot2 = torch.nn.functional.grid_sample(dims_resized, trans_then_rot_grid)
-
-		# affine_mat = torch.matmul(rotation, translate)
-		# affine_mat = affine_mat[:, :2, :]
-		# affine_grid = torch.nn.functional.affine_grid(affine_mat, dims_resized.shape)
-		# dims_transformed = torch.nn.functional.grid_sample(dims_resized, affine_grid)
 
 		# 3 - crop images to 32x32 pixels
-		top = dims_resized.shape[2] // 2 - 17	# 65
+		top = dims_resized.shape[2] // 2 - 17	# 63
 		left = dims_resized.shape[3] // 2 - 17	# 89
-		print("height:", top, top+32)			# 95
-		print("width:", left, left+32)			# 121
-		dims_transformed = trans_then_rot[:, :, 63:95, 89:121] #dims_transformed[:, :, 64:96, 90:122]
-		dims_transformed2 = trans_then_rot2[:, :, 63:95, 89:121]
-		print("dims_transformed:", dims_transformed.shape)
+		dims_transformed = trans_then_rot[:, :, top:top+32, left:left+32]	# [:, :, 63:95, 89:121]
 
-		return pose_tensor, dims_resized, trans_only, rot_only, rot2_only, trans_then_rot, dims_transformed, dims_transformed2
+		return pose_tensor, dims_transformed
 
 	def oracle_eval(self, obj_file, oracle_method=None, robust=None, renderer=None):
 		"""
@@ -867,36 +870,41 @@ def save_nparr(image, filename):
 def test_select_grasp():
 	Grasp.logger.info("Running test_select_grasp...")
 
+	renderer1 = Renderer()
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(model=model)
-
-	# # TESTING TENSOR EXTRACTION AND VISUALIZATION
-	renderer1 = Renderer()
-	# depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
-	# grasp = Grasp(
-	# 	depth=0.607433762324266, 
-	# 	im_center=(416, 286), 
-	# 	im_angle=-2.896613990462929, 
-	# )
-	# pose, image = grasp.extract_tensors(depth0)	# tensor extraction
-	# print("prediction:", run1.run(pose, image))		# gqcnn prediction
-	# renderer1.display(image)
+	run1 = Attack(model=model, renderer=renderer1)
 
 	# TESTING GRASP SAMPLING
 	mesh, image = renderer1.render_object("data/new_barclamp.obj", display=True, title="imported renderer")
 	d_im = renderer1.mesh_to_depth_im(mesh, display=True)
+	dims = d_im.repeat(3, 1, 1, 1)
 
-	grasps = Grasp.sample_grasps("data/new_barclamp.obj", 10, renderer=renderer1) #, save_grasp="example-grasps", sort=False)
-	for i in range(len(grasps)):
-		grasp = grasps[i]
-		qual = grasp.quality
-		pose, image = grasp.extract_tensors(d_im)
-		prediction = run1.run(pose, image)
-		print("\nprediction size:", prediction.shape, prediction)
-		t = "id: " + str(i) + " prediction: " + str(prediction[0][0].item()) + "\noracle quality: " + str(qual.item()) #grasp.title_str()
-		fname = "example-grasps/grasp_" + str(i) + "_pred.png"
-		renderer1.display(image, title=t)	#, save=True, fname=fname)
+	grasp = Grasp.sample_grasps("data/new_barclamp.obj", 3, renderer=renderer1) #, save_grasp = "example-grasps/batch-test")
+
+	print("im_center shape:", grasp.im_center.shape)
+	print("im_axis shape:", grasp.im_axis.shape)
+	print("angle shape:", grasp.im_angle.shape, "\n\n")
+	print("world_center shape:", grasp.world_center.shape)
+	print("world_axis shape:", grasp.world_axis.shape)
+	print("c0 shape:", grasp.c0.shape)
+	print("c1 shape:", grasp.c1.shape)
+	print("quality:", grasp.quality.shape)
+	print(grasp.quality, "\n")
+
+	poses, images = grasp.extract_tensors_batch(dims)
+	pred = run1.run(poses, images)
+	print("prediction:", pred.shape, "\n", pred)
+	
+	# for i in range(len(grasps)):
+	# 	grasp = grasps[i]
+	# 	qual = grasp.quality
+	# 	pose, image = grasp.extract_tensors(d_im)
+	# 	prediction = run1.run(pose, image)
+	# 	print("\nprediction size:", prediction.shape, prediction)
+	# 	t = "id: " + str(i) + " prediction: " + str(prediction[0][0].item()) + "\noracle quality: " + str(qual.item()) #grasp.title_str()
+	# 	fname = "example-grasps/grasp_" + str(i) + "_pred.png"
+	# 	renderer1.display(image, title=t)	#, save=True, fname=fname)
 
 	Grasp.logger.info("Finished running test_select_grasp.")
 
@@ -1162,14 +1170,16 @@ def test_batching():
 	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
 	dim = r.mesh_to_depth_im(mesh, display=False)
 	dims = dim.repeat(4, 1, 1, 1)
-	pose0, _, _, _, _, image0 = g0.extract_tensors(dim)
-	poses, _, _, _, _, images = gb.extract_tensors_batch(dims)
+	pose0, image0 = g0.extract_tensors(dim)
+	poses, images = gb.extract_tensors_batch(dims)
+
+	assert torch.max(pose0 - poses[0]) == 0
 
 	image1 = images[0]
 	pose1 = poses[0]
 	
 	diff = image1 - image0
-	print("diff:", torch.max(diff))
+	Grasp.logger.debug("processed image diff: %f", torch.max(diff))
 
 	# if torch.max(diff).item() > 0:
 	# 	r.display(image0, title="extract_tensors")
@@ -1180,12 +1190,17 @@ def test_batching():
 	model = KitModel("weights.npy")
 	model.eval()
 	run1 = Attack(model=model)
-	print("extract_tensors:", run1.run(pose0, image0)[0][0].item())	#, g0.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=True, renderer=r))
-	print("extract_tensors_batch:", run1.run(poses, images)[0][0].item())
+	pred0, pred1 = run1.run(pose0, image0)[0][0].item(), run1.run(poses, images)[0][0].item()
+	Grasp.logger.debug("extract_tensors: %f", pred0)
+	Grasp.logger.debug("extract_tensors_batch: %f", pred1)
+	Grasp.logger.debug("prediction diff: %f", pred1 - pred0)
 
 	Grasp.logger.info("Finished running test_batching.")
 
 def test_processing_batching():
+
+	Grasp.logger.error("test_processing_batching was only for debugging - no longer functional")
+	return None
 
 	Grasp.logger.info("Running test_processing_batching...")
 
@@ -1253,125 +1268,23 @@ def test_processing_batching():
 	print("prediction diff:", pred0 - pred1)
 	print("prediction diff:", pred0 - pred2)
 
-	# grasp_pic = r.draw_grasp(image, g0.c0, g0.c1, display=False)
-	# grasp_sphere = r.grasp_sphere((g0.c0, g0.c1), mesh, display=False)
-	# display_images2 = [grasp_pic, grasp_sphere, crop, crop0]
-	# display_titles2 = ["grasp axis", "grasp vis", "non-batch: " + str(pred0), "batch: " + str(pred1)]
-	# r.display(display_images2, shape=(1,4), title=display_titles2)
+	grasp_pic = r.draw_grasp(image, g0.c0, g0.c1, display=False)
+	grasp_sphere = r.grasp_sphere((g0.c0, g0.c1), mesh, display=False)
+	display_images2 = [grasp_pic, grasp_sphere, "", crop, crop0, crop1]
+	display_titles2 = ["grasp axis", "grasp vis", "", "non-batch: " + str(pred0), "batch: " + str(pred1), "batch2: " + str(pred2)]
+	r.display(display_images2, shape=(2,3), title=display_titles2)
 
 	# test = torch.from_numpy(np.load("data/grasp_test2.npy")).permute(0,3,1,2)
 	# r.display(test, title="gqcnn grasp_to_tensors")
 
 	Grasp.logger.info("Finished running test_processing_batching.")
 
-def temp_torchvision_matrix():
-	r = Renderer()
-	mesh, image = r.render_object("data/new_barclamp.obj", display=False)
-	dim = r.mesh_to_depth_im(mesh, display=False)
-	g0 = Grasp.read("example-grasps/grasp_0.json")
-	pose, resized, trans, rot3, trans_rot, crop, rot2 = g0.extract_tensors(dim)
-	# print("resized dim dimensions:", resized.shape[-2:])
-	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
-	gb = Grasp.read_batch(files)
-	dims = dim.repeat(4, 1, 1, 1)
-	pose_b, resized_b, trans_b, rot_b, trans_rot_b, crop_b = gb.extract_tensors_batch(dims)
-
-	center = [106, 80]
-	height, width = 160, 213
-	# cx, cy = center
-	center_f = [1.0 * (c - s * 0.5) for c, s in zip(center, [width, height])]
-	print("\ncenter_f:", center_f)
-	cx, cy = center_f
-
-	sx, sy, tx, ty = 0, 0, 0, 0
-	scale = 1
-	theta = -1 * math.degrees(g0.im_angle.item())
-	rot = math.radians(theta)
-	assert rot == -1 * g0.im_angle.item(), "conversion radians --> degrees --> radians not good"
-	assert math.radians(0) == 0, "conversion degrees --> radians for 0 not good"
-
-	a = math.cos(rot - sy) / math.cos(sy)
-	b = -math.cos(rot - sy) * math.tan(sx) / math.cos(sy) - math.sin(rot)
-	c = math.sin(rot - sy) / math.cos(sy)
-	d = -math.sin(rot - sy) * math.tan(sx) / math.cos(sy) + math.cos(rot)
-
-	matrix = [d, -b, 0.0, -c, a, 0.0]
-	matrix = [x / scale for x in matrix]
-
-	matrix[2] += matrix[0] * (-cx - tx) + matrix[1] * (-cy - ty)
-	matrix[5] += matrix[3] * (-cx - tx) + matrix[4] * (-cy - ty)
-	
-	matrix[2] += cx
-	matrix[5] += cy
-
-	mat2 = matrix[0] * (-cx) + matrix[1] * (-cy) + cx
-	mat5 = matrix[3] * (-cx) + matrix[4] * (-cy) + cy
-	print("\nmat2:", mat2, "\nmat5:", mat5)
-
-	# print("\n", resized.shape[-2], height)
-	# print("\n", resized.shape[-1], width)
-	# dim_cx = dims.shape[3] // 2	# 320
-	# dim_cy = dims.shape[2] // 2	# 240
-
-	u = 2 * mat2 / (resized.shape[-1])
-	v = 2 * mat5 / (resized.shape[-2])
-
-	rot_mat = torch.tensor(matrix).reshape(1, 2, 3).to(r.device)
-	print("\n\nmatrix:", rot_mat)
-
-	rot_mat[0][0][2] = u
-	rot_mat[0][1][2] = v
-	print("\n\nrot_mat:", rot_mat)
-	rot_mat = torch.cat((rot_mat, rot_mat, rot_mat, rot_mat), 0)
-	rot_grid = torch.nn.functional.affine_grid(rot_mat, resized_b.shape)
-	rot_only = torch.nn.functional.grid_sample(resized_b, rot_grid)
-	rot0 = rot_only[0]
-
-	# print("rot diff:", torch.max(rot3 - rot0).item())
-	r.display([rot3, rot0, rot_b[0], (rot3-rot3), (rot3-rot0), (rot3-rot_b[0])], shape=(2, 3), title=["t matrix", "batch", "batch w t", "no diff", "batch diff", "batch w t diff"])
-
-	rot_only = rot_only[:, :, 63:95, 89:121]
-	model = KitModel("weights.npy")
-	model.eval()
-	run1 = Attack(model=model, renderer=r)
-	pred0 = run1.run(pose, crop)[0][0].item()
-	print("extract_tensors:", pred0)
-	pred1 = run1.run(pose_b, crop_b)[0][0].item()
-	print("extract_tensors_batch:", pred1)
-	pred2 = run1.run(pose_b, rot_only)[0][0].item()
-	print("batch w t:", pred2)
-
-	# print("batch rot diff:", torch.max(rot0 - rot_b[0]).item())
-	# r.display([rot_b[0], rot0, (rot_b[0]-rot0)], shape=(1, 3), title=["batch", "batch w c", "diff"])
-
-	# # _gen_affine_grid
-	# shape = resized.shape
-	# w, h, ow, oh = shape[-1], shape[-2], shape[-1], shape[-2]
-	# d = 0.5
-	# base_grid = torch.empty(1, oh, ow, 3)
-	# x_grid = torch.linspace(-ow * 0.5 + d, ow * 0.5 + d - 1, steps=ow)
-	# base_grid[..., 0].copy_(x_grid)
-	# y_grid = torch.linspace(-oh * 0.5 + d, oh * 0.5 + d - 1, steps=oh).unsqueeze_(-1)
-	# base_grid[..., 1].copy_(y_grid)
-	# base_grid[..., 2].fill_(1)
-
-	# rescaled_theta = theta.transpose(1, 2) / torch.tensor([0.5 * w, 0.5 * h])
-	# output_grid = base_grid.view(1, oh * ow, 3).bmm(rescaled_theta)
-	# grid = output_grid.view(1, oh, ow, 2).to(r.device)
-	# print("\ngrid shape:", grid.shape)
-	# img = torch.nn.functional.grid_sample(resized, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
-
-	# print(img.shape)
-	# r.display(img, title="torchvision")
-
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
-	# test_select_grasp()
+	test_select_grasp()
 	# test_save_and_load_grasps()
 	# test_oracle_selection()
 	# test_oracle_eval()
 	# test_batching()
-	test_processing_batching()
-	# temp_torchvision_matrix()
 

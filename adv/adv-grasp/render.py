@@ -233,17 +233,17 @@ class Renderer:
 			elif isinstance(image, np.ndarray):
 				if image.shape[0] == 1:
 					image = np.squeeze(image, axis=0)
-			else:
+			elif image != "":
 				Renderer.logger.error("display - List elements must be Torch.tensors, np.ndarrays, and/or Meshes objects")
 				return None
 
-			fig.add_subplot(rows, cols, i+1)
-
-			# showing image 
-			plt.imshow(image) 
-			plt.axis('off') 
-			if isinstance(title, list) and isinstance(title[i], str):
-				plt.title(title[i])		
+			if image != "":
+				fig.add_subplot(rows, cols, i+1)
+				plt.axis('off') 
+				# showing image 
+				plt.imshow(image) 
+				if isinstance(title, list) and isinstance(title[i], str):
+					plt.title(title[i])		
 
 		plt.show()
 
