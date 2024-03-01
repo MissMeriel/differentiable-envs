@@ -46,7 +46,7 @@ class Attack:
 
 		self.loss_weights = {
 			"edge": 5,
-			"normal": 2,
+			"normal": 0.4,
 			"smooth": 5
 		}
 		self.losses = None
@@ -83,7 +83,7 @@ class Attack:
 		ax.set_xlabel("Iteration", fontsize="16")
 		ax.set_ylabel("Loss", fontsize="16")
 		ax.set_title("Loss vs iterations", fontsize="18")
-		plt.show()
+		# plt.show()
 		plt.savefig(dir+"losses.png")
 
 	def calc_loss(self, adv_mesh, grasp):
@@ -92,10 +92,8 @@ class Attack:
 
 		Parameters
 		----------
-		pose_tensor: {batch_size} x 1 torch.tensor
-		image_tensor: {batch_size} x 32 x 32 x 1 torch.tensor
-		oracle_pred: List of size {batch_size}
-			Oracle predicted values of each grasp
+		adv_mesh:
+		grasp:
 		Returns
 		-------
 		float: calculated loss
@@ -104,14 +102,15 @@ class Attack:
 		# CHECK CURRENT MODEL PREDICTION
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
-		pose, image = grasp.extract_tensors(dim)
+		pose, image = grasp.extract_tensors_batch(dim)
 		out = self.run(pose, image)
-		cur_pred = out[0][0]
-		cur_pred = cur_pred.to(adv_mesh.device)
-		oracle_pred = torch.tensor([float(grasp.quality)], requires_grad=False, device=adv_mesh.device)
+		cur_pred = out[:, 0].unsqueeze(1).to(adv_mesh.device)
+		oracle_pred = torch.clone(grasp.quality) / 0.002	# scale to model range
+		assert oracle_pred.shape[0] == 10
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
-		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
+		# max = torch.ones(oracle_pred.shape).to(adv_mesh.device)
+		loss = torch.sub(1.0, torch.abs(torch.sub(torch.mean(cur_pred), torch.mean(oracle_pred))))
 
 		# WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
 		edge_loss = mesh_edge_loss(adv_mesh) * self.loss_weights["edge"]
@@ -123,7 +122,10 @@ class Attack:
 		self.losses["normal"].append(normal_loss.item())
 		self.losses["smoothing"].append(smooth_loss.item())
 
-		return weighted_loss, cur_pred
+		data = ("\n\tModel prediction mean: " + str(torch.mean(cur_pred).item()) + "\n\tModel prediction: " + str(cur_pred.detach().cpu().numpy().tolist()) 
+			+ f"\n\tPrediction loss: {loss}\n\tNormal consistency loss: {normal_loss}\n\tLaplacian smoothing loss: {smooth_loss}\n\tMesh edge loss: {edge_loss}\n\tWeighted loss: {weighted_loss}")
+
+		return weighted_loss, torch.mean(cur_pred), data
 
 	def perturb(self, mesh, param, grasp):
 		"""
@@ -134,6 +136,7 @@ class Attack:
 		mesh: pytorch3d.structures.Meshes
 			Mesh to be perturbed
 		param: torch.tensor
+		grasp:
 		Returns
 		-------
 		float: loss, pytorch.3d.structures.Meshes: adv_mesh
@@ -146,9 +149,38 @@ class Attack:
 		# adv_mesh = Meshes(verts=[param], faces=[current_faces])
 		adv_mesh = mesh.offset_verts(param)
 
-		loss, model_pred = self.calc_loss(adv_mesh, grasp)
+		loss, model_pred, data = self.calc_loss(adv_mesh, grasp)
 
-		return loss, adv_mesh, model_pred
+		return loss, adv_mesh, model_pred, data
+
+	def attack_setup(self, dir, logfile, mesh, grasp, lr, momentum):
+		"""Set up attack by saving info and resetting losses"""
+
+		# save attack info
+		if not os.path.exists(dir):
+			os.mkdir(dir)
+		save_obj(dir+"initial-mesh.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+		grasp.save(dir+"grasp.json")
+		self.renderer.draw_grasp(mesh, grasp.c0, grasp.c1, title="grasp-vis", save=dir+"graps-vis.png", display=False)
+
+		data = {
+			"lr": lr,
+			"momentum": momentum,
+			"optimizer": "SGD",
+			"loss weights": list(self.loss_weights.items()), 
+			"original oracle ferrari_canny quality": str(grasp.quality.detach().cpu().numpy().tolist()), 
+			"oracle robust": self.oracle_robust
+		}
+		with open(logfile, "w") as f:
+			json.dump(data, f, indent=4)
+
+		# reset loss tracking to plot at the end
+		self.losses = {
+			"prediction": [],
+			"edge": [],
+			"normal": [],
+			"smoothing": []
+		}
 
 	def attack(self, mesh, grasp, dir, lr, momentum):
 		"""
@@ -164,33 +196,23 @@ class Attack:
 			Final adversarial mesh
 		"""
 
-		# start by saving attack information
+		# set up attack: save info + reset losses
 		if dir[-1] != "/":
 			dir = dir+"/"
-		if not os.path.exists(dir):
-			os.mkdir(dir)
-		save_obj(dir+"initial-mesh.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
-		grasp.save(dir+"grasp.json")
-		self.renderer.draw_grasp(mesh, grasp.c0, grasp.c1, title="grasp-vis", save=dir+"graps-vis.png", display=False)
+		logfile = dir+"logfile.txt"
+		self.attack_setup(dir=dir, logfile=logfile, mesh=mesh, grasp=grasp, lr=lr, momentum=momentum)
+		original_quality = torch.mean(grasp.quality).item()
 
-		# reset loss tracking to plot at the end
-		self.losses = {
-			"prediction": [],
-			"edge": [],
-			"normal": [],
-			"smoothing": []
-		}
-
-		# param = mesh.verts_packed().clone().detach().requires_grad_(True)
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
 		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
 		adv_mesh = mesh.clone()
 
 		num_steps = 0
+		prev = 0.002
 		for i in range(self.num_steps):
 			optimizer.zero_grad()
-			loss, adv_mesh, model_pred = self.perturb(mesh, param, grasp)
+			loss, adv_mesh, model_pred, data = self.perturb(mesh, param, grasp)
 			loss.backward()
 			optimizer.step()
 
@@ -198,53 +220,58 @@ class Attack:
 				# check oracle prediction
 				mesh_file = dir+"cur-mesh.obj"
 				save_obj(mesh_file, verts=adv_mesh.verts_list()[0], faces=adv_mesh.faces_list()[0])
-				oracle = grasp.oracle_eval(mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
-				oracle_scaled = oracle[0] / (0.002)	# scale to 1.0
+				oracle_full = grasp.oracle_eval(mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
+				oracle = torch.mean(oracle_full)
+				grasp.qualily = oracle_full
+				oracle_scaled = oracle / (0.002)	# scale to 1.0
 
 				# plot
 				print(f"step {i}\t{loss.item()=:.4f}")
-				title="step " + str(i) + " loss: " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle: " + str(oracle[0])
+				title="step " + str(i) + "\nmodel pred: " + str(model_pred.item()) + "\noriginal oracle:" + str(original_quality) + "\noracle: " + str(oracle.item()) + "\noracle scaled: " + str(oracle_scaled.item())
+					# " loss: " + str(loss.item()) + 
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=filename)
 
+				# log
+				data = (f"\n\nIteration{i}\n\tOracle quality mean: " + str(oracle.item()) + f"\n\tOracle scaled: {oracle_scaled}" + data)
+				with open(logfile, "a") as f:
+					f.write(data)
 
-				if (oracle_scaled < 0.3 and model_pred > 0.5) or (oracle_scaled > 0.5 and model_pred < 0.5):
+				if ((oracle_scaled < 0.35 and model_pred > 0.5) or (oracle_scaled > 0.5 and model_pred < 0.5)): # and (oracle - prev <= 0.0005) and i>1:
 					num_steps = i+1
 					break
 			else:
-				if (model_pred < 0.5):
+				if (model_pred < 0.5) and i > 1:
 					num_steps = i+1
 					break
+
+			prev = oracle
 
 		# save final object
 		final_mesh = mesh.offset_verts(param)
 		final_mesh_file = dir+"final-mesh.obj"
-		save_obj(final_mesh_file, verts=final_mesh.verts_list()[0], faces=final_mesh.faces_list()[0])
+		save_obj(final_mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 
-		# get final oracle prediction
-		oracle = grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
+		# get final oracle prediction and save
+		oracle = torch.mean(grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)).item()
+		data = f"\nFinal oracle mean: {oracle}"
+		with open(logfile, "a") as f:
+			f.write(data)
 
-		# save final image and attack info, plot losses
+		# save final image and attack info
 		title = "step" + str(num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle)
 		if num_steps == 0:
 			filename = dir + "step" + str(self.num_steps) + ".png"
 		else:
 			filename = dir + "step" + str(num_steps) + ".png"
 		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=filename)
+		
+		# plot losses
 		Attack.plot_losses(self.losses, dir)
-		data = {
-			"lr": lr,
-			"momentum": momentum,
-			"optimizer": "SGD",
-			"loss weights": list(self.loss_weights.items()), 
-			"oracle ferrari_canny quality": oracle, 
-			"oracle robust": self.oracle_robust
-		}
-		with open(dir+"setup.txt", "w") as f:
-			json.dump(data, f, indent=4)
 
-		_, image = grasp.extract_tensors(dim)
-		return final_mesh, image
+		_, image = grasp.extract_tensors_batch(dim)
+		return final_mesh, image[0]
+
 
 def test_run():
 	"""Test prediction of gqcnn_pytorch model"""
@@ -328,21 +355,25 @@ def test_attack():
 	# 	c0=torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'), 
 	# 	c1=torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0'))
 	grasp = Grasp.read("example-grasps/grasp_0.json")
+	grasp.random_grasps(num_samples=10, camera=renderer.camera)
+	assert grasp.num_grasps() == 10
 	grasp.trans_world_to_im(renderer.camera)
+	grasp.oracle_eval("data/new_barclamp.obj")
+	print(grasp.quality)
 
-	pose, image = grasp.extract_tensors(dim)
+	pose, image = grasp.extract_tensors_batch(dim)
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=renderer)
+	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=renderer, oracle_method=grasp.oracle_method, oracle_robust=grasp.oracle_robust)
 
 	# MODEL VISUALIZATIONS
 	# print("model print:")
 	# print(model)
 
 	Attack.logger.info("ATTACK")
-	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex08/", lr=1e-5, momentum=0.9)
-	renderer.display(final_pic, title="final_grasp", save="experiment-results/ex08/final-grasp.png")
+	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex01/", lr=1e-5, momentum=0.0)
+	renderer.display(final_pic, title="final_grasp", save="experiment-results/ex01/final-grasp.png")
 
 	Attack.logger.info("Finished running test_attack.")
 

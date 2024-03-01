@@ -846,9 +846,9 @@ class Grasp:
 		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
 
 		# update quality info
-		self.quality = torch.from_numpy(np.array(results)).to(self.world_axis.device).float()
+		self.quality = torch.from_numpy(np.array(results)).unsqueeze(1).to(self.world_axis.device).float()
 
-		return results
+		return self.quality
 
 	def oracle_eval_pytorch(self, obj_file, renderer):
 		"""
