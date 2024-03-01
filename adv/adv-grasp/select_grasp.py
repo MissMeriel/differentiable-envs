@@ -30,10 +30,10 @@ class Grasp:
 
 	# SET UP LOGGING
 	logger = logging.getLogger('select_grasp')
-	logger.setLevel(logging.INFO)
+	logger.setLevel(logging.DEBUG)
 	if not logger.handlers:
 		ch = logging.StreamHandler()
-		ch.setLevel(logging.INFO)
+		ch.setLevel(logging.DEBUG)
 		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
@@ -308,6 +308,10 @@ class Grasp:
 		with open(fname, "w") as f:
 			json.dump(grasp_data, f, indent=4)
 
+	def num_grasps(self):
+		"""Return number of grasps in batch"""
+		return self.world_center.shape[0]
+
 	def trans_world_to_im(self, camera):
 		"""
 		If world coordinate information is populated, calculate image coordinate information for grasp - in-place
@@ -343,7 +347,6 @@ class Grasp:
 
 		# calculate angle of im_axis
 		self.im_angle = torch.atan2(self.im_axis[...,1], self.im_axis[..., 0]).unsqueeze(-1)
-
 
 	@classmethod
 	def sample_grasps(cls, obj_f, num_samples, renderer, **kwargs): # min_qual=0.002, max_qual=1.0, save_grasp=""):
@@ -557,6 +560,44 @@ class Grasp:
 
 		cls.logger.error("Error - sample_grasps with batching isn't working.")
 
+	def random_grasps(self, num_samples=64, sigma=1e-4, camera=None):
+		"""
+		Populate a singular grasp (or first grasp in batch) with similar grasps from random variations 
+		Parameters
+		----------
+		num_samples: float
+			Number of total grasps in result
+		sigma: float
+			Standard deviation of outputs normal distribution
+		Return
+		------
+		None
+		"""
+
+		if self.num_grasps() > 1:
+			self.c0 = self.c0[0].unsqueeze(0)
+			self.c1 = self.c1[0].unsqueeze(0)
+
+		# vary world centers
+		expanded_center = self.world_center[0].unsqueeze(0).expand(num_samples, -1)
+		noise_center = torch.normal(mean=torch.zeros_like(expanded_center), std=sigma)
+		self.world_center = expanded_center + noise_center
+
+		# vary world axes
+		expanded_axis = self.world_axis[0].unsqueeze(0).expand(num_samples, -1)
+		noise_axis = torch.normal(mean=torch.zeros_like(expanded_axis), std=sigma)
+		world_axis = expanded_axis + noise_axis
+		# re-normalize world axes
+		self.world_axis = world_axis / torch.norm(world_axis, dim=-1, keepdim=True)
+
+		# update other grasp info
+		self.quality = None
+		self.prediction = None
+		
+		# update 2D grasp info
+		if camera:
+			self.trans_world_to_im(camera=camera)
+
 	def extract_tensors(self, d_im):
 		"""
 		Use grasp information and depth image to get image and pose tensors in form of GQCNN input
@@ -672,16 +713,11 @@ class Grasp:
 			return None, None
 
 		# dims.shape: [batch_size, 1, 480, 640] = [batch_size, channels, H, W]
-		if self.c0.dim() == 4:
-			batch_size = self.c0.shape
-			if dims.dim() == 3:
-				dims = dims.repeat(batch_size, 1, 1, 1)
-			elif dims.shape[0] != batch_size:
-				dims = dims[0].repeat(batch_size, 1, 1, 1)
-		else:
-			batch_size = 1
-			if dims.dim() == 4:
-				dims = dims.squeeze(0)
+		batch_size = self.num_grasps()
+		if dims.dim() != 4:
+			dims = dims.repeat(batch_size, 1, 1, 1)
+		if dims.shape[0] != batch_size:
+			dims = dims[0].repeat(batch_size, 1, 1, 1)
 
 		# construct pose tensor from grasp depth
 		pose_tensor = self.depth
@@ -803,10 +839,14 @@ class Grasp:
 		Pyro4.config.COMMTIMEOUT = None
 		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
 		# calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))	# ensure grasp axis normalized
-		calc_axes = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0), dim=1).unsqueeze(1)
+		# calc_axes = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0), dim=1).unsqueeze(1)
+		calc_axes = self.world_axis / torch.norm(self.world_axis, dim=-1, keepdim=True)
 		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
 		save_nparr(calc_axes.detach().cpu().numpy(), "temp_axis.npy")
 		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
+
+		# update quality info
+		self.quality = torch.from_numpy(np.array(results)).to(self.world_axis.device).float()
 
 		return results
 
@@ -1145,10 +1185,12 @@ def test_batching():
 	gb = Grasp.read_batch(files)
 	assert gb.depth.shape == torch.Size([4,1])
 	assert gb.im_center.shape == torch.Size([4,2])
+	assert gb.num_grasps() == 4
 	files2 = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.png", "grasp_2.json"]
 	gb2 = Grasp.read_batch(files2)
 	assert gb2.depth.shape == torch.Size([1,1])
 	assert gb2.im_center.shape == torch.Size([1,2])
+	assert gb2.num_grasps() == 1
 
 	# try saving a batch of grasps and reading from one file
 	gb.save("test-batch.json")
@@ -1166,6 +1208,7 @@ def test_batching():
 
 	gb.trans_world_to_im(r.camera)
 	g0 = Grasp.read("example-grasps/grasp_0.json")
+	assert g0.num_grasps() == 1
 	g1 = Grasp.read("example-grasps/grasp_1.json")
 	g2 = Grasp.read("example-grasps/grasp_2.json")
 	g3 = Grasp.read("example-grasps/grasp_3.json")
@@ -1179,9 +1222,9 @@ def test_batching():
 	# test extract_tensors in a batch
 	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
 	dim = r.mesh_to_depth_im(mesh, display=False)
-	dims = dim.repeat(4, 1, 1, 1)
+	# dims = dim.repeat(4, 1, 1, 1)
 	pose0, image0 = g0.extract_tensors(dim)
-	poses, images = gb.extract_tensors_batch(dims)
+	poses, images = gb.extract_tensors_batch(dim)
 
 	assert torch.max(pose0 - poses[0]) == 0
 
@@ -1191,10 +1234,10 @@ def test_batching():
 	diff = image1 - image0
 	Grasp.logger.debug("processed image diff: %f", torch.max(diff))
 
-	# if torch.max(diff).item() > 0:
-	# 	r.display(image0, title="extract_tensors")
-	# 	r.display(image1, title="extract_tensors_batch")
-	# 	r.display(diff, title="diff")
+	if torch.max(diff).item() > 0:
+		r.display([image0, image1, diff], title="extract_tensors vs batched")
+		# r.display(image1, title="extract_tensors_batch")
+		# r.display(diff, title="diff")
 
 	# compare model predictions
 	model = KitModel("weights.npy")
@@ -1326,6 +1369,28 @@ def test_oracle_check():
 
 	plt.show()
 
+def test_random_grasps():
+	Grasp.logger.info("Testing random_grasps...")
+	r = Renderer()
+
+	# randomize grasp from file
+	g = Grasp.read("example-grasps/grasp_0.json")
+	g.random_grasps(num_samples=10, camera=r.camera)
+	assert g.num_grasps() == 10
+	g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	print("\nrand qualities:", g.quality.shape, "\n", g.quality)
+
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json"]
+	gb = Grasp.read_batch(files)
+	gb.random_grasps(num_samples=5, camera=r.camera)
+	assert gb.num_grasps() == 5
+	assert gb.c0.shape[0] == 1
+	assert gb.c1.shape[0] == 1
+	res = gb.oracle_eval("data/new_barclamp.obj", renderer=r)
+	print("\n\nrand batch qualities:", gb.quality.shape, "\n", gb.quality)
+
+	Grasp.logger.info("Finished testing random_grasps.")
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
@@ -1334,5 +1399,5 @@ if __name__ == "__main__":
 	# test_oracle_selection()
 	# test_oracle_eval()
 	# test_batching()
-	test_oracle_check()
-
+	# test_oracle_check()
+	test_random_grasps()
