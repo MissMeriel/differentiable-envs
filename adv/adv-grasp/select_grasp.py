@@ -30,10 +30,10 @@ class Grasp:
 
 	# SET UP LOGGING
 	logger = logging.getLogger('select_grasp')
-	logger.setLevel(logging.DEBUG)
+	logger.setLevel(logging.INFO)
 	if not logger.handlers:
 		ch = logging.StreamHandler()
-		ch.setLevel(logging.DEBUG)
+		ch.setLevel(logging.INFO)
 		formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
@@ -802,10 +802,11 @@ class Grasp:
 		# save grasp info for oracle evaluation
 		Pyro4.config.COMMTIMEOUT = None
 		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
-		calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))
+		# calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))	# ensure grasp axis normalized
+		calc_axes = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0), dim=1).unsqueeze(1)
 		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
-		save_nparr(calc_axis.detach().cpu().numpy(), "temp_axis.npy")
-		results = server.final_eval("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
+		save_nparr(calc_axes.detach().cpu().numpy(), "temp_axis.npy")
+		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
 
 		return results
 
@@ -1082,14 +1083,23 @@ def test_oracle_eval():
 	g = Grasp.read("example-grasps/grasp_0.json")
 	g.trans_world_to_im(camera=r.camera)
 
-	pytorch_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)[0].item()
+	# pytorch_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)[0].item()
 	dexnet_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
 	dexnet_qual_robust = g.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=True)
 
-	print("pytorch quality:", pytorch_qual)
+	# print("pytorch quality:", pytorch_qual)
 	print("dexnet quality:", dexnet_qual)
 	print("dexnet quality robust:", dexnet_qual_robust)
-	print("diff:", pytorch_qual - dexnet_qual)
+	# print("diff:", pytorch_qual - dexnet_qual)
+
+	# test oracle eval for batched grasps
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
+	gb = Grasp.read_batch(files)
+	print("\nqualities:\t\t", gb.quality.detach().cpu().numpy().tolist())
+	quals_nr = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
+	quals_r = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
+	print("robust oracle:\t\t", quals_r)
+	print("nonrobust oracle:\t", quals_nr)
 
 	# # iterate through dataset in data/data
 	# data_dir = "data/data/data"
@@ -1279,12 +1289,50 @@ def test_processing_batching():
 
 	Grasp.logger.info("Finished running test_processing_batching.")
 
+def test_oracle_check():
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_0.json","example-grasps/grasp_0.json","example-grasps/grasp_0.json","example-grasps/grasp_0.json", "example-grasps/grasp_0.json", "example-grasps/grasp_0.json","example-grasps/grasp_0.json","example-grasps/grasp_0.json","example-grasps/grasp_0.json",
+	"example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json", "example-grasps/grasp_1.json",
+	"example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json", "example-grasps/grasp_2.json",
+	"example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json", "example-grasps/grasp_3.json",]
+	assert len(files) == 40
+	gb = Grasp.read_batch(files)
+	oracle_quals = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
+	oracle_quals2 = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
+	oracle_quals_nr = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
+	assert len(oracle_quals) == len(files)
+
+	x_values = [0, 1, 2, 3]
+	# points1 = [oracle_quals[0:10], oracle_quals[10:20], oracle_quals[20:30], oracle_quals[30:]]
+	total_points = [oracle_quals[0:10] + oracle_quals2[0:10], oracle_quals[10:20]+ oracle_quals2[10:20], oracle_quals[20:30]+ oracle_quals2[20:30], oracle_quals[30:]+ oracle_quals2[30:]]
+	assert len(total_points) == 4
+	nr_points = [oracle_quals_nr[0:10], oracle_quals_nr[10:20], oracle_quals_nr[20:30], oracle_quals_nr[30:]]
+
+	for i, color1_set in enumerate(total_points):
+		if i == 0:
+			plt.scatter([x_values[i]]*len(color1_set), color1_set, color='red', label='robust')
+		else:
+			plt.scatter([x_values[i]]*len(color1_set), color1_set, color='red')
+
+	for i, color2_set in enumerate(nr_points):
+		if i == 0:
+			plt.scatter([x_values[i]]*len(color2_set), color2_set, color='blue', label='non-robust')
+		else:
+			plt.scatter([x_values[i]]*len(color2_set), color2_set, color='blue')
+
+	plt.xlabel('grasp')
+	plt.ylabel('oracle quality')
+	plt.title('Consistency of robust oracle quality')
+	plt.legend()
+
+	plt.show()
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
-	test_select_grasp()
+	# test_select_grasp()
 	# test_save_and_load_grasps()
 	# test_oracle_selection()
 	# test_oracle_eval()
 	# test_batching()
+	test_oracle_check()
 
