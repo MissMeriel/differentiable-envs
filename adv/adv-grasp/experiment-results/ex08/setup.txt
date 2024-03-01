@@ -1,0 +1,23 @@
+{
+    "lr": 1e-05,
+    "momentum": 0.9,
+    "optimizer": "SGD",
+    "loss weights": [
+        [
+            "edge",
+            5
+        ],
+        [
+            "normal",
+            2
+        ],
+        [
+            "smooth",
+            5
+        ]
+    ],
+    "oracle ferrari_canny quality": [
+        0.0
+    ],
+    "oracle robust": true
+}

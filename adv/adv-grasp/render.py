@@ -245,7 +245,10 @@ class Renderer:
 				if isinstance(title, list) and isinstance(title[i], str):
 					plt.title(title[i])		
 
-		plt.show()
+		if isinstance(save, str):
+			plt.savefig(save)
+		else:
+			plt.show()
 
 	def draw_grasp(self, obj, contact0, contact1, title=None, save="", display=True):
 

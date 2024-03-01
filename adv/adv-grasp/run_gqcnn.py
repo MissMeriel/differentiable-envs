@@ -45,9 +45,9 @@ class Attack:
 			self.oracle_method = "dexnet"
 
 		self.loss_weights = {
-			"edge": 10,
-			"normal": 5,
-			"smooth": 10
+			"edge": 5,
+			"normal": 2,
+			"smooth": 5
 		}
 		self.losses = None
 
@@ -108,7 +108,7 @@ class Attack:
 		out = self.run(pose, image)
 		cur_pred = out[0][0]
 		cur_pred = cur_pred.to(adv_mesh.device)
-		oracle_pred = torch.tensor([float(grasp.fc_quality)], requires_grad=False, device=adv_mesh.device)
+		oracle_pred = torch.tensor([float(grasp.quality)], requires_grad=False, device=adv_mesh.device)
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
@@ -171,6 +171,7 @@ class Attack:
 			os.mkdir(dir)
 		save_obj(dir+"initial-mesh.obj", verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		grasp.save(dir+"grasp.json")
+		self.renderer.draw_grasp(mesh, grasp.c0, grasp.c1, title="grasp-vis", save=dir+"graps-vis.png", display=False)
 
 		# reset loss tracking to plot at the end
 		self.losses = {
@@ -194,14 +195,26 @@ class Attack:
 			optimizer.step()
 
 			if i % self.steps_per_plot == 0:
-				print(f"step {i}\t{loss.item()=:.4f}")
-				title="step " + str(i) + " loss: " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item())
-				filename = dir + "step" + str(i) + ".png"
-				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=True, fname=filename)
+				# check oracle prediction
+				mesh_file = dir+"cur-mesh.obj"
+				save_obj(mesh_file, verts=adv_mesh.verts_list()[0], faces=adv_mesh.faces_list()[0])
+				oracle = grasp.oracle_eval(mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
+				oracle_scaled = oracle[0] / (0.002)	# scale to 1.0
 
-			if model_pred < 0.5:
-				num_steps = i+1
-				break
+				# plot
+				print(f"step {i}\t{loss.item()=:.4f}")
+				title="step " + str(i) + " loss: " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle: " + str(oracle[0])
+				filename = dir + "step" + str(i) + ".png"
+				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=filename)
+
+
+				if (oracle_scaled < 0.3 and model_pred > 0.5) or (oracle_scaled > 0.5 and model_pred < 0.5):
+					num_steps = i+1
+					break
+			else:
+				if (model_pred < 0.5):
+					num_steps = i+1
+					break
 
 		# save final object
 		final_mesh = mesh.offset_verts(param)
@@ -212,12 +225,12 @@ class Attack:
 		oracle = grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
 
 		# save final image and attack info, plot losses
-		title = "step" + str(self.num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle)
+		title = "step" + str(num_steps) + " loss " + str(loss.item()) + "\nmodel pred: " + str(model_pred.item()) + "\noracle pred: " + str(oracle)
 		if num_steps == 0:
 			filename = dir + "step" + str(self.num_steps) + ".png"
 		else:
 			filename = dir + "step" + str(num_steps) + ".png"
-		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=True, fname=filename)
+		self.renderer.mesh_to_depth_im(final_mesh, display=True, title=title, save=filename)
 		Attack.plot_losses(self.losses, dir)
 		data = {
 			"lr": lr,
@@ -307,31 +320,32 @@ def test_attack():
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
 
 	# FIXED GRASP TO ATTACK
-	grasp = Grasp(
-		quality=(1, 0.00039880830039262474), 
-		depth=0.5824155807495117, 
-		world_center=torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'), 
-		world_axis=torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'), 
-		c0=torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'), 
-		c1=torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0'))
+	# grasp = Grasp(
+	# 	quality=(1, 0.00039880830039262474), 
+	# 	depth=0.5824155807495117, 
+	# 	world_center=torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'), 
+	# 	world_axis=torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'), 
+	# 	c0=torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'), 
+	# 	c1=torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0'))
+	grasp = Grasp.read("example-grasps/grasp_0.json")
 	grasp.trans_world_to_im(renderer.camera)
 
 	pose, image = grasp.extract_tensors(dim)
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=renderer)
+	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=renderer)
 
 	# MODEL VISUALIZATIONS
-	print("model print:")
-	print(model)
+	# print("model print:")
+	# print(model)
 
 	Attack.logger.info("ATTACK")
-	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex07/", lr=1e-5, momentum=0.9)
-	renderer.display(final_pic, title="final_grasp", save=True, fname="experiment-results/ex07/final-grasp.png")
+	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex08/", lr=1e-5, momentum=0.9)
+	renderer.display(final_pic, title="final_grasp", save="experiment-results/ex08/final-grasp.png")
 
 	Attack.logger.info("Finished running test_attack.")
 
 if __name__ == "__main__":
-	test_run()
+	# test_run()
 	test_attack()
