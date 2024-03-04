@@ -221,13 +221,15 @@ class Attack:
 				mesh_file = dir+"cur-mesh.obj"
 				save_obj(mesh_file, verts=adv_mesh.verts_list()[0], faces=adv_mesh.faces_list()[0])
 				oracle_full = grasp.oracle_eval(mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)
-				oracle = torch.mean(oracle_full)
+				# oracle = torch.mean(oracle_full)
+				oracle = oracle_full[0]
 				grasp.qualily = oracle_full
 				oracle_scaled = oracle / (0.002)	# scale to 1.0
+				oracle_scaled = oracle_scaled.item()
 
 				# plot
 				print(f"step {i}\t{loss.item()=:.4f}")
-				title="step " + str(i) + "\nmodel pred: " + str(model_pred.item()) + "\noriginal oracle:" + str(original_quality) + "\noracle: " + str(oracle.item()) + "\noracle scaled: " + str(oracle_scaled.item())
+				title="step " + str(i) + "\nmodel pred: " + str(model_pred.item()) + "\noriginal oracle:" + str(original_quality) + "\noracle: " + str(oracle.item()) + "\noracle scaled: " + str(oracle_scaled)
 					# " loss: " + str(loss.item()) + 
 				filename = dir + "step" + str(i) + ".png"
 				dim = self.renderer.mesh_to_depth_im(adv_mesh, display=True, title=title, save=filename)
@@ -253,7 +255,8 @@ class Attack:
 		save_obj(final_mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 
 		# get final oracle prediction and save
-		oracle = torch.mean(grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)).item()
+		# oracle = torch.mean(grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)).item()
+		oracle = grasp.oracle_eval(final_mesh_file, oracle_method=self.oracle_method, robust=self.oracle_robust)[0].item()
 		data = f"\nFinal oracle mean: {oracle}"
 		with open(logfile, "a") as f:
 			f.write(data)
@@ -354,7 +357,8 @@ def test_attack():
 	# 	world_axis=torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'), 
 	# 	c0=torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'), 
 	# 	c1=torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0'))
-	grasp = Grasp.read("example-grasps/grasp_0.json")
+	# grasp = Grasp.read("example-grasps/grasp_3.json")
+	grasp = Grasp.sample_grasps(obj_f="data/new_barclamp.obj", num_samples=2, renderer=renderer, min_qual=0.001, save_grasp = "experiment-results/ex03/grasp-orig")
 	grasp.random_grasps(num_samples=10, camera=renderer.camera)
 	assert grasp.num_grasps() == 10
 	grasp.trans_world_to_im(renderer.camera)
@@ -372,8 +376,8 @@ def test_attack():
 	# print(model)
 
 	Attack.logger.info("ATTACK")
-	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex01/", lr=1e-5, momentum=0.0)
-	renderer.display(final_pic, title="final_grasp", save="experiment-results/ex01/final-grasp.png")
+	adv_mesh, final_pic = run1.attack(mesh, grasp, "experiment-results/ex03/", lr=1e-5, momentum=0.0)
+	renderer.display(final_pic, title="final_grasp", save="experiment-results/ex03/final-grasp.png")
 
 	Attack.logger.info("Finished running test_attack.")
 

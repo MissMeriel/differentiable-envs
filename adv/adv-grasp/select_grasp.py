@@ -503,9 +503,11 @@ class Grasp:
 		# transform successful grasps to image space and convert to Grasp object
 
 		grasp_dict = {"world_center": [], "world_axis": [], "c0": [], "c1": [], "quality": []}
-		for i in range(len(cands)):
+		cls.logger.debug("sample_grasps_dexnet - number of grasps: %d", len(cands))
+		for i in range(len(cands)+1):
 
 			# return final grasp batch
+			cls.logger.debug("sample_grasps_dexnet - Line 510: %s", str(len(grasp_dict["c0"]) >= num_samples))
 			if len(grasp_dict["c0"]) >= num_samples:
 				for key in ["c0", "c1", "quality"]:
 					grasp_dict[key] = torch.tensor(grasp_dict[key]).to(renderer.device).float()
@@ -547,16 +549,17 @@ class Grasp:
 			if kwargs["save_grasp"]: 	# and i<num_samples:
 				# save object to visualize grasp, grasp json, and approx. image of grasp
 				contact0, contact1 = torch.tensor(g[-2][0]).unsqueeze(0).to(renderer.device).float(), torch.tensor(g[-2][1]).unsqueeze(0).to(renderer.device).float()
-				if kwargs["save_grasp"][-1] == "/":
-					kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
-				cls.logger.info("saving new grasp visualization object")
+				# if kwargs["save_grasp"][-1] == "/":
+				# 	kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
+				# cls.logger.info("saving new grasp visualization object")
 				obj_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".obj"
-				json_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".json"
-				img_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".png"
-				renderer.grasp_sphere((contact0, contact1), mesh, obj_name)
+				# json_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".json"
+				json_name = kwargs["save_grasp"] + ".json"
+				# img_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".png"
+				# renderer.grasp_sphere((contact0, contact1), mesh, obj_name)
 				temp_grasp = Grasp(world_center=world_centers_batch[g[-1]][g[0]].unsqueeze(0), world_axis=world_axes_batch[g[-1]][g[0]].unsqueeze(0), c0=contact0, c1=contact1, quality=quality)
 				temp_grasp.save(json_name)
-				renderer.draw_grasp(mesh, contact0, contact1, title=img_name, save=img_name)
+				# renderer.draw_grasp(mesh, contact0, contact1, title=img_name, save=img_name)
 
 		cls.logger.error("Error - sample_grasps with batching isn't working.")
 
@@ -579,14 +582,19 @@ class Grasp:
 			self.c1 = self.c1[0].unsqueeze(0)
 
 		# vary world centers
+		original_center = self.world_center[0]
 		expanded_center = self.world_center[0].unsqueeze(0).expand(num_samples, -1)
 		noise_center = torch.normal(mean=torch.zeros_like(expanded_center), std=sigma)
-		self.world_center = expanded_center + noise_center
+		world_center = expanded_center + noise_center
+		world_center[0] = original_center
+		self.world_center = world_center
 
 		# vary world axes
+		original_axis = self.world_axis[0]
 		expanded_axis = self.world_axis[0].unsqueeze(0).expand(num_samples, -1)
 		noise_axis = torch.normal(mean=torch.zeros_like(expanded_axis), std=sigma)
 		world_axis = expanded_axis + noise_axis
+		world_axis[0] = original_axis
 		# re-normalize world axes
 		self.world_axis = world_axis / torch.norm(world_axis, dim=-1, keepdim=True)
 
@@ -804,17 +812,17 @@ class Grasp:
 		check_method = (oracle_method in ["dexnet", "pytorch"])
 		if oracle_method == "dexnet" or (not check_method and (self.oracle_method == "dexnet")):
 			if isinstance(robust, bool):
-				Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
+				# Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
 				return self.oracle_eval_dexnet(obj_file, robust=robust)
 			else:
-				Grasp.logger.debug("Oracle eval - dexnet, robust %r", self.oracle_robust)
+				# Grasp.logger.debug("Oracle eval - dexnet, robust %r", self.oracle_robust)
 				return self.oracle_eval_dexnet(obj_file, robust=self.oracle_robust)
 		
 		else:
 			if not renderer:
 				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 			else:
-				Grasp.logger.debug("Oracle eval - pytorch")
+				# Grasp.logger.debug("Oracle eval - pytorch")
 				return self.oracle_eval_pytorch(obj_file, renderer)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
@@ -1342,6 +1350,9 @@ def test_oracle_check():
 	oracle_quals = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
 	oracle_quals2 = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
 	oracle_quals_nr = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
+	oracle_quals = oracle_quals.squeeze().detach().cpu().numpy()
+	oracle_quals2 = oracle_quals2.squeeze().detach().cpu().numpy()
+	oracle_quals_nr = oracle_quals_nr.squeeze().detach().cpu().numpy()
 	assert len(oracle_quals) == len(files)
 
 	x_values = [0, 1, 2, 3]
@@ -1374,6 +1385,7 @@ def test_random_grasps():
 	r = Renderer()
 
 	# randomize grasp from file
+	g_orig = Grasp.read("example-grasps/grasp_0.json")
 	g = Grasp.read("example-grasps/grasp_0.json")
 	g.random_grasps(num_samples=10, camera=r.camera)
 	assert g.num_grasps() == 10
