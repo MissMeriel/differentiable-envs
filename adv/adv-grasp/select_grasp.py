@@ -40,7 +40,7 @@ class Grasp:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, prediction=None, oracle_method="dexnet", oracle_robust=True):
+	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, prediction=None, oracle_method="dexnet", oracle_robust=True, objf=None):
 		"""
 		Initialize a Grasp object
 		Paramters
@@ -70,6 +70,8 @@ class Grasp:
 		oracle_robust: Boolean
 			True: robust ferrari canny oracle evaluation (default)
 			False: static ferrari canny oracle evaluation 
+		objf: String
+			Path to .obj file associated with grasp
 
 		Returns
 		-------
@@ -152,6 +154,8 @@ class Grasp:
 		if isinstance(oracle_robust, bool):
 			self.oracle_robust = oracle_robust
 
+		self.objf = objf
+
 	@classmethod
 	def init_from_dict(cls, dict):
 		"""Initialize grasp object from a dictionary"""
@@ -166,8 +170,10 @@ class Grasp:
 			dict["oracle_robust"] = True
 		if "prediction" not in dict_keys:
 			dict["prediction"] = None
+		if "objf" not in dict_keys:
+			dict["objf"] = None
 
-		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], prediction=dict["prediction"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"])
+		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], prediction=dict["prediction"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"], objf=dict["objf"])
 
 	@classmethod
 	def read(cls, fname):
@@ -232,12 +238,85 @@ class Grasp:
 			for k, v in d.items():
 				batch_dict.setdefault(k, [])
 				batch_dict[k].append(v)
-				# if isinstance(v, list):
-				# 	batch_dict[k].extend(v)
-				# else:
-				# 	batch_dict[k].append(v)
+
+		if "objf" in batch_dict.keys():
+			obj_lst = batch_dict["objf"]
+			obj = obj_list.pop(0)
+			for o in obj_list:
+				if o != obj:
+					cls.logger.error("read_batch - all grasps must be for the same grasp object.")
+					continue
+			batch_dict["objf"] = o
 
 		return cls.init_from_dict(batch_dict)
+
+	def __iter__(self):
+		"""Make Grasp class iterable"""
+		self.index = 0
+		self.length = self.num_grasps()
+
+		return self
+
+	def __next__(self):
+		"""Make Grasp class iterable"""
+		if self.index < self.length:
+			self.index += 1
+			return self[self.index-1]
+		else:
+			raise StopIteration
+
+	def __getitem__(self, key):
+		"""Make Grasp class sliceable"""
+		if isinstance(key, slice):
+			dep = self.depth[key] if self.depth is not None else None
+			imc = self.im_center[key] if self.im_center is not None else None
+			angle = self.im_angle[key] if self.im_angle is not None else None
+			imax = self.im_axis[key] if self.im_axis is not None else None
+			wc = self.world_center[key] if self.world_center is not None else None
+			wax = self.world_axis[key] if self.world_axis is not None else None
+			con0 = self.c0[key] if self.c0 is not None else None
+			con1 = self.c1[key] if self.c1 is not None else None
+			qual = self.quality[key] if self.quality is not None else None
+			pred = self.prediction[key] if self.prediction is not None else None
+			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust)
+		elif isinstance(key, int):
+			length = self.num_grasps()
+			if key < 0:
+				key += length
+			if key >= length or key < 0:
+				raise IndexError(f"The index {key} is out of range for accessing a Grasp object of length {length}")
+			dep = self.depth[key] if self.depth is not None else None
+			imc = self.im_center[key] if self.im_center is not None else None
+			angle = self.im_angle[key] if self.im_angle is not None else None
+			imax = self.im_axis[key] if self.im_axis is not None else None
+			wc = self.world_center[key] if self.world_center is not None else None
+			wax = self.world_axis[key] if self.world_axis is not None else None
+			con0 = self.c0[key] if self.c0 is not None else None
+			con1 = self.c1[key] if self.c1 is not None else None
+			qual = self.quality[key] if self.quality is not None else None
+			pred = self.prediction[key] if self.prediction is not None else None
+			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust)
+		else:
+			raise TypeError("Invalid argument type for accessing a Grasp object.")
+
+	def __eq__(self, obj):
+		if type(self) != type(obj):
+			return False
+		if self.depth.shape != obj.depth.shape or not torch.min(torch.eq(self.depth, obj.depth)): return False
+		if self.world_center is not None and obj.world_center is not None:
+			if self.world_center.shape != obj.world_center.shape or not torch.min(torch.eq(self.world_center, obj.world_center)): return False
+			if self.world_axis.shape != obj.world_axis.shape or not torch.min(torch.eq(self.world_axis, obj.world_axis)): return False
+		if self.im_center is not None and obj.im_center is not None:
+			if self.im_center.shape != obj.im_center.shape or not torch.min(torch.eq(self.im_center, obj.im_center)): return False
+			if self.im_axis.shape != obj.im_axis.shape or not torch.min(torch.eq(self.im_axis, obj.im_axis)): return False
+			if self.im_angle.shape != obj.im_angle.shape or not torch.min(torch.eq(self.im_angle, obj.im_angle)): return False
+		if self.c0 is not None and obj.c0 is not None:
+			if self.c0.shape != obj.c0.shape or not torch.min(torch.eq(self.c0, obj.c0)): return False
+			if self.c1.shape != obj.c1.shape or not torch.min(torch.eq(self.c1, obj.c1)): return False
+		if self.objf is not None and obj.objf is not None:
+			if self.objf.split("/")[-1] != obj.objf.split("/")[-1]:
+				if not ((self.objf.split("/")[-1] in ["new_barclamp.obj", "bar_clamp.obj"]) and (obj.objf.split("/")[-1] in ["new_barclamp.obj", "bar_clamp.obj"])): return False
+		return True
 
 	def __str__(self):
 		"""Returns a string with grasp information in image coordinates"""
@@ -291,6 +370,7 @@ class Grasp:
 		prediction = self.prediction
 		if isinstance(self.prediction, torch.Tensor):
 			predicition = self.prediction.clone().detach().cpu().numpy().tolist()
+		objf = self.objf if self.objf is not None else "unknown"
 
 		grasp_data = {
 			"depth": depth,
@@ -304,7 +384,8 @@ class Grasp:
 			"oracle_method": self.oracle_method,
 			"oracle_robust": self.oracle_robust,
 			"quality": quality,
-			"prediction": prediction
+			"prediction": prediction,
+			"objf": objf
 		}
 
 		with open(fname, "w") as f:
@@ -435,6 +516,8 @@ class Grasp:
 			kwargs["max_qual"] = 1.0
 		if "save_grasp" not in keys:
 			kwargs["save_grasp"] = ""
+		elif kwargs["save_grasp"][-1] == "/":
+				kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
 		if "sort" not in keys:
 			kwargs["sort"] = True
 		if "oracle_robust" not in keys:
@@ -528,8 +611,25 @@ class Grasp:
 				grasp.trans_world_to_im(renderer.camera)
 
 				if kwargs["save_grasp"]:
-					json_name = kwargs["save_grasp"] + ".json"
-					grasp.save(json_name)
+					# save object to visualize grasp, grasp json, and approx. image of grasp
+					pathname = kwargs["save_grasp"]
+					if not os.path.isdir(pathname):
+						os.mkdir(pathname)
+					j, json_batch_name = 0, pathname + "/grasp_batch.json"
+					while os.path.exists(json_batch_name):
+						json_batch_name = pathname + "/grasp_batch_" + str(i) + ".json"
+						j += 1
+					grasp.save(json_batch_name)
+
+					for j, g in enumerate(grasp):
+						cls.logger.info("saving new grasp visualization object")
+						pathname = pathname + "/grasp_" + str(j) + "/"
+						if not os.path.exists(pathname):
+							os.mkdir(pathname)
+						img_name = pathname + "grasp_image.png"
+						obj_name = pathname + "grasp_vis.obj"
+						renderer.grasp_sphere((g.c0, g.c1), mesh, display=False, save=obj_name)
+						renderer.draw_grasp(mesh, g.c0, g.c1, save=img_name, display=False)
 
 				return grasp
 
@@ -546,22 +646,6 @@ class Grasp:
 			grasp_dict["c0"] += [g[-2][0]]
 			grasp_dict["c1"] += [g[-2][1]]
 			grasp_dict["quality"] += [quality]
-
-
-			if kwargs["save_grasp"]: 	# and i<num_samples:
-				# save object to visualize grasp, grasp json, and approx. image of grasp
-				contact0, contact1 = torch.tensor(g[-2][0]).unsqueeze(0).to(renderer.device).float(), torch.tensor(g[-2][1]).unsqueeze(0).to(renderer.device).float()
-				# if kwargs["save_grasp"][-1] == "/":
-				# 	kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
-				# cls.logger.info("saving new grasp visualization object")
-				obj_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".obj"
-				# json_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".json"
-				json_name = kwargs["save_grasp"] + ".json"
-				# img_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".png"
-				# renderer.grasp_sphere((contact0, contact1), mesh, obj_name)
-				temp_grasp = Grasp(world_center=world_centers_batch[g[-1]][g[0]].unsqueeze(0), world_axis=world_axes_batch[g[-1]][g[0]].unsqueeze(0), c0=contact0, c1=contact1, quality=quality)
-				temp_grasp.save(json_name)
-				# renderer.draw_grasp(mesh, contact0, contact1, title=img_name, save=img_name)
 
 		cls.logger.error("Error - sample_grasps with batching isn't working.")
 
@@ -1260,6 +1344,44 @@ def test_batching():
 
 	Grasp.logger.info("Finished running test_batching.")
 
+def test_slicing():
+	Grasp.logger.info("Running test_slicing...")
+	
+	# try loading a batch of grasps from json files
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
+	gb = Grasp.read_batch(files)
+	assert gb.depth.shape == torch.Size([4,1])
+	assert gb.im_center.shape == torch.Size([4,2])
+	assert gb.num_grasps() == 4
+	g0 = Grasp.read("example-grasps/grasp_0.json")
+	assert g0.num_grasps() == 1
+	files2 = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json"]
+	gb2 = Grasp.read_batch(files2)
+	assert gb2.num_grasps() == 2
+
+	print("testing __eq__")
+	assert gb != 4
+	assert gb == gb
+	assert g0 == g0
+	assert gb2 == gb2
+	g0_dup = Grasp.read("example-grasps/grasp_0.json")
+	assert g0 == g0_dup
+	g0_dup.depth[0][0] = 45.4
+	assert g0 != g0_dup
+
+	g_slice0 = gb[0]
+	assert g_slice0 == g0
+	gb_slice = gb[0:2]
+	assert gb_slice == gb2
+
+	for g in gb:
+		assert g.num_grasps() == 1
+
+	for i, g in enumerate(gb):
+		assert g.num_grasps() == 1
+
+	Grasp.logger.info("Finished running test_slicing.")
+
 def test_processing_batching():
 
 	Grasp.logger.error("test_processing_batching was only for debugging - no longer functional")
@@ -1417,6 +1539,16 @@ def test_random_grasps():
 
 	Grasp.logger.info("Finished testing random_grasps.")
 
+def generate_grasp_dataset(dataset_dir):
+	Grasp.logger.info(f"Generating grasp dataset in directory {dataset_dir}...")
+
+	renderer = Renderer()
+	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
+
+	grasps = Grasp.sample_grasps("data/bar_clamp.obj", 10, renderer=renderer, min_qual=0.002, save_grasp=dataset_dir)
+
+	Grasp.logger.info(f"Finished generating grasp dataset to directory {dataset_dir}")
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
@@ -1425,6 +1557,8 @@ if __name__ == "__main__":
 	# test_oracle_selection()
 	# test_oracle_eval()
 	# test_batching()
-	for i in range(4):
-		test_oracle_check(i)
+	# test_slicing()
+	# for i in range(4):
+	# 	test_oracle_check(i)
 	# test_random_grasps()
+	generate_grasp_dataset("grasp-dataset")
