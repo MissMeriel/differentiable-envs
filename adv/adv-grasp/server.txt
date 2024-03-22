@@ -92,7 +92,9 @@ class Server(object):
 
 		return ret 
 
-	def final_eval(self, centerfile, axisfile, objfile, robust=True):
+	def final_evals(self, centerfile, axisfile, objfile, robust=True):
+
+		ret = []
 
 		# create GraspableObject3D
 		obj_path = os.path.join(SHARED_DIR, objfile)
@@ -101,22 +103,37 @@ class Server(object):
 		sdf_file = objfile.split(".")[0] + ".sdf"
 		sdf_path = os.path.join(SHARED_DIR, sdf_file)
 		if not os.path.isfile(sdf_path):
-			mesh2sdf(obj_path)
+				mesh2sdf(obj_path)
+		sf = SdfFile(sdf_path)
+		sdf = sf.read()
+		obj_path = os.path.join(SHARED_DIR, objfile)
+		of = ObjFile(obj_path)
+		mesh = of.read()
+		sdf_file = objfile.split(".")[0] + ".sdf"
+		sdf_path = os.path.join(SHARED_DIR, sdf_file)
+		if not os.path.isfile(sdf_path):
+				mesh2sdf(obj_path)
 		sf = SdfFile(sdf_path)
 		sdf = sf.read()
 		obj = GraspableObject3D(sdf, mesh)
 
-		# create ParallelJawPtGrasp3D object from grasp
-		center = np.load(os.path.join(SHARED_DIR, centerfile))
-		axis = np.load(os.path.join(SHARED_DIR, axisfile))
-		g = ParallelJawPtGrasp3D(ParallelJawPtGrasp3D.configuration_from_params(center, axis, 0.05))
-		success, contacts = g.close_fingers(obj)
+		# create ParallelJawPtGrasp3D object from grasp list
+		centers = np.load(os.path.join(SHARED_DIR, centerfile))
+		axes = np.load(os.path.join(SHARED_DIR, axisfile))
+		logger.info("%d grasps for final eval", centers.shape[0])
+		for i in range(centers.shape[0]):
+			center = centers[i]
+			axis = axes[i]
+			g = ParallelJawPtGrasp3D(ParallelJawPtGrasp3D.configuration_from_params(center, axis, 0.05))
+			success, contacts = g.close_fingers(obj)
+			q = 0.0
 
-		if success:
-			q = self.quality(g, obj, robust=robust)
-			return q
+			if success:
+				q = self.quality(g, obj, robust=robust)
 
-		return 0.0
+			ret.append(q)
+
+		return ret
 
 # set up logger
 logger = logging.getLogger("dexnet_server")

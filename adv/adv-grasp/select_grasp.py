@@ -2,12 +2,14 @@ import Pyro4
 import os
 import sys
 import math
+import time
 import logging
 import json
 import torch
 from torchvision import transforms
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 from pytorch3d.ops import sample_points_from_meshes
 
@@ -17,7 +19,7 @@ from run_gqcnn import *
 from quality_fork import *
 
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
-EPS = 0.0000001
+EPS = 0.000001
 
 if torch.cuda.is_available():
 	device = torch.device("cuda:0")
@@ -38,7 +40,7 @@ class Grasp:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, prediction=None, oracle_method="dexnet", oracle_robust=True):
+	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, prediction=None, oracle_method="dexnet", oracle_robust=True, objf=None):
 		"""
 		Initialize a Grasp object
 		Paramters
@@ -68,6 +70,8 @@ class Grasp:
 		oracle_robust: Boolean
 			True: robust ferrari canny oracle evaluation (default)
 			False: static ferrari canny oracle evaluation 
+		objf: String
+			Path to .obj file associated with grasp
 
 		Returns
 		-------
@@ -112,7 +116,7 @@ class Grasp:
 
 		self.depth = depth
 		if isinstance(depth, float):
-			self.depth = torch.tensor([depth]).to(device).float().unsqueeze()
+			self.depth = torch.tensor([depth]).to(device).float().unsqueeze(0)
 		elif isinstance(depth, list):
 			self.depth = torch.from_numpy(np.array(depth)).to(device).float()
 		if self.depth != None and self.depth.dim() == 1:
@@ -120,7 +124,7 @@ class Grasp:
 
 		self.im_angle = im_angle
 		if isinstance(im_angle, float):
-			self.im_angle = torch.tensor([im_angle]).to(device).float().unsqueeze()
+			self.im_angle = torch.tensor([im_angle]).to(device).float().unsqueeze(0)
 		elif isinstance(im_angle, list):
 			self.im_angle = torch.from_numpy(np.array(im_angle)).to(device).float()
 		if self.im_angle != None and self.im_angle.dim() == 1:
@@ -128,15 +132,15 @@ class Grasp:
 
 		self.quality = quality
 		if isinstance(quality, float):
-			self.quality = torch.tensor([quality]).to(device).float().unsqueeze()
+			self.quality = torch.tensor([quality]).to(device).float().unsqueeze(0)
 		elif isinstance(quality, list):
 			self.quality = torch.from_numpy(np.array(quality)).to(device).float()
-		if self.im_axis != None and self.im_axis.dim() == 1:
-			self.im_axis = self.im_axis.unsqueeze(0)
+		if self.quality != None and self.quality.dim() == 1:
+			self.qualilty = self.quality.unsqueeze(0)
 
 		self.prediction = prediction
 		if isinstance(prediction, float):
-			self.prediction = torch.tensor([prediction]).to(device).float().unsqueeze()
+			self.prediction = torch.tensor([prediction]).to(device).float().unsqueeze(0)
 		elif isinstance(prediction, list):
 			self.prediction = torch.from_numpy(np.array(quality)).to(device).float()
 		if self.prediction != None and self.prediction.dim() == 1:
@@ -149,6 +153,8 @@ class Grasp:
 		self.oracle_robust = oracle_robust
 		if isinstance(oracle_robust, bool):
 			self.oracle_robust = oracle_robust
+
+		self.objf = objf
 
 	@classmethod
 	def init_from_dict(cls, dict):
@@ -164,8 +170,10 @@ class Grasp:
 			dict["oracle_robust"] = True
 		if "prediction" not in dict_keys:
 			dict["prediction"] = None
+		if "objf" not in dict_keys:
+			dict["objf"] = None
 
-		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], prediction=dict["prediction"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"])
+		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], prediction=dict["prediction"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"], objf=dict["objf"])
 
 	@classmethod
 	def read(cls, fname):
@@ -230,12 +238,85 @@ class Grasp:
 			for k, v in d.items():
 				batch_dict.setdefault(k, [])
 				batch_dict[k].append(v)
-				# if isinstance(v, list):
-				# 	batch_dict[k].extend(v)
-				# else:
-				# 	batch_dict[k].append(v)
+
+		if "objf" in batch_dict.keys():
+			obj_lst = batch_dict["objf"]
+			obj = obj_list.pop(0)
+			for o in obj_list:
+				if o != obj:
+					cls.logger.error("read_batch - all grasps must be for the same grasp object.")
+					continue
+			batch_dict["objf"] = o
 
 		return cls.init_from_dict(batch_dict)
+
+	def __iter__(self):
+		"""Make Grasp class iterable"""
+		self.index = 0
+		self.length = self.num_grasps()
+
+		return self
+
+	def __next__(self):
+		"""Make Grasp class iterable"""
+		if self.index < self.length:
+			self.index += 1
+			return self[self.index-1]
+		else:
+			raise StopIteration
+
+	def __getitem__(self, key):
+		"""Make Grasp class sliceable"""
+		if isinstance(key, slice):
+			dep = self.depth[key] if self.depth is not None else None
+			imc = self.im_center[key] if self.im_center is not None else None
+			angle = self.im_angle[key] if self.im_angle is not None else None
+			imax = self.im_axis[key] if self.im_axis is not None else None
+			wc = self.world_center[key] if self.world_center is not None else None
+			wax = self.world_axis[key] if self.world_axis is not None else None
+			con0 = self.c0[key] if self.c0 is not None else None
+			con1 = self.c1[key] if self.c1 is not None else None
+			qual = self.quality[key] if self.quality is not None else None
+			pred = self.prediction[key] if self.prediction is not None else None
+			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust)
+		elif isinstance(key, int):
+			length = self.num_grasps()
+			if key < 0:
+				key += length
+			if key >= length or key < 0:
+				raise IndexError(f"The index {key} is out of range for accessing a Grasp object of length {length}")
+			dep = self.depth[key] if self.depth is not None else None
+			imc = self.im_center[key] if self.im_center is not None else None
+			angle = self.im_angle[key] if self.im_angle is not None else None
+			imax = self.im_axis[key] if self.im_axis is not None else None
+			wc = self.world_center[key] if self.world_center is not None else None
+			wax = self.world_axis[key] if self.world_axis is not None else None
+			con0 = self.c0[key] if self.c0 is not None else None
+			con1 = self.c1[key] if self.c1 is not None else None
+			qual = self.quality[key] if self.quality is not None else None
+			pred = self.prediction[key] if self.prediction is not None else None
+			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust)
+		else:
+			raise TypeError("Invalid argument type for accessing a Grasp object.")
+
+	def __eq__(self, obj):
+		if type(self) != type(obj):
+			return False
+		if self.depth.shape != obj.depth.shape or not torch.min(torch.eq(self.depth, obj.depth)): return False
+		if self.world_center is not None and obj.world_center is not None:
+			if self.world_center.shape != obj.world_center.shape or not torch.min(torch.eq(self.world_center, obj.world_center)): return False
+			if self.world_axis.shape != obj.world_axis.shape or not torch.min(torch.eq(self.world_axis, obj.world_axis)): return False
+		if self.im_center is not None and obj.im_center is not None:
+			if self.im_center.shape != obj.im_center.shape or not torch.min(torch.eq(self.im_center, obj.im_center)): return False
+			if self.im_axis.shape != obj.im_axis.shape or not torch.min(torch.eq(self.im_axis, obj.im_axis)): return False
+			if self.im_angle.shape != obj.im_angle.shape or not torch.min(torch.eq(self.im_angle, obj.im_angle)): return False
+		if self.c0 is not None and obj.c0 is not None:
+			if self.c0.shape != obj.c0.shape or not torch.min(torch.eq(self.c0, obj.c0)): return False
+			if self.c1.shape != obj.c1.shape or not torch.min(torch.eq(self.c1, obj.c1)): return False
+		if self.objf is not None and obj.objf is not None:
+			if self.objf.split("/")[-1] != obj.objf.split("/")[-1]:
+				if not ((self.objf.split("/")[-1] in ["new_barclamp.obj", "bar_clamp.obj"]) and (obj.objf.split("/")[-1] in ["new_barclamp.obj", "bar_clamp.obj"])): return False
+		return True
 
 	def __str__(self):
 		"""Returns a string with grasp information in image coordinates"""
@@ -289,6 +370,7 @@ class Grasp:
 		prediction = self.prediction
 		if isinstance(self.prediction, torch.Tensor):
 			predicition = self.prediction.clone().detach().cpu().numpy().tolist()
+		objf = self.objf if self.objf is not None else "unknown"
 
 		grasp_data = {
 			"depth": depth,
@@ -302,11 +384,16 @@ class Grasp:
 			"oracle_method": self.oracle_method,
 			"oracle_robust": self.oracle_robust,
 			"quality": quality,
-			"prediction": prediction
+			"prediction": prediction,
+			"objf": objf
 		}
 
 		with open(fname, "w") as f:
 			json.dump(grasp_data, f, indent=4)
+
+	def num_grasps(self):
+		"""Return number of grasps in batch"""
+		return self.world_center.shape[0]
 
 	def trans_world_to_im(self, camera):
 		"""
@@ -343,7 +430,6 @@ class Grasp:
 
 		# calculate angle of im_axis
 		self.im_angle = torch.atan2(self.im_axis[...,1], self.im_axis[..., 0]).unsqueeze(-1)
-
 
 	@classmethod
 	def sample_grasps(cls, obj_f, num_samples, renderer, **kwargs): # min_qual=0.002, max_qual=1.0, save_grasp=""):
@@ -430,6 +516,8 @@ class Grasp:
 			kwargs["max_qual"] = 1.0
 		if "save_grasp" not in keys:
 			kwargs["save_grasp"] = ""
+		elif kwargs["save_grasp"][-1] == "/":
+				kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
 		if "sort" not in keys:
 			kwargs["sort"] = True
 		if "oracle_robust" not in keys:
@@ -446,8 +534,8 @@ class Grasp:
 		while len(cands) < num_samples:
 
 			# randomly sample surface points for possible grasps
-			samples_c0 = sample_points_from_meshes(mesh, num_samples*1500)[0]
-			samples_c1 = sample_points_from_meshes(mesh, num_samples*1500)[0]
+			samples_c0 = sample_points_from_meshes(mesh, num_samples*1000)[0]
+			samples_c1 = sample_points_from_meshes(mesh, num_samples*1000)[0]
 			norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
 
 			# mask to eliminate grasps that don't fit in the gripper
@@ -497,45 +585,114 @@ class Grasp:
 			if len(results) > 0:
 				it += 1
 
-		# transform successful grasps to image space
-		ret_grasps = []
-		for i in range(len(cands)):
-			if len(ret_grasps) >= num_samples:
-				break
+		# transform successful grasps to image space and convert to Grasp object
+
+		grasp_dict = {"world_center": [], "world_axis": [], "c0": [], "c1": [], "quality": []}
+		cls.logger.debug("sample_grasps_dexnet - number of grasps: %d", len(cands))
+		for i in range(len(cands)+1):
+
+			# return final grasp batch
+			cls.logger.debug("sample_grasps_dexnet - Line 510: %s", str(len(grasp_dict["c0"]) >= num_samples))
+			if len(grasp_dict["c0"]) >= num_samples:
+				for key in ["c0", "c1", "quality"]:
+					grasp_dict[key] = torch.tensor(grasp_dict[key]).to(renderer.device).float()
+					# print("key:", key, "\tshape:", grasp_dict[key].shape)
+
+				grasp = cls.init_from_dict(grasp_dict)
+
+				if kwargs["sort"]:
+					sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
+					grasp.world_center = torch.index_select(grasp.world_center, 0, sort_indices)
+					grasp.world_axis = torch.index_select(grasp.world_axis, 0, sort_indices)
+					grasp.c0 = torch.index_select(grasp.c0, 0, sort_indices)
+					grasp.c1 = torch.index_select(grasp.c1, 0, sort_indices)
+					grasp.quality = torch.index_select(grasp.quality, 0, sort_indices)
+
+				grasp.trans_world_to_im(renderer.camera)
+
+				if kwargs["save_grasp"]:
+					# save object to visualize grasp, grasp json, and approx. image of grasp
+					pathname = kwargs["save_grasp"]
+					if not os.path.isdir(pathname):
+						os.mkdir(pathname)
+					j, json_batch_name = 0, pathname + "/grasp_batch.json"
+					while os.path.exists(json_batch_name):
+						json_batch_name = pathname + "/grasp_batch_" + str(i) + ".json"
+						j += 1
+					grasp.save(json_batch_name)
+
+					for j, g in enumerate(grasp):
+						cls.logger.info("saving new grasp visualization object")
+						pathname = pathname + "/grasp_" + str(j) + "/"
+						if not os.path.exists(pathname):
+							os.mkdir(pathname)
+						img_name = pathname + "grasp_image.png"
+						obj_name = pathname + "grasp_vis.obj"
+						renderer.grasp_sphere((g.c0, g.c1), mesh, display=False, save=obj_name)
+						renderer.draw_grasp(mesh, g.c0, g.c1, save=img_name, display=False)
+
+				return grasp
 
 			g = cands[i]
 			quality = g[2]
 
-			# if quality <= kwargs["max_qual"] and quality >= kwargs["min_qual"]:	# server.py checks quality
-			contact0 = torch.tensor(g[-2][0]).to(renderer.device)
-			contact1 = torch.tensor(g[-2][1]).to(renderer.device)
-			world_center = world_centers_batch[g[-1]][g[0]]
-			world_axis = world_axes_batch[g[-1]][g[0]]
+			wc, wa = grasp_dict["world_center"], grasp_dict["world_axis"]
+			if i == 0:
+				grasp_dict["world_center"] = world_centers_batch[g[-1]][g[0]].unsqueeze(0)
+				grasp_dict["world_axis"] = world_axes_batch[g[-1]][g[0]].unsqueeze(0)
+			else:
+				grasp_dict["world_center"] = torch.cat((wc, world_centers_batch[g[-1]][g[0]].unsqueeze(0)), 0)
+				grasp_dict["world_axis"] = torch.cat((wa, world_axes_batch[g[-1]][g[0]].unsqueeze(0)), 0)
+			grasp_dict["c0"] += [g[-2][0]]
+			grasp_dict["c1"] += [g[-2][1]]
+			grasp_dict["quality"] += [quality]
 
-			grasp = Grasp(world_center=world_center, world_axis=world_axis, c0=contact0, c1=contact1, quality=quality, oracle_method="dexnet", oracle_robust=kwargs["oracle_robust"])
-			grasp.trans_world_to_im(renderer.camera)
+		cls.logger.error("Error - sample_grasps with batching isn't working.")
 
-			if kwargs["save_grasp"]: 	# and i<num_samples:
-				# save object to visualize grasp, grasp json, and approx. image of grasp
-				if kwargs["save_grasp"][-1] == "/":
-					kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
-				cls.logger.info("\nsaving new grasp visualization object")
-				obj_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".obj"
-				json_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".json"
-				img_name = kwargs["save_grasp"] + "/grasp_" + str(i) + ".png"
-				renderer.grasp_sphere((contact0, contact1), mesh, obj_name)
-				grasp.save(json_name)
-				renderer.draw_grasp(mesh, grasp.c0, grasp.c1, title=img_name, save=img_name)
+	def random_grasps(self, num_samples=64, sigma=1e-4, camera=None):
+		"""
+		Populate a singular grasp (or first grasp in batch) with similar grasps from random variations 
+		Parameters
+		----------
+		num_samples: float
+			Number of total grasps in result
+		sigma: float
+			Standard deviation of outputs normal distribution
+		Return
+		------
+		None
+		"""
 
-			ret_grasps.append(grasp)
+		if self.num_grasps() > 1:
+			self.c0 = self.c0[0].unsqueeze(0)
+			self.c1 = self.c1[0].unsqueeze(0)
 
-		if kwargs["sort"]:
-			# sort grasps in descending order of quality
-			ret_grasps.sort(key=lambda x: x.quality, reverse=True)
+		# vary world centers
+		original_center = self.world_center[0]
+		expanded_center = self.world_center[0].unsqueeze(0).expand(num_samples, -1)
+		noise_center = torch.normal(mean=torch.zeros_like(expanded_center), std=sigma)
+		world_center = expanded_center + noise_center
+		world_center[0] = original_center
+		self.world_center = world_center
 
-		return ret_grasps[:num_samples]
+		# vary world axes
+		original_axis = self.world_axis[0]
+		expanded_axis = self.world_axis[0].unsqueeze(0).expand(num_samples, -1)
+		noise_axis = torch.normal(mean=torch.zeros_like(expanded_axis), std=sigma)
+		world_axis = expanded_axis + noise_axis
+		world_axis[0] = original_axis
+		# re-normalize world axes
+		self.world_axis = world_axis / torch.norm(world_axis, dim=-1, keepdim=True)
 
-	def extract_tensors(self, d_im, debug=False):
+		# update other grasp info
+		self.quality = None
+		self.prediction = None
+		
+		# update 2D grasp info
+		if camera:
+			self.trans_world_to_im(camera=camera)
+
+	def extract_tensors(self, d_im):
 		"""
 		Use grasp information and depth image to get image and pose tensors in form of GQCNN input
 		Parameters
@@ -583,8 +740,6 @@ class Grasp:
 		
 		translate = ((self.im_center[0][0] - dim_cx) / 3, (self.im_center[0][1]- dim_cy) / 3)
 
-		# print("translate:", translate[0] / torch_image_tensor.shape[1], translate[1] / torch_image_tensor.shape[2])
-
 		cx = torch_image_tensor.shape[2] // 2
 		cy = torch_image_tensor.shape[1] // 2
 
@@ -609,25 +764,35 @@ class Grasp:
 			center=(cx, cy)
 		)
 
-		if debug:
-			rotated_only = transforms.functional.affine(
-				torch_image_tensor,
-				theta,
-				translate=(0,0),
-				scale=1,
-				shear=0,
-				interpolation=transforms.InterpolationMode.BILINEAR,
-				center=(cx, cy)
-			)
-			return pose_tensor, torch_image_tensor, translated_only, rotated_only, torch_rotated
+		# torch_rotated2 = transforms.functional.affine(
+		# 	translated_only,
+		# 	theta,
+		# 	translate=(0, 0),
+		# 	scale=1,
+		# 	shear=0, 
+		# 	interpolation=transforms.InterpolationMode.BILINEAR,
+		# 	center=(torch_image_tensor.shape[2] / 2, torch_image_tensor.shape[1] / 2)
+		# )
+
+		# # for debugging - rotation only, no translation
+		# rotated_only = transforms.functional.affine(
+		# 	torch_image_tensor,
+		# 	theta,
+		# 	translate=(0,0),
+		# 	scale=1,
+		# 	shear=0,
+		# 	interpolation=transforms.InterpolationMode.BILINEAR,
+		# 	center=(cx, cy)
+		# )
 
 		# 3 - crop image to size (32, 32)
 		torch_cropped = transforms.functional.crop(torch_rotated, cy-17, cx-17, 32, 32)
 		image_tensor = torch_cropped.unsqueeze(0)
 
-		return pose_tensor, image_tensor 
+		return pose_tensor, image_tensor
+		# return pose_tensor, torch_image_tensor, translated_only, rotated_only, torch_rotated, image_tensor, torch_rotated2
 
-	def extract_tensors_batch(self, dims, debug=False):
+	def extract_tensors_batch(self, dims):
 
 		r = Renderer()
 
@@ -641,7 +806,12 @@ class Grasp:
 			Grasp.logger.error("Grasp is not in 2D, must convert with camera intrinsics before tensor extraction.")
 			return None, None
 
-		batch_size = dims.shape[0]	# dims.shape: [batch_size, 1, 480, 640]
+		# dims.shape: [batch_size, 1, 480, 640] = [batch_size, channels, H, W]
+		batch_size = self.num_grasps()
+		if dims.dim() != 4:
+			dims = dims.repeat(batch_size, 1, 1, 1)
+		if dims.shape[0] != batch_size:
+			dims = dims[0].repeat(batch_size, 1, 1, 1)
 
 		# construct pose tensor from grasp depth
 		pose_tensor = self.depth
@@ -653,7 +823,7 @@ class Grasp:
 		out_shape = tuple(out_shape.type(torch.int)[0][1:].numpy())		# (160, 213)
 
 		torch_transform = transforms.Resize(out_shape, antialias=False) 
-		dims_resized = torch_transform(dims)		# shape: [batch_size, 1, 160, 213]
+		dims_resized = torch_transform(dims)		# shape: [batch_size, 1, 160, 213] = [batch_size, channels, H, W]
 
 		# 2 - translation wrt to grasp angle and grasp center
 		# 	translation matrix
@@ -662,9 +832,8 @@ class Grasp:
 		dim_cx_tens = torch.tensor([dim_cx]).expand(batch_size).to(device)
 		dim_cy_tens = torch.tensor([dim_cy]).expand(batch_size).to(device)
 
-		u = -1 * ((self.im_center[..., 0] - dim_cx_tens) / (dims_resized.shape[3])).float()
-		v = -1 * ((self.im_center[..., 1] - dim_cy_tens) / (dims_resized.shape[2])).float()
-		# 	should not be in pixels, but normalized based on image size, -1 to account for pytorch coordinates
+		u = (2 * ((dim_cx_tens - self.im_center[..., 0])/3) / (dims_resized.shape[3])).float()	# not in pixels, but normalized on (image size * 2)
+		v = (2 * ((dim_cy_tens - self.im_center[..., 1])/3) / (dims_resized.shape[2])).float()
 
 		translate = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]])
 		translate = translate.expand(batch_size, -1, -1).to(device).float()
@@ -683,59 +852,25 @@ class Grasp:
 		rotation[indices, 0, 1] = -1 * sin
 		rotation[indices, 1, 0] = sin
 
-		#	center and uncenter matrices
-		uncenter = torch.tensor([[[1, 0, -0.5], [0, 1, 0.5], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
-		center = torch.tensor([[[1, 0, 0.5], [0, 1, -0.5], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
-
-		#	combine transformations and apply them
-		if debug:
-			trans_rot_mat = torch.matmul(translate, rotation)[:, :2, :]
-			center_mat = center[:, :2, :]
-			translate_mat = translate[:, :2, :]
-			rotation_mat = rotation[:, :2, :]
-			
-			trans_grid = torch.nn.functional.affine_grid(translate_mat, dims_resized.shape)
-			trans_only = torch.nn.functional.grid_sample(dims_resized, trans_grid)
-
-			rot_grid = torch.nn.functional.affine_grid(rotation_mat, dims_resized.shape)
-			rot_only = torch.nn.functional.grid_sample(dims_resized, rot_grid)
-
-			trans_rot_grid = torch.nn.functional.affine_grid(trans_rot_mat, dims_resized.shape)
-			trans_rot = torch.nn.functional.grid_sample(dims_resized, trans_rot_grid)
-
-			center_grid = torch.nn.functional.affine_grid(center_mat, dims_resized.shape)
-			centered = torch.nn.functional.grid_sample(dims_resized, center_grid)
-
-			return pose_tensor, dims_resized, trans_only, rot_only, trans_rot, centered
-
-		# affine_mat = torch.matmul(torch.matmul(translate, uncenter), torch.matmul(rotation, uncenter))
-		affine_mat = torch.matmul(translate, rotation)
-		affine_mat = affine_mat[:, :2, :]
-		affine_grid = torch.nn.functional.affine_grid(affine_mat, dims_resized.shape)
-		dims_transformed = torch.nn.functional.grid_sample(dims_resized, affine_grid)
+		#	apply transformations
+		translate_mat = translate[:, :2, :]
+		rotation_mat = rotation[:, :2, :]
 		
-		# print("\ncenter:\n", center[0])
-		# print("\nuncenter:\n", uncenter[0])
-		# print("\ntranslate:\n", translate[0])
-		# print("\nrotation:\n", rotation[0])
-		# print("\naffine mat:\n", affine_mat[0])
-		# theta = theta[0].item()
-		# print("\ncos:", math.cos(theta))
-		# print("sin:", math.sin(theta))
-		# u = u[0].item()
-		# v = v[0].item()
-		# print("u:", u)
-		# print("v:", v)
-		# u2 = u - math.cos(theta)/2 + math.sin(theta)/2 + 0.5
-		# v2 = v - math.cos(theta)/2 - math.sin(theta)/2 + 0.5
-		# print("u2:", u2)
-		# print("v2:", v2)
+		# 	translation only
+		trans_grid = torch.nn.functional.affine_grid(translate_mat, dims_resized.shape)
+		trans_only = torch.nn.functional.grid_sample(dims_resized, trans_grid)
 
-		# r.display(dims_transformed[0].squeeze(0), title="translate & rotate only")
+		# 	rotation only
+		rot_grid = torch.nn.functional.affine_grid(rotation_mat, dims_resized.shape)
+		rot_only = torch.nn.functional.grid_sample(dims_resized, rot_grid)
+
+		# 	translation then rotation (applied separately)
+		trans_then_rot = torch.nn.functional.grid_sample(trans_only, rot_grid)
 
 		# 3 - crop images to 32x32 pixels
-		dims_transformed = dims_transformed[:, :, 64:96, 90:122]
-		# print("dims_transformed:", dims_transformed.shape)
+		top = dims_resized.shape[2] // 2 - 17	# 63
+		left = dims_resized.shape[3] // 2 - 17	# 89
+		dims_transformed = trans_then_rot[:, :, top:top+32, left:left+32]	# [:, :, 63:95, 89:121]
 
 		return pose_tensor, dims_transformed
 
@@ -763,17 +898,17 @@ class Grasp:
 		check_method = (oracle_method in ["dexnet", "pytorch"])
 		if oracle_method == "dexnet" or (not check_method and (self.oracle_method == "dexnet")):
 			if isinstance(robust, bool):
-				Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
+				# Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
 				return self.oracle_eval_dexnet(obj_file, robust=robust)
 			else:
-				Grasp.logger.debug("Oracle eval - dexnet, robust %r", self.oracle_robust)
+				# Grasp.logger.debug("Oracle eval - dexnet, robust %r", self.oracle_robust)
 				return self.oracle_eval_dexnet(obj_file, robust=self.oracle_robust)
 		
 		else:
 			if not renderer:
 				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 			else:
-				Grasp.logger.debug("Oracle eval - pytorch")
+				# Grasp.logger.debug("Oracle eval - pytorch")
 				return self.oracle_eval_pytorch(obj_file, renderer)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
@@ -797,12 +932,17 @@ class Grasp:
 		# save grasp info for oracle evaluation
 		Pyro4.config.COMMTIMEOUT = None
 		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
-		calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))
+		# calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))	# ensure grasp axis normalized
+		# calc_axes = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0), dim=1).unsqueeze(1)
+		calc_axes = self.world_axis / torch.norm(self.world_axis, dim=-1, keepdim=True)
 		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
-		save_nparr(calc_axis.detach().cpu().numpy(), "temp_axis.npy")
-		results = server.final_eval("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
+		save_nparr(calc_axes.detach().cpu().numpy(), "temp_axis.npy")
+		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
 
-		return results
+		# update quality info
+		self.quality = torch.from_numpy(np.array(results)).unsqueeze(1).to(self.world_axis.device).float()
+
+		return self.quality
 
 	def oracle_eval_pytorch(self, obj_file, renderer):
 		"""
@@ -865,36 +1005,41 @@ def save_nparr(image, filename):
 def test_select_grasp():
 	Grasp.logger.info("Running test_select_grasp...")
 
+	renderer1 = Renderer()
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(model=model)
-
-	# # TESTING TENSOR EXTRACTION AND VISUALIZATION
-	renderer1 = Renderer()
-	# depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
-	# grasp = Grasp(
-	# 	depth=0.607433762324266, 
-	# 	im_center=(416, 286), 
-	# 	im_angle=-2.896613990462929, 
-	# )
-	# pose, image = grasp.extract_tensors(depth0)	# tensor extraction
-	# print("prediction:", run1.run(pose, image))		# gqcnn prediction
-	# renderer1.display(image)
+	run1 = Attack(model=model, renderer=renderer1)
 
 	# TESTING GRASP SAMPLING
 	mesh, image = renderer1.render_object("data/new_barclamp.obj", display=True, title="imported renderer")
 	d_im = renderer1.mesh_to_depth_im(mesh, display=True)
+	dims = d_im.repeat(3, 1, 1, 1)
 
-	grasps = Grasp.sample_grasps("data/new_barclamp.obj", 10, renderer=renderer1) #, save_grasp="example-grasps", sort=False)
-	for i in range(len(grasps)):
-		grasp = grasps[i]
-		qual = grasp.quality
-		pose, image = grasp.extract_tensors(d_im)
-		prediction = run1.run(pose, image)
-		print("\nprediction size:", prediction.shape, prediction)
-		t = "id: " + str(i) + " prediction: " + str(prediction[0][0].item()) + "\noracle quality: " + str(qual.item()) #grasp.title_str()
-		fname = "example-grasps/grasp_" + str(i) + "_pred.png"
-		renderer1.display(image, title=t)	#, save=True, fname=fname)
+	grasp = Grasp.sample_grasps("data/new_barclamp.obj", 3, renderer=renderer1) #, save_grasp = "example-grasps/batch-test")
+
+	print("im_center shape:", grasp.im_center.shape)
+	print("im_axis shape:", grasp.im_axis.shape)
+	print("angle shape:", grasp.im_angle.shape, "\n\n")
+	print("world_center shape:", grasp.world_center.shape)
+	print("world_axis shape:", grasp.world_axis.shape)
+	print("c0 shape:", grasp.c0.shape)
+	print("c1 shape:", grasp.c1.shape)
+	print("quality:", grasp.quality.shape)
+	print(grasp.quality, "\n")
+
+	poses, images = grasp.extract_tensors_batch(dims)
+	pred = run1.run(poses, images)
+	print("prediction:", pred.shape, "\n", pred)
+	
+	# for i in range(len(grasps)):
+	# 	grasp = grasps[i]
+	# 	qual = grasp.quality
+	# 	pose, image = grasp.extract_tensors(d_im)
+	# 	prediction = run1.run(pose, image)
+	# 	print("\nprediction size:", prediction.shape, prediction)
+	# 	t = "id: " + str(i) + " prediction: " + str(prediction[0][0].item()) + "\noracle quality: " + str(qual.item()) #grasp.title_str()
+	# 	fname = "example-grasps/grasp_" + str(i) + "_pred.png"
+	# 	renderer1.display(image, title=t)	#, save=True, fname=fname)
 
 	Grasp.logger.info("Finished running test_select_grasp.")
 
@@ -933,26 +1078,20 @@ def test_save_and_load_grasps():
 	# Test init_from_dict with tensors vs init_from_dict with lists vs init_from_dict with floats vs read from json
 	g = Grasp.init_from_dict(fixed_grasp)	# from tensors
 	s1 = str(g)
-	# print("\ns1:", s1)
 
 	g2 = Grasp.init_from_dict(fixed_grasp2)	# from floats
 	s2 = str(g2)
-	# print("\ns2:", s2)
 
 	g3 = Grasp.init_from_dict(fixed_grasp3)	# from lists
 	s3 = str(g3)
-	# print("\ns3:", s3)
 
-	print("\nEqual when using init_from_dict with tensors vs floats vs lists?", s1 == s2 == s3)
-
+	print("Equal when using init_from_dict with tensors vs floats vs lists?", s1 == s2 == s3)
 	
 	# Test with init_from_dict vs read from json
-	# print("\ns1:", s1)
 	g.save("test-grasp.json")
 	g4 = Grasp.read("test-grasp.json")
 	s4 = str(g4)
-	# print("\ns4:", s4)
-	print("\nEqual when using init_from_dict and read?", s1==s4, "\n")
+	print("Equal when using init_from_dict and read?", s1==s4)
 
 
 	# Test trans_world_to_im from init_from_dict with tensors vs floats vs lists vs json
@@ -964,35 +1103,15 @@ def test_save_and_load_grasps():
 	s3 = str(g3)
 	g4.trans_world_to_im(r.camera)
 	s4 = str(g4)
-	print("\nEqual for trans_world_to_im from init_from_dict with tensors vs floats vs lists vs from read?", s1 == s2 == s3 == s4)
+	print("Equal for trans_world_to_im from init_from_dict with tensors vs floats vs lists vs from read?", s1 == s2 == s3 == s4)
 	
 
 	# Test equality before and after saving after using trans_world_to_im
-	# g.trans_world_to_im(r.camera)
-	# s1 = str(g)
-	# # print("\ns1:", s1)
 	g.save('test-grasp.json')
 
 	g5 = Grasp.read("test-grasp.json")
 	s5 = str(g5)
-	# print("\ns5:", s5)
-	print("\nEqual after reading after trans_world_to_im?", s1==s5, "\n")
-
-
-	# # Test dtypes and shapes of all attributes are equal
-	# for grasp in [g, g4, g5]:
-	# 	# print("im_angle:\t", grasp.im_angle.item())
-		# print("\ngrasp")
-		# print("\tquality:\t", type(grasp.quality), "\t", grasp.quality.dtype, "\t", grasp.quality)
-		# print("\tdepth:\t\t", type(grasp.depth), "\t", grasp.depth.dtype, "\t", grasp.depth)
-		# print("\tworld_center:\t", type(grasp.world_center), "\t", grasp.world_center.dtype, "\t", grasp.world_center)
-		# print("\tworld_axis:\t", type(grasp.world_axis), "\t", grasp.world_axis.dtype, "\t", grasp.world_axis)
-		# print("\tc0:\t\t", type(grasp.c0), "\t", grasp.c0.dtype, "\t", grasp.c0)
-		# print("\tc1:\t\t", type(grasp.c1), "\t", grasp.c1.dtype, "\t", grasp.c1)
-		# print("\tim_center:\t", type(grasp.im_center),"\t", grasp.im_center.dtype, "\t", grasp.im_center)
-		# print("\tim_angle:\t", type(grasp.im_angle), "\t", grasp.im_angle.dtype, "\t", grasp.im_angle)
-		# print("\tim_axis:\t", type(grasp.im_axis), "\t", grasp.im_axis.dtype, "\t", grasp.im_axis)
-
+	print("Equal after reading after trans_world_to_im?", s1==s5, "\n")
 
 	# Test model inference and trans_world_to_im on saved grasps
 	model = KitModel("weights.npy")
@@ -1008,28 +1127,20 @@ def test_save_and_load_grasps():
 	pred1 = run1.run(pose1, image1)[0][0].item()	# gqcnn predictions
 	pred2 = run1.run(pose2, image2)[0][0].item()
 	pred3 = run1.run(pose3, image3)[0][0].item()
-	print("\nprediction 1:", pred1)
-	print("prediction 2:", pred2)
-	print("prediction 3:", pred3)
-	print("\nModel predictions the same on fixed and read grasps?", pred1 == pred2) # == pred3)
+	print("\nModel predictions the same on fixed and read grasps?", pred1 == pred2 == pred3)
 
 
 	# Test using trans_to_im again
 	g.trans_world_to_im(r.camera)
 	s1 = str(g)
-	print("\nangle:", g.im_angle)
-	print("\tim_axis:", g.im_axis)
-	# print("\tworld_axis:", g.world_axis)
-	print("\nangle:", g2.im_angle)
-	print("\tim_axis:", g2.im_axis)
-	# print("\tworld_axis:", g2.world_axis)
-	print("\nEqual after using trans_to_im again?", s1 == s2)
+	print("Equal after using trans_to_im again?", s1 == s2)
 
-	print("")
 	Grasp.logger.info("Finished running test_save_and_load_grasps.")
 	
 def test_trans_world_to_im():
 	Grasp.logger.info("Running test_trans_world_to_im...")
+	display_images = []
+	display_titles = []
 
 	r = Renderer()
 	mesh, _ = r.render_object("data/bar_clamp.obj", display=False)
@@ -1039,19 +1150,29 @@ def test_trans_world_to_im():
 	grasp.trans_world_to_im(camera=r.camera)
 
 	pose, image = grasp.extract_tensors(dim)
-	r.display(image, "processed depth image")
-	r.draw_grasp(dim, grasp.c0, grasp.c1, "draw_grasp")
 
-	r.grasp_sphere((grasp.c0, grasp.c1), mesh, "test_draw_grasp.obj", display=True)
+	draw_grasp_im = r.draw_grasp(dim, grasp.c0, grasp.c1, "draw_grasp", display=False)
+	display_images.append(draw_grasp_im)
+	display_titles.append("draw_grasp")
 
-	# # model evaluation
-	# model = KitModel("weights.npy")
-	# model.eval()
-	# run1 = Attack(model=model)
-	# pose, image = grasp.extract_tensors(dim)
+	# r.grasp_sphere((grasp.c0, grasp.c1), mesh, "test_draw_grasp.obj", display=True)
+	mesh = r.grasp_sphere((grasp.c0, grasp.c1), mesh, display=False)
+	display_images.append(mesh)
+	display_titles.append("grasp_sphere")
 
-	# model_out = run1.run(pose, image)[0][0].item()
+
+	# model evaluation
+	model = KitModel("weights.npy")
+	model.eval()
+	run1 = Attack(model=model)
+	pose, image = grasp.extract_tensors(dim)
+
+	model_out = run1.run(pose, image)[0][0].item()
 	# r.display(image, title="processed dim\npred: "+str(model_out))
+	display_images.append(image)
+	display_titles.append("processed depth image\npred: " + str(model_out))
+
+	r.display(images=display_images, title=display_titles, shape=(1,3))
 
 	Grasp.logger.info("Finished running test_trans_world_to_im.")
 
@@ -1096,14 +1217,23 @@ def test_oracle_eval():
 	g = Grasp.read("example-grasps/grasp_0.json")
 	g.trans_world_to_im(camera=r.camera)
 
-	pytorch_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)[0].item()
+	# pytorch_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)[0].item()
 	dexnet_qual = g.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
 	dexnet_qual_robust = g.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=True)
 
-	print("pytorch quality:", pytorch_qual)
+	# print("pytorch quality:", pytorch_qual)
 	print("dexnet quality:", dexnet_qual)
 	print("dexnet quality robust:", dexnet_qual_robust)
-	print("diff:", pytorch_qual - dexnet_qual)
+	# print("diff:", pytorch_qual - dexnet_qual)
+
+	# test oracle eval for batched grasps
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
+	gb = Grasp.read_batch(files)
+	print("\nqualities:\t\t", gb.quality.detach().cpu().numpy().tolist())
+	quals_nr = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
+	quals_r = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
+	print("robust oracle:\t\t", quals_r)
+	print("nonrobust oracle:\t", quals_nr)
 
 	# # iterate through dataset in data/data
 	# data_dir = "data/data/data"
@@ -1149,10 +1279,12 @@ def test_batching():
 	gb = Grasp.read_batch(files)
 	assert gb.depth.shape == torch.Size([4,1])
 	assert gb.im_center.shape == torch.Size([4,2])
+	assert gb.num_grasps() == 4
 	files2 = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.png", "grasp_2.json"]
 	gb2 = Grasp.read_batch(files2)
 	assert gb2.depth.shape == torch.Size([1,1])
 	assert gb2.im_center.shape == torch.Size([1,2])
+	assert gb2.num_grasps() == 1
 
 	# try saving a batch of grasps and reading from one file
 	gb.save("test-batch.json")
@@ -1170,6 +1302,7 @@ def test_batching():
 
 	gb.trans_world_to_im(r.camera)
 	g0 = Grasp.read("example-grasps/grasp_0.json")
+	assert g0.num_grasps() == 1
 	g1 = Grasp.read("example-grasps/grasp_1.json")
 	g2 = Grasp.read("example-grasps/grasp_2.json")
 	g3 = Grasp.read("example-grasps/grasp_3.json")
@@ -1183,35 +1316,76 @@ def test_batching():
 	# test extract_tensors in a batch
 	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
 	dim = r.mesh_to_depth_im(mesh, display=False)
-	dims = dim.repeat(4, 1, 1, 1)
+	# dims = dim.repeat(4, 1, 1, 1)
 	pose0, image0 = g0.extract_tensors(dim)
-	print("\nBATCH PROCESSING")
-	poses, images = gb.extract_tensors_batch(dims)
+	poses, images = gb.extract_tensors_batch(dim)
 
-	print("\nimages:", images.shape)
-	print("poses:", poses.shape)
+	assert torch.max(pose0 - poses[0]) == 0
 
 	image1 = images[0]
-	print("image0", image0.shape)
-	print("image1:", image1.shape)
+	pose1 = poses[0]
+	
 	diff = image1 - image0
-	print("diff:", torch.max(diff))
+	Grasp.logger.debug("processed image diff: %f", torch.max(diff))
 
 	if torch.max(diff).item() > 0:
-		r.display(image0, title="extract_tensors")
-		r.display(image1, title="extract_tensors_batch")
-		r.display(diff, title="diff")
+		r.display([image0, image1, diff], title="extract_tensors vs batched")
+		# r.display(image1, title="extract_tensors_batch")
+		# r.display(diff, title="diff")
 
 	# compare model predictions
 	model = KitModel("weights.npy")
 	model.eval()
 	run1 = Attack(model=model)
-	print("extract_tensors:", run1.run(pose0, image0)[0][0].item())	#, g0.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=True, renderer=r))
-	print("extract_tensors_batch:", run1.run(poses, images)[0][0].item())
+	pred0, pred1 = run1.run(pose0, image0)[0][0].item(), run1.run(poses, images)[0][0].item()
+	Grasp.logger.debug("extract_tensors: %f", pred0)
+	Grasp.logger.debug("extract_tensors_batch: %f", pred1)
+	Grasp.logger.debug("prediction diff: %f", pred1 - pred0)
 
 	Grasp.logger.info("Finished running test_batching.")
 
+def test_slicing():
+	Grasp.logger.info("Running test_slicing...")
+	
+	# try loading a batch of grasps from json files
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
+	gb = Grasp.read_batch(files)
+	assert gb.depth.shape == torch.Size([4,1])
+	assert gb.im_center.shape == torch.Size([4,2])
+	assert gb.num_grasps() == 4
+	g0 = Grasp.read("example-grasps/grasp_0.json")
+	assert g0.num_grasps() == 1
+	files2 = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json"]
+	gb2 = Grasp.read_batch(files2)
+	assert gb2.num_grasps() == 2
+
+	print("testing __eq__")
+	assert gb != 4
+	assert gb == gb
+	assert g0 == g0
+	assert gb2 == gb2
+	g0_dup = Grasp.read("example-grasps/grasp_0.json")
+	assert g0 == g0_dup
+	g0_dup.depth[0][0] = 45.4
+	assert g0 != g0_dup
+
+	g_slice0 = gb[0]
+	assert g_slice0 == g0
+	gb_slice = gb[0:2]
+	assert gb_slice == gb2
+
+	for g in gb:
+		assert g.num_grasps() == 1
+
+	for i, g in enumerate(gb):
+		assert g.num_grasps() == 1
+
+	Grasp.logger.info("Finished running test_slicing.")
+
 def test_processing_batching():
+
+	Grasp.logger.error("test_processing_batching was only for debugging - no longer functional")
+	return None
 
 	Grasp.logger.info("Running test_processing_batching...")
 
@@ -1223,40 +1397,157 @@ def test_processing_batching():
 	gb.trans_world_to_im(r.camera)
 	g0.trans_world_to_im(r.camera)
 
-	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
+	mesh, image = r.render_object("data/new_barclamp.obj", display=False)
 	dim = r.mesh_to_depth_im(mesh, display=False)
 	dims = dim.repeat(4, 1, 1, 1)
-	pose, resized, trans, rot, trans_rot = g0.extract_tensors(dim, debug=True)
-	pose_batch, resized_batch, trans_batch, rot_batch, trans_rot_batch, centered = gb.extract_tensors_batch(dims, debug=True)
+	pose, resized, trans, rot, trans_rot, crop, rot2 = g0.extract_tensors(dim)
+	pose_b, resized_b, trans_b, rot_b, rot_b2, trans_rot_b, crop_b, crop_b2 = gb.extract_tensors_batch(dims)
 
-	pose0 = pose_batch[0]
-	pose_diff = torch.max(pose0 - pose)
-	print("\npose_diff:", pose_diff.item(), "\n")
+	r.display([rot, rot_b[0], rot_b2[0], (rot_b[0]-rot_b2[0]), rot-rot_b[0], rot-rot_b2[0]], shape=(2, 3), title=["no batch", "batch", "batch w t", "batch vs batch w t", "no batch vs batch", "no batch vs batch w t"])
+	print("rot - rotb:", torch.max(rot - rot_b[0]).item())
+	print("rot - rotb2:", torch.max(rot - rot_b2[0]).item())
 
-	resized0 = resized_batch[0]
-	resized_diff = torch.max(resized0 - resized)
-	print("resized_diff:", resized_diff.item(), "\n")
+	"""
+	assert pose == pose_b[0]
+	resized_diff = torch.max(resized - resized_b[0]).item()
+	assert resized_diff == 0
 
-	trans0 = trans_batch[0]
-	trans_diff = torch.max(trans0 - trans)
-	print("trans_diff:", trans_diff.item(), "\n")
+	trans0 = trans_b[0]
+	trans_diff = torch.max(trans - trans0).item()
+	print("trans_diff:", trans_diff, "\n")
+	assert trans_diff <= EPS
 
-	rot0 = rot_batch[0]
-	rot_diff = torch.max(rot0 - rot)
+	rot0 = rot_b[0]
+	rot_diff = torch.max(rot - rot0)
 	print("rot_diff:", rot_diff.item(), "\n")
+	
+	trans_rot0 = trans_rot_b[0]
+	trans_rot_diff = torch.max(trans_rot - trans_rot0)
+	print("diff trans_then_rot:", trans_rot_diff.item(), "\n")
+	"""
 
-	r.display(centered[0], "center translation only")	# NOT WORKING AS EXPECTED
-	r.display(trans0, "tensor_extraction translation only")
-	r.display(trans, "tensor_extraction_batch translation only")
-	r.display(trans-trans0, "diff translation only")
+	crop0 = crop_b[0]
+	crop1 = crop_b2[0]
+	crop_diff = crop-crop0
+	crop_diff2 = crop-crop1
+	print("crop_diff:", torch.max(crop_diff).item(), "\n")
+	print("crop_diff 2:", torch.max(crop_diff2).item(), "\n")
 
-	test = torch.from_numpy(np.load("data/grasp_test2.npy")).permute(0,3,1,2)
-	r.display(test, title="gqcnn grasp_to_tensors")
+	display_images = [crop, crop1, crop0, (crop-crop), crop_diff, crop_diff2]
+	display_titles = ["no batch", "batch", "batch w t", "no diff", "batch diff", "batch w t diff"]
+	r.display(display_images, shape=(2, 3), title=display_titles)
 
-	save_dim = dim.unsqueeze(0).permute(0,2,3,1).cpu().detach().numpy()
-	save_nparr(save_dim, "np_dim_test.npy")
+	# display_images = [trans, rot, trans_rot, crop, trans0, rot0, trans_rot0, crop0, (trans-trans0), (rot-rot0), (trans_rot-trans_rot0), crop_diff]
+	# display_titles = ["trans", "rot", "trans_rot", "crop", "trans batch", "rot batch", "trans rot batch", "crop batch", "trans diff", "rot diff", "trans rot diff", "crop diff"]
+	# r.display(display_images, shape=(3, 4), title=display_titles)
+
+	model = KitModel("weights.npy")
+	model.eval()
+	run1 = Attack(model=model, renderer=r)
+	pred0 = run1.run(pose, crop)[0][0].item()
+	pred1 = run1.run(pose_b, crop_b)[0][0].item()
+	pred2 = run1.run(pose_b, crop_b2)[0][0].item()
+	print("extract_tensors:", pred0)
+	print("extract_tensors_batch:", pred1)
+	print("extract_tensors_batch2:", pred2)
+	print("prediction diff:", pred0 - pred1)
+	print("prediction diff:", pred0 - pred2)
+
+	grasp_pic = r.draw_grasp(image, g0.c0, g0.c1, display=False)
+	grasp_sphere = r.grasp_sphere((g0.c0, g0.c1), mesh, display=False)
+	display_images2 = [grasp_pic, grasp_sphere, "", crop, crop0, crop1]
+	display_titles2 = ["grasp axis", "grasp vis", "", "non-batch: " + str(pred0), "batch: " + str(pred1), "batch2: " + str(pred2)]
+	r.display(display_images2, shape=(2,3), title=display_titles2)
+
+	# test = torch.from_numpy(np.load("data/grasp_test2.npy")).permute(0,3,1,2)
+	# r.display(test, title="gqcnn grasp_to_tensors")
 
 	Grasp.logger.info("Finished running test_processing_batching.")
+
+def test_oracle_check(iteration):
+	Grasp.logger.info(f"Running oracle volatility check {iteration}...")
+
+	grasp_files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
+	files = [str_ for str_ in grasp_files for _ in range(16)]
+	assert len(files) == 64
+
+	gb = Grasp.read_batch(files)
+	start1 = time.time()
+	oracle_quals = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
+	end1 = time.time()
+	oracle_quals_nr = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet", robust=False)
+	end2 = time.time()
+	oracle_quals = oracle_quals.squeeze().detach().cpu().numpy()
+	oracle_quals_nr = oracle_quals_nr.squeeze().detach().cpu().numpy()
+	assert len(oracle_quals) == len(files)
+
+	robust_time = end1 - start1
+	nonrobust_time = end2 - end1
+	Grasp.logger.info(f"Time for robust evaluation: {robust_time}")
+	Grasp.logger.info(f"Time for non-robust evaluation: {nonrobust_time}")
+
+	x_values = [0, 1, 2, 3]
+	total_points = [oracle_quals[0:16], oracle_quals[16:32], oracle_quals[32:48], oracle_quals[48:]]
+	assert len(total_points) == 4
+	nr_points = [oracle_quals_nr[0:16], oracle_quals_nr[16:32], oracle_quals_nr[32:48], oracle_quals_nr[48:]]
+
+	plt.figure(figsize=(9, 9))
+	for i, color1_set in enumerate(total_points):
+		if i == 0:
+			plt.scatter([x_values[i]]*len(color1_set), color1_set, color='red', label='robust')
+		else:
+			plt.scatter([x_values[i]]*len(color1_set), color1_set, color='red')
+
+	for i, color2_set in enumerate(nr_points):
+		if i == 0:
+			plt.scatter([x_values[i]]*len(color2_set), color2_set, color='blue', label='non-robust')
+		else:
+			plt.scatter([x_values[i]]*len(color2_set), color2_set, color='blue')
+
+	plt.xlabel('Grasp')
+	plt.ylabel('Oracle Quality')
+	title_str = f"Consistency of oracle evaluations\nbatch_size: 64\nnum_samples: 25\nrobust time (s): {robust_time}\nnon-robust time (s): {nonrobust_time}"
+	plt.title(title_str)
+	plt.legend()
+	plt.gca().xaxis.set_major_locator(MaxNLocator(integer=True))
+
+	plt.show()
+	# filesave = "ex" + str(10+iteration) + ".png"
+	# Grasp.logger.info(f"SAVING FIGURE {iteration}")
+	# plt.savefig(filesave)
+
+def test_random_grasps():
+	Grasp.logger.info("Testing random_grasps...")
+	r = Renderer()
+
+	# randomize grasp from file
+	g_orig = Grasp.read("example-grasps/grasp_0.json")
+	g = Grasp.read("example-grasps/grasp_0.json")
+	g.random_grasps(num_samples=10, camera=r.camera)
+	assert g.num_grasps() == 10
+	g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	print("\nrand qualities:", g.quality.shape, "\n", g.quality)
+
+	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json"]
+	gb = Grasp.read_batch(files)
+	gb.random_grasps(num_samples=5, camera=r.camera)
+	assert gb.num_grasps() == 5
+	assert gb.c0.shape[0] == 1
+	assert gb.c1.shape[0] == 1
+	res = gb.oracle_eval("data/new_barclamp.obj", renderer=r)
+	print("\n\nrand batch qualities:", gb.quality.shape, "\n", gb.quality)
+
+	Grasp.logger.info("Finished testing random_grasps.")
+
+def generate_grasp_dataset(dataset_dir):
+	Grasp.logger.info(f"Generating grasp dataset in directory {dataset_dir}...")
+
+	renderer = Renderer()
+	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
+
+	grasps = Grasp.sample_grasps("data/bar_clamp.obj", 10, renderer=renderer, min_qual=0.002, save_grasp=dataset_dir)
+
+	Grasp.logger.info(f"Finished generating grasp dataset to directory {dataset_dir}")
 
 if __name__ == "__main__":
 
@@ -1266,5 +1557,8 @@ if __name__ == "__main__":
 	# test_oracle_selection()
 	# test_oracle_eval()
 	# test_batching()
-	test_processing_batching()
-
+	# test_slicing()
+	# for i in range(4):
+	# 	test_oracle_check(i)
+	# test_random_grasps()
+	generate_grasp_dataset("grasp-dataset")
