@@ -95,7 +95,6 @@ class GraspTorch(object):
         if contact_normals is not None:
             self.contact_normals = contact_normals.double()
 
-
     def make2D(self, updateCamera=False,camera_intr=None):
         if camera_intr==None:
             camera_intr = self.camera_intr
@@ -137,7 +136,59 @@ class GraspTorch(object):
 
         return camera_intr
 
-        
+    @staticmethod
+    def normal_diagonal_3D(reference, var_triple, sampleCount, meanZero=False):
+        output_size = [sampleCount] + list(reference.shape)
+        #reference = torch.unsqueeze(reference,0)
+        reference = reference.expand(output_size)
+        output_samples = torch.zeros_like(reference)
+        for i in range(3):
+            if meanZero:
+                output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2)
+            else:
+                output_samples[...,i] = torch.normal(reference[...,i], var_triple[i] ** 2)
+        return output_samples
+    
+    def generateNoisyGrasps(self, sampleCount=1):
+                #          center,
+                #  angle=0.0,
+                #  depth=1.0,
+                #  width=0.05,
+                #  camera_intr=None,
+                #  contact_points=None,
+                #  contact_normals=None,
+                #  axis3D=None,
+                #  num_cone_faces=8, 
+                #  friction_coef=0.5,
+                #  torque_scaling=None
+        sigma_grasp_trans_x= math.sqrt(0.005 ** 2 + 0.01 ** 2)
+        sigma_grasp_trans_y= math.sqrt(0.005 ** 2 + 0.01 ** 2)
+        sigma_grasp_trans_z= math.sqrt(0.005 ** 2 + 0.01 ** 2)
+        sigma_grasp_rot_x= math.sqrt(0.001 ** 2 + 0.01 ** 2)
+        sigma_grasp_rot_y= math.sqrt(0.001 ** 2 + 0.01 ** 2)
+        sigma_grasp_rot_z= math.sqrt(0.001 ** 2 + 0.01 ** 2)
+        R_sample_sigma = torch.eye(3,device=self.axis3D.device,dtype=self.axis3D.dtype) # 3x3
+
+        t_var = (sigma_grasp_trans_x,sigma_grasp_trans_y,sigma_grasp_trans_z)
+        r_var = (sigma_grasp_rot_x, sigma_grasp_rot_y, sigma_grasp_rot_z)
+
+        # R_sample_sigma is treated as (1 grasp dim times) x 3 x 3
+        center_in_noise_frame = torch.squeeze(torch.matmul(torch.transpose(R_sample_sigma,-1,-2),torch.unsqueeze(self.center3D,-1)))
+        center_noised_in_noise_frame = self.normal_diagonal_3D(center_in_noise_frame, t_var, sampleCount)
+        # R_sample_sigma is treated as 1 x (1 grasp dim times) x 3 x 3
+        center3D = torch.squeeze(R_sample_sigma.matmul(torch.unsqueeze(center_noised_in_noise_frame,-1)),-1)
+
+        axis_in_noise_frame = torch.matmul(torch.transpose(R_sample_sigma,-1,-2), torch.unsqueeze(self.axis3D,-1))
+        randRotVel = self.normal_diagonal_3D(self.axis3D, r_var, sampleCount, meanZero=True)
+        randRotVel = torch.reshape(randRotVel, (-1,3))
+        randRelRotMat = tf.so3_exp_map(randRotVel)
+        randRelRotMat = torch.reshape(randRelRotMat, list(center3D.shape)+[3])
+        # R_sample_sigma is treated as 1 x (1 grasp dim times) x 3 x 3
+        axis3D = torch.squeeze(torch.matmul(R_sample_sigma, torch.matmul(randRelRotMat, axis_in_noise_frame)),-1)
+        return GraspTorch(center=center3D, axis3D=axis3D, 
+                          friction_coef=self.friction_coef, num_cone_faces=self.num_cone_faces,
+                          torque_scaling=self.torque_scaling, width=self.width,
+                          camera_intr=self.camera_intr)
     
     @property
     def ray_directions(self):
@@ -1230,6 +1281,14 @@ def test_quality():
     qual_tensor.backward(inputs=axis3D)
     print('after', axis3D.grad)
     print('value', axis3D)
+
+    noised_grasps = graspObj.generateNoisyGrasps(25)
+    noised_tensor = com_qual_func.quality(mesh, noised_grasps)
+    torch.set_printoptions(precision=8)
+    print(qual_tensor)
+    print(noised_tensor)
+    torch.set_printoptions(precision=4)
+
 
     optimizer = optim.SGD([axis3D, center3D], lr=0.001, momentum=0.0)
     for i in range(10):
