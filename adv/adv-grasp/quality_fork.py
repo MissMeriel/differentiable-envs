@@ -144,9 +144,9 @@ class GraspTorch(object):
         output_samples = torch.zeros_like(reference)
         for i in range(3):
             if meanZero:
-                output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2)
+                output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i))
             else:
-                output_samples[...,i] = torch.normal(reference[...,i], var_triple[i] ** 2)
+                output_samples[...,i] = torch.normal(reference[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i+10))
         return output_samples
     
     def generateNoisyGrasps(self, sampleCount=1):
@@ -1290,11 +1290,33 @@ def test_quality():
     torch.set_printoptions(precision=4)
 
 
+    optimizer = optim.SGD([axis3D, center3D], lr=1, momentum=0.0)
+    for i in range(10):
+        optimizer.zero_grad()
+        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+        noised_grasps = graspObj.generateNoisyGrasps(25)
+        noised_tensor = com_qual_func.quality(mesh, noised_grasps)   
+        qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
+        # com_qual_func.savemat(f'quality_out{i}.mat')
+        qual_tensor.backward()
+        print('iteration: ', i)
+        print('raw cf: ',noised_tensor.squeeze().numpy(force=True))
+        print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.002))
+        print('loss score:',qual_tensor.squeeze().numpy(force=True))
+        print('grasp-update', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
+        print('new-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+        print()
+        optimizer.step()
+
     optimizer = optim.SGD([axis3D, center3D], lr=0.001, momentum=0.0)
     for i in range(10):
         optimizer.zero_grad()
+        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+   
         qual_tensor = -com_qual_func.quality(mesh, graspObj)
-        com_qual_func.savemat(f'quality_out{i}.mat')
+        # com_qual_func.savemat(f'quality_out{i}.mat')
         qual_tensor.backward()
         print('quality:',-qual_tensor.squeeze().numpy(force=True))
         print('grad', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
