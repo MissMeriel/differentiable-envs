@@ -26,9 +26,9 @@ from pytorch3d.renderer import (
         TexturesVertex
 )
 from qpth.qp import QPFunction, QPSolvers
-from ll4ma_opt.problems.problem import Problem
-from ll4ma_opt.problems import SteinWrapper
-from ll4ma_opt.solvers import GradientDescent,BFGSMethod
+#from ll4ma_opt.problems.problem import Problem
+#from ll4ma_opt.problems import SteinWrapper
+#from ll4ma_opt.solvers import GradientDescent,BFGSMethod
 
 # Grasp2D class copied from: https://github.com/BerkeleyAutomation/gqcnn/blob/master/gqcnn/grasping/grasp.py
 class GraspTorch(object):
@@ -185,7 +185,7 @@ class GraspTorch(object):
         randRelRotMat = torch.reshape(randRelRotMat, list(center3D.shape)+[3])
         # R_sample_sigma is treated as 1 x (1 grasp dim times) x 3 x 3
         axis3D = torch.squeeze(torch.matmul(R_sample_sigma, torch.matmul(randRelRotMat, axis_in_noise_frame)),-1)
-        return GraspTorch(center=center3D, axis3D=axis3D, 
+        return GraspTorch(center3D, axis3D=axis3D, 
                           friction_coef=self.friction_coef, num_cone_faces=self.num_cone_faces,
                           torque_scaling=self.torque_scaling, width=self.width,
                           camera_intr=self.camera_intr)
@@ -1289,7 +1289,10 @@ def test_quality():
     print(noised_tensor)
     torch.set_printoptions(precision=4)
 
-
+    center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
+    axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
+    axis3D.retain_grad() 
+    center3D.retain_grad()
     optimizer = optim.SGD([axis3D, center3D], lr=1, momentum=0.0)
     for i in range(10):
         optimizer.zero_grad()
@@ -1309,6 +1312,10 @@ def test_quality():
         print()
         optimizer.step()
 
+    center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
+    axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
+    axis3D.retain_grad() 
+    center3D.retain_grad()
     optimizer = optim.SGD([axis3D, center3D], lr=0.001, momentum=0.0)
     for i in range(10):
         optimizer.zero_grad()
