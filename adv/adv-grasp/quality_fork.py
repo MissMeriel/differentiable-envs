@@ -144,9 +144,6 @@ class GraspTorch(object):
         output_samples = torch.zeros_like(reference)
         for i in range(3):
             output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i))
-            
-        if not meanZero:
-            output_samples += reference
         return output_samples
     
     def generateNoisyGrasps(self, sampleCount=1):
@@ -174,12 +171,12 @@ class GraspTorch(object):
 
         # R_sample_sigma is treated as (1 grasp dim times) x 3 x 3
         center_in_noise_frame = torch.squeeze(torch.matmul(torch.transpose(R_sample_sigma,-1,-2),torch.unsqueeze(self.center3D,-1)))
-        center_noised_in_noise_frame = self.normal_diagonal_3D(center_in_noise_frame, t_var, sampleCount)
+        center_noised_in_noise_frame = self.normal_diagonal_3D(center_in_noise_frame, t_var, sampleCount) + center_in_noise_frame
         # R_sample_sigma is treated as 1 x (1 grasp dim times) x 3 x 3
         center3D = torch.squeeze(R_sample_sigma.matmul(torch.unsqueeze(center_noised_in_noise_frame,-1)),-1)
 
         axis_in_noise_frame = torch.matmul(torch.transpose(R_sample_sigma,-1,-2), torch.unsqueeze(self.axis3D,-1))
-        randRotVel = self.normal_diagonal_3D(self.axis3D, r_var, sampleCount, meanZero=True)
+        randRotVel = self.normal_diagonal_3D(self.axis3D, r_var, sampleCount)
         randRotVel = torch.reshape(randRotVel, (-1,3))
         randRelRotMat = tf.so3_exp_map(randRotVel)
         randRelRotMat = torch.reshape(randRelRotMat, list(center3D.shape)+[3])
@@ -1293,8 +1290,9 @@ def test_quality():
     axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
     axis3D.retain_grad() 
     center3D.retain_grad()
-    optimizer = optim.SGD([axis3D, center3D], lr=0.25, momentum=0.0)
+    optimizer = optim.Rprop([axis3D, center3D], lr=0.00001)
     #optimizer = optim.SGD([center3D], lr=0.25, momentum=0.0)
+    print('original-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
     for i in range(20):
         optimizer.zero_grad()
         graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
@@ -1310,9 +1308,9 @@ def test_quality():
         print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.002))
         print('loss score:',qual_tensor.squeeze().numpy(force=True))
         print('grasp-update', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
+        optimizer.step()
         print('new-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
         print()
-        optimizer.step()
 
     center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
     axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
