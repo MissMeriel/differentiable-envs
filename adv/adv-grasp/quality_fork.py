@@ -143,10 +143,10 @@ class GraspTorch(object):
         reference = reference.expand(output_size)
         output_samples = torch.zeros_like(reference)
         for i in range(3):
-            if meanZero:
-                output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i))
-            else:
-                output_samples[...,i] = torch.normal(reference[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i+10))
+            output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i))
+            
+        if not meanZero:
+            output_samples += reference
         return output_samples
     
     def generateNoisyGrasps(self, sampleCount=1):
@@ -1293,13 +1293,15 @@ def test_quality():
     axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
     axis3D.retain_grad() 
     center3D.retain_grad()
-    optimizer = optim.SGD([axis3D, center3D], lr=1, momentum=0.0)
-    for i in range(10):
+    optimizer = optim.SGD([axis3D, center3D], lr=0.25, momentum=0.0)
+    #optimizer = optim.SGD([center3D], lr=0.25, momentum=0.0)
+    for i in range(20):
         optimizer.zero_grad()
         graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
                         friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
         noised_grasps = graspObj.generateNoisyGrasps(25)
         noised_tensor = com_qual_func.quality(mesh, noised_grasps)   
+        com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
         qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
         # com_qual_func.savemat(f'quality_out{i}.mat')
         qual_tensor.backward()
@@ -1363,88 +1365,88 @@ def test_quality():
     # Call quality with the Grasp2D and mesh
         com_qual_func.quality(mesh, grasp3)
 
-def test_stein():
+# def test_stein():
 
-    renderer, device = pytorch_setup()
-    with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
-    faces = faces_idx.verts_idx
-    verts_rgb = torch.ones_like(verts)[None]
-    textures = TexturesVertex(verts_features=verts_rgb.to(device))
+#     renderer, device = pytorch_setup()
+#     with record_function("load_obj"):
+#         verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
+#     faces = faces_idx.verts_idx
+#     verts_rgb = torch.ones_like(verts)[None]
+#     textures = TexturesVertex(verts_features=verts_rgb.to(device))
 
-    mesh = Meshes(
-        verts=[verts.to(device)],
-        faces=[faces.to(device)],
-        textures=textures
-    )
-    config_dict = {
-        "torque_scaling":1000,
-        "soft_fingers":1,
-        "friction_coef": 0.8, # TODO use 0.8 in practice
-        "antipodality_pctile": 1.0 
-    }
-    i=0
-    f = open('data/data/data'+str(i)+'.json')
-    grasp_dict = json.load(f)
+#     mesh = Meshes(
+#         verts=[verts.to(device)],
+#         faces=[faces.to(device)],
+#         textures=textures
+#     )
+#     config_dict = {
+#         "torque_scaling":1000,
+#         "soft_fingers":1,
+#         "friction_coef": 0.8, # TODO use 0.8 in practice
+#         "antipodality_pctile": 1.0 
+#     }
+#     i=0
+#     f = open('data/data/data'+str(i)+'.json')
+#     grasp_dict = json.load(f)
 
-    center3D = torch.tensor([grasp_dict['pytorch_w_center']],device=device,requires_grad=True)
-    axis3D = torch.tensor([grasp_dict['pytorch_w_axis']],device=device,requires_grad=True)
-    axis3D.retain_grad() 
-    center3D.retain_grad()
+#     center3D = torch.tensor([grasp_dict['pytorch_w_center']],device=device,requires_grad=True)
+#     axis3D = torch.tensor([grasp_dict['pytorch_w_axis']],device=device,requires_grad=True)
+#     axis3D.retain_grad() 
+#     center3D.retain_grad()
 
-    com_qual_func = CannyFerrariQualityFunction(config_dict)
+#     com_qual_func = CannyFerrariQualityFunction(config_dict)
     
-    GT = lambda center,axis:GraspTorch(center, axis3D=axis, width=0.05,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
-    graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+#     GT = lambda center,axis:GraspTorch(center, axis3D=axis, width=0.05,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+#     graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
 
-    grasp = GT(center3D,axis3D)
-    qual = com_qual_func.quality(mesh, grasp)
-    qual.backward(inputs=[axis3D, center3D])
-    print('quality', qual)
-    print('center', center3D, center3D.grad)
-    print('axis3D', axis3D, axis3D.grad)
+#     grasp = GT(center3D,axis3D)
+#     qual = com_qual_func.quality(mesh, grasp)
+#     qual.backward(inputs=[axis3D, center3D])
+#     print('quality', qual)
+#     print('center', center3D, center3D.grad)
+#     print('axis3D', axis3D, axis3D.grad)
 
-    prob = graspQualityOpt(com_qual_func,GT,mesh)
-    num_particles = 10
-    stein_problem = SteinWrapper(prob,num_particles,repulsive_weight=1e-3)
+#     prob = graspQualityOpt(com_qual_func,GT,mesh)
+#     num_particles = 10
+#     stein_problem = SteinWrapper(prob,num_particles,repulsive_weight=1e-3)
 
 
-    solver = BFGSMethod(stein_problem, alpha=0.01, rho=0.2,min_alpha=1e-5)
-    initial_solution = torch.cat((axis3D, center3D),dim=1).T.numpy(force=True)
-    particles = np.random.normal(initial_solution,1e-4,(num_particles,6,1))
-    stacked_particles = particles.reshape((-1,1))
-    result = solver.optimize(stacked_particles,max_iterations=10)
-    result.display()
-    new_particles = result.iterates.reshape((result.iterates.shape[0],-1,6,1))
-    tensor_iterates = prob.make_tensor(new_particles)
-    for iterate_index in range(new_particles.shape[0]):
-        for particle_index in range(new_particles.shape[1]):
-            axis = tensor_iterates[iterate_index,particle_index, :3].T
-            center = tensor_iterates[iterate_index,particle_index, 3:].T
-            grasp = GT(center,axis)
-            com_qual_func.quality(mesh, grasp)
-            com_qual_func.savemat(f'stein_iterates{iterate_index}_{particle_index}.mat')
+#     solver = BFGSMethod(stein_problem, alpha=0.01, rho=0.2,min_alpha=1e-5)
+#     initial_solution = torch.cat((axis3D, center3D),dim=1).T.numpy(force=True)
+#     particles = np.random.normal(initial_solution,1e-4,(num_particles,6,1))
+#     stacked_particles = particles.reshape((-1,1))
+#     result = solver.optimize(stacked_particles,max_iterations=10)
+#     result.display()
+#     new_particles = result.iterates.reshape((result.iterates.shape[0],-1,6,1))
+#     tensor_iterates = prob.make_tensor(new_particles)
+#     for iterate_index in range(new_particles.shape[0]):
+#         for particle_index in range(new_particles.shape[1]):
+#             axis = tensor_iterates[iterate_index,particle_index, :3].T
+#             center = tensor_iterates[iterate_index,particle_index, 3:].T
+#             grasp = GT(center,axis)
+#             com_qual_func.quality(mesh, grasp)
+#             com_qual_func.savemat(f'stein_iterates{iterate_index}_{particle_index}.mat')
 
-class graspQualityOpt(Problem):
-    def __init__(self, qualityObj=None, grasp=None, mesh=None):
-        self.grasp = grasp
-        self.device = mesh.device
-        self.qualityObj = qualityObj
-        self.mesh = mesh
-        super().__init__()
-        self.make_tensor = self.test
-    def test(self, x):
-        return torch.DoubleTensor(x).to(self.device)
-    def size(self):
-        return 6
-    def tensor_batch_cost(self, x):
-        axis = x[:,:3,0]
-        center = x[:,3:,0]
-        return -self.qualityObj.quality(self.mesh,self.grasp(center,axis)).squeeze(-1)
-    def tensor_cost(self, x):
-        axis = x[:3].T
-        center = x[3:].T
-        return -self.qualityObj.quality(self.mesh,self.grasp(center,axis))
+# class graspQualityOpt(Problem):
+#     def __init__(self, qualityObj=None, grasp=None, mesh=None):
+#         self.grasp = grasp
+#         self.device = mesh.device
+#         self.qualityObj = qualityObj
+#         self.mesh = mesh
+#         super().__init__()
+#         self.make_tensor = self.test
+#     def test(self, x):
+#         return torch.DoubleTensor(x).to(self.device)
+#     def size(self):
+#         return 6
+#     def tensor_batch_cost(self, x):
+#         axis = x[:,:3,0]
+#         center = x[:,3:,0]
+#         return -self.qualityObj.quality(self.mesh,self.grasp(center,axis)).squeeze(-1)
+#     def tensor_cost(self, x):
+#         axis = x[:3].T
+#         center = x[3:].T
+#         return -self.qualityObj.quality(self.mesh,self.grasp(center,axis))
 
 if __name__ == "__main__":
     #minHull.apply(torch.tensor(dict['G']).transpose(0,1).reshape((20,1,1,6)))
