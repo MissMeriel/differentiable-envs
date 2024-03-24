@@ -277,7 +277,9 @@ class GraspTorch(object):
         in_normal = -self.contact_normals
 
         normal_force_mag = torch.sum(torch.mul(in_normal, in_direction_norm),-1)
-        return torch.nn.functional.relu(normal_force_mag)
+        # allow backface normals
+        return torch.abs(normal_force_mag)
+#        return torch.nn.functional.relu(normal_force_mag)
         
     @staticmethod
     def compute_mesh_COM(mesh): 
@@ -435,7 +437,7 @@ class GraspTorch(object):
         v = torch.unflatten(v, 0, target_shape[:-1])
         t = torch.unflatten(t, 0, target_shape[:-1])
         # correct dir, not too far, actually hits triangle
-        inside1 = ((t >= 0.0) * (t < self.width/2) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
+        inside1 = ((t >= 0.0) * (t < self.width) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
         t[torch.logical_not(inside1)] = float('Inf')
         # (n_rays, n_faces)
         min_out = torch.min(t, -1,keepdim=True)
@@ -1151,7 +1153,63 @@ def pytorch_setup():
         )
     
         return renderer, device    
-    
+
+def test_wine():
+
+
+
+    renderer, device = pytorch_setup()
+    with record_function("load_obj"):
+        verts, faces_idx, _ = load_obj("data/Wineglass_800_tex.obj")
+    faces = faces_idx.verts_idx
+    verts_rgb = torch.ones_like(verts)[None]
+    textures = TexturesVertex(verts_features=verts_rgb.to(device))
+
+    mesh = Meshes(
+        verts=[verts.to(device)],
+        faces=[faces.to(device)],
+        textures=textures
+    )
+    config_dict = {
+        "torque_scaling":1000,
+        "soft_fingers":1,
+        "friction_coef": 0.8, # TODO use 0.8 in practice
+        "antipodality_pctile": 1.0 
+    }
+
+    com_qual_func = CannyFerrariQualityFunction(config_dict)
+
+    center3D = torch.tensor([[0.0, -0.00, -0.034]], device=device,requires_grad=True)
+    axis3D   = torch.tensor([[1.0,0.0,0.0]], device=device,requires_grad=True)
+    graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+    graspObj = graspObj.apply_to_mesh(mesh)
+    original_quality = com_qual_func.quality(mesh, graspObj)   
+    print("original: ", original_quality)
+    axis3D.retain_grad() 
+    center3D.retain_grad()
+    optimizer = optim.Rprop([axis3D, center3D], lr=0.00001)
+    #optimizer = optim.SGD([center3D], lr=0.25, momentum=0.0)
+    print('original-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+    for i in range(20):
+        optimizer.zero_grad()
+        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+        noised_grasps = graspObj.generateNoisyGrasps(25).apply_to_mesh(mesh)
+        noised_tensor = com_qual_func.quality(mesh, noised_grasps)
+        com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
+        qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
+        # com_qual_func.savemat(f'quality_out{i}.mat')
+        qual_tensor.backward()
+        print('iteration: ', i)
+        print('raw cf: ',noised_tensor.squeeze().numpy(force=True))
+        print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.002))
+        print('loss score:',qual_tensor.squeeze().numpy(force=True))
+        print('grasp-update', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
+        optimizer.step()
+        print('new-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+        print()
+
 def test_quality():
     # load PyTorch3D mesh from .obj file
     renderer, device = pytorch_setup()
@@ -1454,6 +1512,7 @@ if __name__ == "__main__":
             #model(inputs)
             with torch.enable_grad():        
                 # test_stein()
+                test_wine()
                 test_quality()
     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
     # prof.export_chrome_trace("trace.json")
