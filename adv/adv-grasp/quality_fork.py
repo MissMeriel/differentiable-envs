@@ -6,9 +6,6 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import numpy as np
 import math
 import json
-import cvxopt as cvx
-import cvxpy as cp
-import pyhull.convex_hull as cvh
 from pytorch3d.io import load_obj
 from pytorch3d import _C
 import pytorch3d.transforms as tf
@@ -918,45 +915,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         x = QPFunction(check_Q_spd=True)(P, q, G, h, A , b)
         dist = torch.sqrt(torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))/2)
         return dist, x, P
-    
-    @staticmethod
-    def min_norm_vector_in_facet(facet, wrench_regularizer=1e-10):
-        """ Finds the minimum norm point in the convex hull of a given facet (aka simplex) by solving a QP.
-
-        Parameters
-        ----------
-        facet : 6xN :obj:`numpy.ndarray`
-            vectors forming the facet
-        wrench_regularizer : float
-            small float to make quadratic program positive semidefinite
-
-        Returns
-        -------
-        float
-            minimum norm of any point in the convex hull of the facet
-        Nx1 :obj:`numpy.ndarray`
-            vector of coefficients that achieves the minimum
-        """
-        dim = facet.shape[1] # num vertices in facet
-
-        # create alpha weights for vertices of facet
-        G = facet.T.dot(facet)
-        grasp_matrix = G + wrench_regularizer * np.eye(G.shape[0])
-
-        # Solve QP to minimize .5 x'Px + q'x subject to Gx <= h, Ax = b
-        P = cvx.matrix(2 * grasp_matrix)   # quadratic cost for Euclidean dist
-        q = cvx.matrix(np.zeros((dim, 1)))
-        G = cvx.matrix(-np.eye(dim))       # greater than zero constraint
-        h = cvx.matrix(np.zeros((dim, 1)))
-        A = cvx.matrix(np.ones((1, dim)))  # sum constraint to enforce convex
-        b = cvx.matrix(np.ones(1))         # combinations of vertices
-
-        sol = cvx.solvers.qp(P, q, G, h, A, b)
-        v = np.array(sol['x'])
-        min_norm = np.sqrt(sol['primal objective'])
-
-        return abs(min_norm), v, 2 * grasp_matrix
-
+   
     @staticmethod
     def distWrap(G_unwrapped):
         facets_local = []
@@ -1003,8 +962,6 @@ class qHullTorch(torch.autograd.Function):
         return torch.tensor(hull.simplices,dtype=torch.long)
     @staticmethod
     def backward(_, grad_output):
-        # miniG, = ctx.saved_tensors
-        # grad = torch.zeros(size=)
         return None
     
 class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
@@ -1512,7 +1469,7 @@ if __name__ == "__main__":
             #model(inputs)
             with torch.enable_grad():        
                 # test_stein()
-                test_wine()
+                # test_wine()
                 test_quality()
     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
     # prof.export_chrome_trace("trace.json")
