@@ -245,7 +245,7 @@ class Renderer:
 				if isinstance(title, list) and isinstance(title[i], str):
 					plt.title(title[i])		
 
-		if isinstance(save, str):
+		if save != "":
 			plt.savefig(save)
 		else:
 			plt.show()
@@ -372,7 +372,8 @@ class Renderer:
 			mesh = join_meshes_as_scene([grasp_obj, c0, c1])
 
 		if save:
-			save_obj(save, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+			fname = save.split(".")[0] + ".obj"
+			save_obj(fname, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 
 		if display:
 			if save:

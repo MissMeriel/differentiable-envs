@@ -369,7 +369,12 @@ class Grasp:
 			quality = self.quality.clone().detach().cpu().numpy().tolist()
 		prediction = self.prediction
 		if isinstance(self.prediction, torch.Tensor):
-			predicition = self.prediction.clone().detach().cpu().numpy().tolist()
+			prediction = self.prediction.clone().detach().cpu().numpy().tolist()
+		oracle_method, robust = self.oracle_method, self.oracle_robust
+		if isinstance(oracle_method, torch.Tensor):
+			oracle_method = oracle_method.clone().detach().cpu().numpy().tolist()
+		if isinstance(robust, torch.Tensor):
+			robust = robust.clone().detach().cpu().numpy().tolist()
 		objf = self.objf if self.objf is not None else "unknown"
 
 		grasp_data = {
@@ -381,8 +386,8 @@ class Grasp:
 			"world_axis": was_list,
 			"c0": c0_list,
 			"c1": c1_list, 
-			"oracle_method": self.oracle_method,
-			"oracle_robust": self.oracle_robust,
+			"oracle_method": oracle_method,
+			"oracle_robust": robust,
 			"quality": quality,
 			"prediction": prediction,
 			"objf": objf
@@ -575,6 +580,7 @@ class Grasp:
 			server = Pyro4.Proxy("PYRO:Server@localhost:5000")
 			save_nparr(world_centers.detach().cpu().numpy(), "temp_centers.npy")
 			save_nparr(world_axes.detach().cpu().numpy(), "temp_axes.npy")
+			print("sample_grasps_dexnet robust:", kwargs["oracle_robust"])
 			results = server.close_fingers("temp_centers.npy", "temp_axes.npy", kwargs["min_qual"], kwargs["max_qual"], robust=kwargs["oracle_robust"])
 			#	results returns list of lists of form [[int: index, float: ferrari canny quality, (array, array): contact points], ...]
 			for res in results:
@@ -918,6 +924,8 @@ class Grasp:
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
 
+		print("oracle_eval_dexnet robust:", robust)
+
 		# check if object file is already saved in shared directory and copy there if not
 		if not os.path.isfile(obj_file):
 			Grasp.logger.error("Object for oracle evaluation does not exist.")
@@ -937,6 +945,7 @@ class Grasp:
 		calc_axes = self.world_axis / torch.norm(self.world_axis, dim=-1, keepdim=True)
 		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
 		save_nparr(calc_axes.detach().cpu().numpy(), "temp_axis.npy")
+		# print("\nobj_name:", type(obj_name), obj_name, "\n\n")
 		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
 
 		# update quality info
@@ -1549,6 +1558,22 @@ def generate_grasp_dataset(dataset_dir):
 
 	Grasp.logger.info(f"Finished generating grasp dataset to directory {dataset_dir}")
 
+def check_grasp_dataset():
+	r = Renderer()
+	grasps = Grasp.read("grasp-dataset/grasp_batch.json")
+	grasps.oracle_eval("data/new_barclamp.obj", renderer=r, robust=False)
+	print("non-robust qualities:", grasps.quality)
+
+	# grasps2 = Grasp.read("example-grasps/batch-test.json")
+	# print("grasps2 qualities:\n", grasps2.quality, "\n")
+	# grasps2.oracle_eval("data/new_barclamp.obj", renderer=r)
+	# print(grasps2.quality)
+
+	# grasps3 = Grasp.read("experiment-results/ex01/grasp.json")
+	# print("\ngrasp3 qualities:", grasps3.quality, "\n")
+	# grasps3.oracle_eval("data/new_barclamp.obj", renderer=r)
+	# print(grasps3.quality)
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
@@ -1559,6 +1584,8 @@ if __name__ == "__main__":
 	# test_batching()
 	# test_slicing()
 	# for i in range(4):
-	# 	test_oracle_check(i)
+	test_oracle_check(1)
 	# test_random_grasps()
-	generate_grasp_dataset("grasp-dataset")
+	# generate_grasp_dataset("grasp-dataset")
+	# vis_rand_grasps()
+	# check_grasp_dataset()
