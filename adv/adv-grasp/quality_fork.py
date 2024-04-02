@@ -444,15 +444,15 @@ class GraspTorch(object):
         contactFound = torch.all(torch.logical_not(torch.isinf(min_out.values)))
         self.contact_points = intersectionPoints
         
-        verts = mesh.verts_packed()[mesh.faces_packed()[faces_index,:]]
+        #verts = mesh.verts_packed()[mesh.faces_packed()[faces_index,:]]
         # experimental, weighted vertex normals
-        vertex_normals = mesh.verts_normals_packed()[mesh.faces_packed()[faces_index,:]]
-        u_vals = torch.gather(u, 2, faces_index).unsqueeze(3).unsqueeze(4)
-        v_vals = torch.gather(v, 2, faces_index).unsqueeze(3).unsqueeze(4)
-        w_vals = 1 - u_vals - v_vals
-        weights = torch.cat((w_vals,u_vals,v_vals),-2)
-        minReturn=torch.min(weights,dim=-2)
-        normsVert = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
+        #vertex_normals = mesh.verts_normals_packed()[mesh.faces_packed()[faces_index,:]]
+        #u_vals = torch.gather(u, 2, faces_index).unsqueeze(3).unsqueeze(4)
+        #v_vals = torch.gather(v, 2, faces_index).unsqueeze(3).unsqueeze(4)
+        #w_vals = 1 - u_vals - v_vals
+        #weights = torch.cat((w_vals,u_vals,v_vals),-2)
+        #minReturn=torch.min(weights,dim=-2)
+        #normsVert = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
         # verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
         # vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = mesh.faces_normals_packed()[faces_index,:]
         # (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(self.contact_points, mesh)
