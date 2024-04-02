@@ -964,35 +964,35 @@ class Grasp:
 			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
 			return None
 
-		# convert to GraspTorch object
-		width = torch.tensor([[0.05]], device=renderer.camera.device)
-		center3D = self.world_center.unsqueeze(0)
-		axis3D = self.world_axis.unsqueeze(0)
-		gt = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.camera)
-		gt.make2D(updateCamera=False)
-
-		# # check 2D information matches
-		# print("depth:", g.depth.item() == gt.depth.squeeze(0).item())
-		# print("angle diff:", g.im_angle.item() - gt.angle.item())
-		# print("axis2D diff:", g.im_axis - gt.axis[0].float())
-		# print("center2D:", g.im_center == gt.center[0].float())
-		# print("axis3D diff:", g.world_axis - gt.axis3D[0].float())
-		# print("center3D:", g.world_center == gt.center3D[0].float())
-
-		# get ferrari canny quality
 		config_dict = {
 			"torque_scaling":1000,
 			"soft_fingers":1,
-			"friction_coef": 0.8, 
+			"friction_coef": 0.8,
 			"antipodality_pctile": 1.0 
-		}
-		mesh, _ = renderer.render_object(obj_file)
+    	}
 
-		com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
-		force_closure_qual = com_qual_func.quality(mesh, gt)
+		# copied from quality_fork.py
+		renderer, device = pytorch_setup()
+		verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
+		faces = faces_idx.verts_idx
+		verts_rgb = torch.ones_like(verts)[None]
+		textures = TexturesVertex(verts_features=verts_rgb.to(device))
 
+		mesh = Meshes(
+			verts=[verts.to(device)],
+			faces=[faces.to(device)],
+			textures=textures
+		)
+
+		center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
+		angle = torch.tensor([[0.3525843322277069 + math.pi]],device=device)
+		depth = torch.tensor([[0.5824159979820251]],device=device)
+		width = torch.tensor([[0.05]],device=device)
+
+		grasp1 = GraspTorch(center2d, angle, depth, width, renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+		
 		com_qual_func = CannyFerrariQualityFunction(config_dict)
-		return com_qual_func.quality(mesh, gt)
+		print("canny ferrari:", com_qual_func.quality(mesh, grasp1))
 
 def save_nparr(image, filename):
 	""" 
@@ -1574,6 +1574,11 @@ def check_grasp_dataset():
 	# grasps3.oracle_eval("data/new_barclamp.obj", renderer=r)
 	# print(grasps3.quality)
 
+def test_pytorch_oracle():
+	r = Renderer()
+	grasp = Grasp.read("example-grasps/grasp_0.json")
+	grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
+
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
@@ -1584,8 +1589,9 @@ if __name__ == "__main__":
 	# test_batching()
 	# test_slicing()
 	# for i in range(4):
-	test_oracle_check(1)
+	# test_oracle_check(1)
 	# test_random_grasps()
 	# generate_grasp_dataset("grasp-dataset")
 	# vis_rand_grasps()
 	# check_grasp_dataset()
+	test_pytorch_oracle()
