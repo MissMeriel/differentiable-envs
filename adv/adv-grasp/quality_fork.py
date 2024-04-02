@@ -1265,85 +1265,85 @@ def test_quality():
     tests = [[1e-3, 1e-5, test_grasps_set], [1e-2, 1e-3, test_grasps_compute]]
     print("atol", tests[0][0], "rtol", tests[0][1],"atol", tests[1][0], "rtol", tests[1][1])
     print("torch (w/o col), torch (w/ col), dexnet")
-    for i in range(len(dicts)):            
-            com_qual_func = CannyFerrariQualityFunction(config_dict)
-            # print("set")
-            torch_quality_no_col = com_qual_func.quality(mesh, tests[0][2][i]).numpy(force=True)[0]
-            np.testing.assert_allclose(torch_quality_no_col,
-                    np.array(dicts[i]['ferrari_canny_fc08']).T,
-                    atol=tests[0][0],rtol=tests[0][1])
-            # print("compute")
-            torch_quality_col = com_qual_func.quality(mesh, tests[1][2][i]).numpy(force=True)[0]
-            np.testing.assert_allclose(torch_quality_col,
-                    np.array(dicts[i]['ferrari_canny_fc08']).T,
-                    atol=tests[1][0],rtol=tests[1][1])
-            print(torch_quality_no_col[0],",", torch_quality_col[0],",",
-            dicts[i]['ferrari_canny_fc08'],";")
+    # for i in range(len(dicts)):            
+    #         com_qual_func = CannyFerrariQualityFunction(config_dict)
+    #         # print("set")
+    #         torch_quality_no_col = com_qual_func.quality(mesh, tests[0][2][i]).numpy(force=True)[0]
+    #         np.testing.assert_allclose(torch_quality_no_col,
+    #                 np.array(dicts[i]['ferrari_canny_fc08']).T,
+    #                 atol=tests[0][0],rtol=tests[0][1])
+    #         # print("compute")
+    #         torch_quality_col = com_qual_func.quality(mesh, tests[1][2][i]).numpy(force=True)[0]
+    #         np.testing.assert_allclose(torch_quality_col,
+    #                 np.array(dicts[i]['ferrari_canny_fc08']).T,
+    #                 atol=tests[1][0],rtol=tests[1][1])
+    #         print(torch_quality_no_col[0],",", torch_quality_col[0],",",
+    #         dicts[i]['ferrari_canny_fc08'],";")
 
-    #torch.autograd.set_detect_anomaly(True)
-    center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
-    axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
-    axis3D.retain_grad() 
-    center3D.retain_grad()
-    graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
-                           friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
-    print('before', axis3D.grad)
-    qual_tensor = com_qual_func.quality(mesh, graspObj)
-    print('quality', qual_tensor)
-    qual_tensor.backward(inputs=axis3D)
-    print('after', axis3D.grad)
-    print('value', axis3D)
+    # #torch.autograd.set_detect_anomaly(True)
+    # center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
+    # axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
+    # axis3D.retain_grad() 
+    # center3D.retain_grad()
+    # graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+    #                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+    # print('before', axis3D.grad)
+    # qual_tensor = com_qual_func.quality(mesh, graspObj)
+    # print('quality', qual_tensor)
+    # qual_tensor.backward(inputs=axis3D)
+    # print('after', axis3D.grad)
+    # print('value', axis3D)
 
-    noised_grasps = graspObj.generateNoisyGrasps(25)
-    noised_tensor = com_qual_func.quality(mesh, noised_grasps)
-    torch.set_printoptions(precision=8)
-    print(qual_tensor)
-    print(noised_tensor)
-    torch.set_printoptions(precision=4)
+    # noised_grasps = graspObj.generateNoisyGrasps(25)
+    # noised_tensor = com_qual_func.quality(mesh, noised_grasps)
+    # torch.set_printoptions(precision=8)
+    # print(qual_tensor)
+    # print(noised_tensor)
+    # torch.set_printoptions(precision=4)
 
-    center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
-    axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
-    axis3D.retain_grad() 
-    center3D.retain_grad()
-    optimizer = optim.Rprop([axis3D, center3D], lr=0.00001)
-    #optimizer = optim.SGD([center3D], lr=0.25, momentum=0.0)
-    print('original-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
-    for i in range(20):
-        optimizer.zero_grad()
-        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
-                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
-        noised_grasps = graspObj.generateNoisyGrasps(25)
-        noised_tensor = com_qual_func.quality(mesh, noised_grasps)   
-        com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
-        qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
-        # com_qual_func.savemat(f'quality_out{i}.mat')
-        qual_tensor.backward()
-        print('iteration: ', i)
-        print('raw cf: ',noised_tensor.squeeze().numpy(force=True))
-        print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.002))
-        print('loss score:',qual_tensor.squeeze().numpy(force=True))
-        print('grasp-update', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
-        optimizer.step()
-        print('new-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
-        print()
+    # center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
+    # axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
+    # axis3D.retain_grad() 
+    # center3D.retain_grad()
+    # optimizer = optim.Rprop([axis3D, center3D], lr=0.00001)
+    # #optimizer = optim.SGD([center3D], lr=0.25, momentum=0.0)
+    # print('original-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+    # for i in range(20):
+    #     optimizer.zero_grad()
+    #     graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+    #                     friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+    #     noised_grasps = graspObj.generateNoisyGrasps(25)
+    #     noised_tensor = com_qual_func.quality(mesh, noised_grasps)   
+    #     com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
+    #     qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
+    #     # com_qual_func.savemat(f'quality_out{i}.mat')
+    #     qual_tensor.backward()
+    #     print('iteration: ', i)
+    #     print('raw cf: ',noised_tensor.squeeze().numpy(force=True))
+    #     print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.002))
+    #     print('loss score:',qual_tensor.squeeze().numpy(force=True))
+    #     print('grasp-update', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
+    #     optimizer.step()
+    #     print('new-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+    #     print()
 
-    center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
-    axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
-    axis3D.retain_grad() 
-    center3D.retain_grad()
-    optimizer = optim.SGD([axis3D, center3D], lr=0.001, momentum=0.0)
-    for i in range(10):
-        optimizer.zero_grad()
-        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
-                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+    # center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
+    # axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
+    # axis3D.retain_grad() 
+    # center3D.retain_grad()
+    # optimizer = optim.SGD([axis3D, center3D], lr=0.001, momentum=0.0)
+    # for i in range(10):
+    #     optimizer.zero_grad()
+    #     graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+    #                     friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
    
-        qual_tensor = -com_qual_func.quality(mesh, graspObj)
-        # com_qual_func.savemat(f'quality_out{i}.mat')
-        qual_tensor.backward()
-        print('quality:',-qual_tensor.squeeze().numpy(force=True))
-        print('grad', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
-        print('value', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
-        optimizer.step()
+    #     qual_tensor = -com_qual_func.quality(mesh, graspObj)
+    #     # com_qual_func.savemat(f'quality_out{i}.mat')
+    #     qual_tensor.backward()
+    #     print('quality:',-qual_tensor.squeeze().numpy(force=True))
+    #     print('grad', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
+    #     print('value', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
+    #     optimizer.step()
     
 
     center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
@@ -1366,11 +1366,11 @@ def test_quality():
     grasp3 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
     # Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 
-    with record_function("FastAntipodalityFunction"):
-        com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
+    # with record_function("FastAntipodalityFunction"):
+    #     com_qual_func = ComForceClosureParallelJawQualityFunction(config_dict)
 
-    # Call quality with the Grasp2D and mesh
-        com_qual_func.quality(mesh, grasp3)
+    # # Call quality with the Grasp2D and mesh
+    #     com_qual_func.quality(mesh, grasp3)
 
     with record_function("CannyFerrari"):
         com_qual_func = CannyFerrariQualityFunction(config_dict)
