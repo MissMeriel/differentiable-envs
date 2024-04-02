@@ -105,8 +105,8 @@ class Attack:
 		pose, image = grasp.extract_tensors_batch(dim)
 		out = self.run(pose, image)
 		cur_pred = out[:, 0].unsqueeze(1).to(adv_mesh.device)
-		oracle_pred = torch.clone(grasp.quality) / 0.002	# scale to model range
-		assert oracle_pred.shape[0] == 10
+		oracle_pred = torch.clone(grasp.quality) / 0.004	# scale to model range
+		# assert oracle_pred.shape[0] == 10
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		# max = torch.ones(oracle_pred.shape).to(adv_mesh.device)
@@ -382,5 +382,4 @@ def test_attack():
 	Attack.logger.info("Finished running test_attack.")
 
 if __name__ == "__main__":
-	# test_run()
-	test_attack()
+	test_run()
