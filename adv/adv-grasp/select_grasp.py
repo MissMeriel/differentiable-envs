@@ -1,4 +1,4 @@
-import Pyro4
+# import Pyro4
 import os
 import sys
 import math
@@ -437,7 +437,7 @@ class Grasp:
 		self.im_angle = torch.atan2(self.im_axis[...,1], self.im_axis[..., 0]).unsqueeze(-1)
 
 	@classmethod
-	def sample_grasps(cls, obj_f, num_samples, renderer, **kwargs): # min_qual=0.002, max_qual=1.0, save_grasp=""):
+	def sample_grasps(cls, obj_f, num_samples, renderer, **kwargs):
 		"""
 		Samples grasps using oracle depending on oracle_method arg and returns grasps with qualities between min_qual and max_qual inclusive. 
 		Saves new grasp object with an added sphere to visualize grasp if desired (default: does not save new grasp object).
@@ -453,9 +453,8 @@ class Grasp:
 		
 		* optional kwargs:
 		min_qual: float
-			Float between 0.0 and 1.0, minimum ferrari canny quality for returned grasps, defaults to 0.0005
+			Float between 0.0 and 1.0, minimum ferrari canny quality for returned grasps, defaults to 0.002
 				(0.002 according to dexnet robust ferrari canny method)
-			NOTE: Currently returns a grasp if force_closure metric returns 1 or robust ferrari canny quality is above min_qual
 		max_qual: float
 			Float between 0.0 and 1.0, maximum ferrari canny quality for returned grasps, defaults to 1.0
 		save_grasp: String
@@ -465,8 +464,8 @@ class Grasp:
 			True: sort grasps in descending order of quality (default)
 			False: return in order they were sampled in
 		oracle_method: String in ["dexnet", "pytorch"]
-			"dexnet": use docker dexnet oracle (default)
-			"pytorch": use local pytorch oracle implementation
+			"dexnet": use docker dexnet oracle 
+			"pytorch": use local pytorch oracle implementation (default)
 		oracle_robust: Boolean
 			True: robust oracle evaluation (default)
 			False: non-robust oracle evaluation
@@ -475,24 +474,6 @@ class Grasp:
 		-------
 		List of Grasp objects with quality between min_qual and max_qual inclusive in descending order of rfc_quality
 		"""
-
-		keys = kwargs.keys()
-		if ("oracle_method" not in keys) or (kwargs["oracle_method"] != "pytorch"):
-			return cls.sample_grasps_dexnet(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
-
-		else:
-			return cls.sample_grasps_pytorch(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
-
-	@classmethod
-	def sample_grasps_pytorch(cls, obj_f, num_samples, renderer, **kwargs):
-		"""
-		Helper method for sample_grasps: samples grasps using local pytorch oracle implementation.
-
-		Refer to `sample_grasps` method documentation for details on parameters and return values.
-		"""
-
-		cls.logger.error("Grasp.sample_grasps_pytorch not yet implemented.")
-		return []
 
 		# process kwargs
 		keys = kwargs.keys()
@@ -505,6 +486,70 @@ class Grasp:
 		if "sort" not in keys:
 			kwargs["sort"] = True
 
+		if ("oracle_method" not in keys) or (kwargs["oracle_method"] != "dexnet"):
+			return cls.sample_grasps_pytorch(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
+		else:
+			return cls.sample_grasps_dexnet(obj_f=obj_f, num_samples=num_samples, renderer=renderer, **kwargs)
+
+	@classmethod
+	def sample_grasps_pytorch(cls, obj_f, num_samples, renderer, **kwargs):
+		"""
+		Helper method for sample_grasps: samples grasps using local pytorch oracle implementation.
+
+		Refer to `sample_grasps` method documentation for details on parameters and return values.
+		"""
+
+		# logging
+		cls.logger.info("Sampling grasps...")
+
+		# render mesh
+		mesh, _ = renderer.render_object(obj_f, display=False)
+
+		# oracle set up
+		config_dict = {
+			"torque_scaling":1000,
+			"soft_fingers":1,
+			"friction_coef": 0.8,
+			"antipodality_pctile": 1.0 
+		}
+		width = torch.tensor([[0.05]],device=device)
+		com_qual_func = CannyFerrariQualityFunction(config_dict)
+
+		# track grasps
+		num_grasps, it, grasp_dict = 0, 0, {}
+
+		while num_grasps < num_samples:
+
+			# randomly sample surface points for possible grasps
+			samples_c0 = sample_points_from_meshes(mesh, num_samples*1000)[0]
+			samples_c1 = sample_points_from_meshes(mesh, num_samples*1000)[0]
+			norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
+
+			# mask to eliminate grasps that don't fit in the gripper
+			mask = (norms > 0.0) & (norms <= 0.05)
+			mask = mask.squeeze()
+			norms = norms[mask]
+			c0 = samples_c0[mask, :]
+			c1 = samples_c1[mask, :]
+		
+			# compute grasp center and axis, then check quality
+			world_centers = (c0 + c1) / 2
+			world_axes = (c1 - c0) #/ norms.unsqueeze(1)
+			grasp_torch = GraspTorch(center=world_centers, axis3D=world_axes, width=width, camera_intr=renderer.camera, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+			
+			# filter for qualities between min_qual and max_qual
+			# try:
+			cand_quals = com_qual_func.quality(mesh, grasp_torch)
+			mask = (cand_quals >= kwargs["min_qual"]) & (cand_quals <= kwargs["max_qual"])
+			mask.squeeze()
+			print(f"Iteration {it}: {torch.max(mask).item()} {torch.sum(mask).item()} {torch.max(cand_quals).item()}")
+			# num_grasps += torch.sum(mask)
+			num_grasps += 1
+			it += 1
+			# except:
+			# 	it += 1
+
+
 	@classmethod
 	def sample_grasps_dexnet(cls, obj_f, num_samples, renderer, **kwargs):
 		"""
@@ -514,19 +559,8 @@ class Grasp:
 		"""
 
 		# process kwargs
-		keys = kwargs.keys()
-		if "min_qual" not in keys:
-			kwargs["min_qual"] = 0.0005
-		if "max_qual" not in keys:
-			kwargs["max_qual"] = 1.0
-		if "save_grasp" not in keys:
-			kwargs["save_grasp"] = ""
-		elif kwargs["save_grasp"][-1] == "/":
-				kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
-		if "sort" not in keys:
-			kwargs["sort"] = True
-		if "oracle_robust" not in keys:
-			kwargs["oracle_robust"] = True
+		if kwargs["save_grasp"][-1] == "/":
+			kwargs["save_grasp"] = kwargs["save_grasp"][:-1]
 
 		# logging
 		cls.logger.info("Sampling grasps...")
@@ -971,28 +1005,12 @@ class Grasp:
 			"antipodality_pctile": 1.0 
     	}
 
-		# copied from quality_fork.py
-		renderer, device = pytorch_setup()
-		verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
-		faces = faces_idx.verts_idx
-		verts_rgb = torch.ones_like(verts)[None]
-		textures = TexturesVertex(verts_features=verts_rgb.to(device))
-
-		mesh = Meshes(
-			verts=[verts.to(device)],
-			faces=[faces.to(device)],
-			textures=textures
-		)
-
-		center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
-		angle = torch.tensor([[0.3525843322277069 + math.pi]],device=device)
-		depth = torch.tensor([[0.5824159979820251]],device=device)
+		mesh, _ = renderer.render_object(obj_file, display=False)
 		width = torch.tensor([[0.05]],device=device)
-
-		grasp1 = GraspTorch(center2d, angle, depth, width, renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 		
 		com_qual_func = CannyFerrariQualityFunction(config_dict)
-		print("canny ferrari:", com_qual_func.quality(mesh, grasp1))
+		return com_qual_func.quality(mesh, grasp_torch)
 
 def save_nparr(image, filename):
 	""" 
@@ -1575,9 +1593,58 @@ def check_grasp_dataset():
 	# print(grasps3.quality)
 
 def test_pytorch_oracle():
+	Grasp.logger.info("Running test_pytorch_oracle() to test PyTorch oracle.")
+
 	r = Renderer()
-	grasp = Grasp.read("example-grasps/grasp_0.json")
-	grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
+	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
+	config_dict = {
+		"torque_scaling":1000,
+		"soft_fingers":1,
+		"friction_coef": 0.8,
+		"antipodality_pctile": 1.0 
+	}
+
+	Grasp.logger.info("Run Ferarri Canny quality function from quality_fork.py")
+	_, device = pytorch_setup()
+
+	center2d = torch.tensor([[344.3809509277344, 239.4164276123047]],device=device)
+	angle = torch.tensor([[0.3525843322277069 + math.pi]],device=device)
+	depth = torch.tensor([[0.5824159979820251]],device=device)
+	width = torch.tensor([[0.05]],device=device)
+
+	grasp1 = GraspTorch(center2d, angle, depth, width, r.camera, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+	
+	com_qual_func = CannyFerrariQualityFunction(config_dict)
+	print("canny ferrari:", com_qual_func.quality(mesh, grasp1))
+
+	Grasp.logger.info("Comparison of select_grasp.Grasp and quality_fork.GraspTorch")
+	# GraspTorch object
+	center3D = torch.tensor([[ 0.027602000162005424, 0.017583999782800674, -9.273400064557791e-05]], device=device)
+	axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
+	graspt = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=r.camera,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
+	graspt.make2D(updateCamera=False)
+	# Grasp object
+	grasp = Grasp(world_center=center3D, world_axis=axis3D)
+	grasp.trans_world_to_im(camera=r.camera)
+	# comparisons
+	assert torch.max(torch.sub(graspt.center, grasp.im_center)).item() == 0
+	assert torch.max(torch.sub(graspt.angle, grasp.im_angle)).item() < EPS
+	assert torch.max(torch.sub(graspt.depth, grasp.depth)).item() == 0
+	assert torch.max(torch.sub(graspt.axis, grasp.im_axis)).item() < EPS
+	assert torch.max(torch.sub(graspt.axis3D, grasp.world_axis)).item() == 0
+	# quality comparisons
+	graspt_qual, grasp_qual = com_qual_func.quality(mesh, graspt), grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
+	assert torch.max(torch.sub(graspt_qual, grasp_qual)).item() < EPS
+
+	Grasp.logger.info("PyTorch oracle evaluation on batched grasps.")
+	files = ["example-grasps/grasp_" + str(i) + ".json" for i in range(5)]
+	grasps = Grasp.read_batch(files)
+	grasps.trans_world_to_im(camera=r.camera)
+	batch_qual = grasps.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
+	for i, grasp in enumerate(grasps):
+		qual = grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
+		assert torch.sub(qual, batch_qual[i]).item() < EPS
+
 
 if __name__ == "__main__":
 
@@ -1594,4 +1661,5 @@ if __name__ == "__main__":
 	# generate_grasp_dataset("grasp-dataset")
 	# vis_rand_grasps()
 	# check_grasp_dataset()
-	test_pytorch_oracle()
+	# test_pytorch_oracle()
+	Grasp.sample_grasps("data/new_barclamp.obj", 5, renderer=Renderer())
