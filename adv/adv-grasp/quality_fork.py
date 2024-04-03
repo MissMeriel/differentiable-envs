@@ -403,7 +403,7 @@ class GraspTorch(object):
         return friction_cone
 
         
-    def apply_to_mesh(self, mesh): 
+    def apply_to_mesh(self, mesh, contact_points=None): 
         """Compute where grasp contacts a mesh, state is meshes pytorch3D object"""
             # for grasp in grasp 
         # for each ray (2)
@@ -417,7 +417,6 @@ class GraspTorch(object):
             # that intersection is contact_point
             # angle between ray and normal is contact_normal
         #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
-        mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
         opposite_dir_rays = self.ray_directions
         ray_o = self.center3D - (opposite_dir_rays * self.width / 2)
         ray_d = opposite_dir_rays # [axis3d, -axis3d]
@@ -427,22 +426,26 @@ class GraspTorch(object):
         # moller_trumbore assumes flat list of rays (2d Nx3)
         ray_o_flat = torch.flatten(ray_o, end_dim=-2)
         ray_d_flat = torch.flatten(ray_d, end_dim=-2)
+        if contact_points is None:
+            mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
 
-        u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped.double())
+            u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped.double())
 
-        u = torch.unflatten(u, 0, target_shape[:-1])
-        v = torch.unflatten(v, 0, target_shape[:-1])
-        t = torch.unflatten(t, 0, target_shape[:-1])
-        # correct dir, not too far, actually hits triangle
-        inside1 = ((t >= 0.0) * (t < self.width) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
-        t[torch.logical_not(inside1)] = float('Inf')
-        # (n_rays, n_faces)
-        min_out = torch.min(t, -1,keepdim=True)
+            u = torch.unflatten(u, 0, target_shape[:-1])
+            v = torch.unflatten(v, 0, target_shape[:-1])
+            t = torch.unflatten(t, 0, target_shape[:-1])
+            # correct dir, not too far, actually hits triangle
+            inside1 = ((t >= 0.0) * (t < self.width) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
+            t[torch.logical_not(inside1)] = float('Inf')
+            # (n_rays, n_faces)
+            min_out = torch.min(t, -1,keepdim=True)
 
-        intersectionPoints = ray_o + ray_d * min_out.values
-        faces_index = min_out.indices
-        contactFound = torch.all(torch.logical_not(torch.isinf(min_out.values)))
-        self.contact_points = intersectionPoints
+            intersectionPoints = ray_o + ray_d * min_out.values
+            faces_index = min_out.indices
+            contactFound = torch.all(torch.logical_not(torch.isinf(min_out.values)))
+            self.contact_points = intersectionPoints
+        else:
+            self.contact_points = contact_points
         
         #verts = mesh.verts_packed()[mesh.faces_packed()[faces_index,:]]
         # experimental, weighted vertex normals
