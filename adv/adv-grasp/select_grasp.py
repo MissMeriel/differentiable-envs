@@ -11,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
+from scipy.spatial._qhull import QhullError
 from pytorch3d.ops import sample_points_from_meshes
 
 from render import *
@@ -165,9 +166,9 @@ class Grasp:
 			if key not in dict_keys:
 				dict[key] = None
 		if "oracle_method" not in dict_keys:
-			dict["oracle_method"] = "dexnet"
+			dict["oracle_method"] = "pytorch"
 		if "oracle_robust" not in dict_keys:
-			dict["oracle_robust"] = True
+			dict["oracle_robust"] = None
 		if "prediction" not in dict_keys:
 			dict["prediction"] = None
 		if "objf" not in dict_keys:
@@ -322,17 +323,17 @@ class Grasp:
 		"""Returns a string with grasp information in image coordinates"""
 		p_str = "grasp:"
 		
-		if self.quality != None:
-			p_str += "\n\tquality: " + str(self.quality.item())
-		if self.im_center != None:
+		if self.quality is not None:
+			p_str += "\n\tquality: " + str(self.quality)
+		if self.im_center is not None:
 			p_str +=  "\n\timage center: " + str(self.im_center)
-		if self.im_angle != None:
-			p_str += "\n\timage angle: " + str(self.im_angle.item()) 
-		if self.depth != None:
-			p_str += "\n\tdepth: " + str(self.depth.item()) 	
-		if self.world_center != None:
-			p_str += "\n\tworld center: " + str(self.world_center) 
-		if self.world_axis != None:
+		if self.im_angle is not None:
+			p_str += "\n\timage angle: " + str(self.im_angle)
+		if self.depth is not None:
+			p_str += "\n\tdepth: " + str(self.depth)
+		if self.world_center is not None:
+			p_str += "\n\tworld center: " + str(self.world_center)
+		if self.world_axis is not None:
 			p_str += "\n\tworld axis: " + str(self.world_axis)
 
 		return p_str + "\n"
@@ -517,38 +518,75 @@ class Grasp:
 
 		# track grasps
 		num_grasps, it, grasp_dict = 0, 0, {}
+		grasp_dict["world_axis"] = []
+		grasp_dict["world_center"] = []
+		grasp_dict["quality"] = []
+		grasp_dict["c0"] = []
+		grasp_dict["c1"] = []
+		grasp_dict["objf"] = obj_f
+		grasp_dict["oracle_method"] = "pytorch"
 
-		while num_grasps < num_samples:
-
+		while (num_grasps < num_samples) and (it < 10):
+			print(f"iteration {it}")
 			# randomly sample surface points for possible grasps
-			samples_c0 = sample_points_from_meshes(mesh, num_samples*1000)[0]
-			samples_c1 = sample_points_from_meshes(mesh, num_samples*1000)[0]
+			samples_c0 = sample_points_from_meshes(mesh, num_samples*200)[0]
+			samples_c1 = sample_points_from_meshes(mesh, num_samples*200)[0]
 			norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
 
 			# mask to eliminate grasps that don't fit in the gripper
-			mask = (norms > 0.0) & (norms <= 0.05)
+			mask = (norms > 0.01) & (norms <= 0.05)
 			mask = mask.squeeze()
 			norms = norms[mask]
 			c0 = samples_c0[mask, :]
 			c1 = samples_c1[mask, :]
+			contacts = torch.stack((c0, c1), 0)
 		
 			# compute grasp center and axis, then check quality
 			world_centers = (c0 + c1) / 2
-			world_axes = (c1 - c0) #/ norms.unsqueeze(1)
-			grasp_torch = GraspTorch(center=world_centers, axis3D=world_axes, width=width, camera_intr=renderer.camera, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-			
-			# filter for qualities between min_qual and max_qual
-			# try:
-			cand_quals = com_qual_func.quality(mesh, grasp_torch)
-			mask = (cand_quals >= kwargs["min_qual"]) & (cand_quals <= kwargs["max_qual"])
-			mask.squeeze()
-			print(f"Iteration {it}: {torch.max(mask).item()} {torch.sum(mask).item()} {torch.max(cand_quals).item()}")
-			# num_grasps += torch.sum(mask)
-			num_grasps += 1
-			it += 1
-			# except:
-			# 	it += 1
+			world_axes = (c1 - c0) / norms.unsqueeze(1)
+			quals = torch.zeros(world_centers.shape[0], 1, dtype=torch.float64, device="cuda:0")
 
+			for i in range(world_centers.shape[0]):
+				if i % 100 == 0:
+					cls.logger.info(f"Checking grasp {i} of {world_centers.shape[0]} in iteration {it}.")
+				try:
+					grasp_torch = GraspTorch(center=world_centers[i], axis3D=world_axes[i], width=width, camera_intr=renderer.camera, contact_points = contacts[:, i, :], friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+					qual = com_qual_func.quality(mesh, grasp_torch)
+					# print(f"qual: {qual}")
+					quals[i] = qual
+				except QhullError:
+					cls.logger.error("QhullError caught")
+					quals[i] = 0.0
+   
+			mask = (quals >= kwargs["min_qual"]) & (quals <= kwargs["max_qual"])
+			mask = mask.squeeze()
+			quals = quals[mask]
+			c0 = c0[mask, :]
+			c1 = c1[mask, :]
+			world_centers = world_centers[mask, :]
+			world_axes = world_axes[mask, :]
+
+			grasp_dict["world_axis"] = grasp_dict["world_axis"] + world_axes.detach().cpu().numpy().tolist()
+			grasp_dict["world_center"] = grasp_dict["world_center"] + world_centers.detach().cpu().numpy().tolist()
+			grasp_dict["quality"] = grasp_dict["quality"] + quals.detach().cpu().numpy().tolist()
+			grasp_dict["c0"] = grasp_dict["c0"] + c0.detach().cpu().numpy().tolist()
+			grasp_dict["c1"] = grasp_dict["c1"] + c1.detach().cpu().numpy().tolist()
+			num_grasps += torch.sum(mask).item()
+			it += 1
+			cls.logger.info(f"# successful grasps on iteration {it}: {torch.sum(mask)}")
+  
+		# sort in descending order of quality
+
+		grasp = Grasp.init_from_dict(grasp_dict)
+		if kwargs["sort"]:
+			sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
+			grasp.world_center = torch.index_select(grasp.world_center, 0, sort_indices)
+			grasp.world_axis = torch.index_select(grasp.world_axis, 0, sort_indices)
+			grasp.c0 = torch.index_select(grasp.c0, 0, sort_indices)
+			grasp.c1 = torch.index_select(grasp.c1, 0, sort_indices)
+			grasp.quality = torch.index_select(grasp.quality, 0, sort_indices)
+
+		return grasp
 
 	@classmethod
 	def sample_grasps_dexnet(cls, obj_f, num_samples, renderer, **kwargs):
@@ -936,7 +974,7 @@ class Grasp:
 
 		"""
 		check_method = (oracle_method in ["dexnet", "pytorch"])
-		if oracle_method == "dexnet" or (not check_method and (self.oracle_method == "dexnet")):
+		if oracle_method == "dexnet" or (self.oracle_method == "dexnet"):
 			if isinstance(robust, bool):
 				# Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
 				return self.oracle_eval_dexnet(obj_file, robust=robust)
@@ -1007,10 +1045,14 @@ class Grasp:
 
 		mesh, _ = renderer.render_object(obj_file, display=False)
 		width = torch.tensor([[0.05]],device=device)
-		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+		if self.c0 is not None and self.c1 is not None:
+			contact_points = torch.stack((self.c0, self.c1), 0)
+		else:
+			contact_points = None
+		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 		
 		com_qual_func = CannyFerrariQualityFunction(config_dict)
-		return com_qual_func.quality(mesh, grasp_torch)
+		return com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
 
 def save_nparr(image, filename):
 	""" 
@@ -1616,6 +1658,7 @@ def test_pytorch_oracle():
 	
 	com_qual_func = CannyFerrariQualityFunction(config_dict)
 	print("canny ferrari:", com_qual_func.quality(mesh, grasp1))
+	print("CONTACT SHAPE:", grasp1.contact_points.shape)
 
 	Grasp.logger.info("Comparison of select_grasp.Grasp and quality_fork.GraspTorch")
 	# GraspTorch object
@@ -1662,4 +1705,19 @@ if __name__ == "__main__":
 	# vis_rand_grasps()
 	# check_grasp_dataset()
 	# test_pytorch_oracle()
-	Grasp.sample_grasps("data/new_barclamp.obj", 5, renderer=Renderer())
+ 
+	# testing grasp sampling with pytorch
+	r = Renderer()
+	# g = Grasp.sample_grasps("data/new_barclamp.obj", 10, renderer=r)
+	# g.save("grasp-batch.json")
+	g = Grasp.read("grasp-batch.json")
+	qual = g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	# print("\nquality 1:", qual)
+	g.trans_world_to_im(camera=r.camera)
+	qual2 = g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	print("max difference:", torch.max(torch.sub(g.quality, qual)).item())
+	print("\nquality 0:", g.quality)
+	print("\nquality 2:", qual2)
+	diff = torch.sub(g.quality, qual2)
+	print("differences:", diff)
+	print("max difference:", torch.max(diff).item())
