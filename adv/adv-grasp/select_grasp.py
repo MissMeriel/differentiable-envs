@@ -1,6 +1,5 @@
-# import Pyro4
+import Pyro4
 import os
-import sys
 import math
 import time
 import logging
@@ -242,8 +241,8 @@ class Grasp:
 
 		if "objf" in batch_dict.keys():
 			obj_lst = batch_dict["objf"]
-			obj = obj_list.pop(0)
-			for o in obj_list:
+			obj = obj_lst.pop(0)
+			for o in obj_lst:
 				if o != obj:
 					cls.logger.error("read_batch - all grasps must be for the same grasp object.")
 					continue
