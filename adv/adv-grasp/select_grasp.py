@@ -1020,7 +1020,7 @@ class Grasp:
 
 		return self.quality
 
-	def oracle_eval_pytorch(self, obj_file, renderer):
+	def oracle_eval_pytorch(self, obj, renderer):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
@@ -1038,12 +1038,13 @@ class Grasp:
 			"antipodality_pctile": 1.0 
     	}
 
-		mesh, _ = renderer.render_object(obj_file, display=False)
-		width = torch.tensor([[0.05]],device=device)
-		if self.c0 is not None and self.c1 is not None:
-			contact_points = torch.stack((self.c0, self.c1), 0)
-		else:
-			contact_points = None
+		if isinstance(obj, Meshes): mesh = obj
+		else: mesh, _ = renderer.render_object(obj, display=False)
+
+		if self.c0 is not None and self.c1 is not None: contact_points = torch.stack((self.c0, self.c1), 0)
+		else: contact_points = None
+		
+		width = torch.tensor([[0.05]], device=device)
 		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 		
 		try:
@@ -1053,6 +1054,7 @@ class Grasp:
 			self.quality = 0.0
 
 		return self.quality
+
 
 	def vis_grasp_dataset(self, obj_file, directory, renderer):
 		"""Visualize a dataset of grasps in the given directory"""
