@@ -99,22 +99,28 @@ class Attack:
 		float: calculated loss
 		"""
 
-		# NO ORACLE
-		adv_mesh_clone = adv_mesh.clone()
-		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
-		pose, image = grasp.extract_tensors_batch(dim)
-		out = self.run(pose, image)
-		cur_pred = out[:,0:1].to(adv_mesh.device)
-		loss = cur_pred
-		return loss
+		# # NO ORACLE
+		# adv_mesh_clone = adv_mesh.clone()
+		# dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
+		# pose, image = grasp.extract_tensors_batch(dim)
+		# out = self.run(pose, image)
+		# cur_pred = out[:,0:1].to(adv_mesh.device)
+		# loss = cur_pred
+		# return loss
 
-		# CHECK CURRENT MODEL PREDICTION
+		# NO ORACLE GRADIENT - check current model prediction
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
 		pose, image = grasp.extract_tensors_batch(dim)
 		out = self.run(pose, image)
 		cur_pred = out[:,0:1].to(adv_mesh.device)
-		oracle_pred = torch.clone(grasp.quality) / 0.004	# scale to model range
+		if isinstance(grasp.quality, torch.Tensor):
+			oracle_pred = torch.clone(grasp.quality) / 0.004	# scale to model range
+		else:
+			oracle_pred = torch.zeros(1, 1).to(adv_mesh.device)
+		loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
+		self.losses["prediction"].append(loss.item())
+		return loss
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		# loss = torch.sub(1.0, torch.abs(torch.sub(torch.mean(cur_pred), torch.mean(oracle_pred))))
@@ -126,7 +132,7 @@ class Attack:
 		# normal_loss = mesh_normal_consistency(adv_mesh) * self.loss_weights["normal"]
 		# smooth_loss = mesh_laplacian_smoothing(adv_mesh) * self.loss_weights["smooth"]
 		# weighted_loss = loss + edge_loss + normal_loss + smooth_loss
-		self.losses["prediction"].append(loss.item())
+		# self.losses["prediction"].append(loss.item())
 		# self.losses["edge"].append(edge_loss.item())
 		# self.losses["normal"].append(normal_loss.item())
 		# self.losses["smoothing"].append(smooth_loss.item())
@@ -154,23 +160,23 @@ class Attack:
 			adv_mesh: perturbed mesh structure
 		"""
 
-		# RANDOM FUZZ PERTURBATION
+		# # RANDOM FUZZ PERTURBATION
 		# v = normal sample(dims)
 		# v = v / torch.linalg.norm(v)
 		# random_step = self.learning_rate * v
 		# adv_mesh = mesh.offset_verts(param)
 		# return adv_mesh
   
-		# NO ORACLE
+		# # NO ORACLE
+		# adv_mesh = mesh.offset_verts(param)
+		# loss = self.calc_loss(adv_mesh, grasp)
+		# return loss, adv_mesh
+
+		# NO ORACLE GRADIENT - perturb vertices
 		adv_mesh = mesh.offset_verts(param)
 		loss = self.calc_loss(adv_mesh, grasp)
+
 		return loss, adv_mesh
-
-		# PERTURB VERTICES
-		adv_mesh = mesh.offset_verts(param)
-		loss, model_pred, data = self.calc_loss(adv_mesh, grasp)
-
-		return loss, adv_mesh	#, model_pred, data
 
 	def attack_setup(self, dir, logfile, grasp, method):
 		"""Set up attack by saving info and resetting losses"""
@@ -221,8 +227,7 @@ class Attack:
 		if dir[-1] != "/": dir = dir+"/"
 		logfile = dir+"logfile.txt"
 		self.attack_setup(dir=dir, logfile=logfile, grasp=grasp, method=method)
-		# image = self.renderer.render_mesh(mesh, display=False)
-		dim = self.renderer.mesh_to_depth_im(mesh)
+		dim = self.renderer.mesh_to_depth_im(mesh, display=False)
 		_, orig_pdim = grasp.extract_tensors_batch(dim)
 
 		# SNAPSHOT
@@ -245,15 +250,15 @@ class Attack:
 
 		# save final object
 		final_mesh = mesh.offset_verts(param)
-		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim)
+		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, save_mesh=True)
 		
-		# # plot losses
-		# Attack.plot_losses(self.losses, dir)
+		# plot losses
+		Attack.plot_losses(self.losses, dir)
 
 		# _, image = grasp.extract_tensors_batch(dim)
 		return final_mesh	#, image[0]
 
-	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim):
+	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim, save_mesh=False):
 		"""Save information at current point in attack."""
 		# TODO: Implement for batch of grasps in attack
 
@@ -261,7 +266,7 @@ class Attack:
 		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		image = self.renderer.render_mesh(mesh, display=False)
 
-		dim = self.renderer.mesh_to_depth_im(mesh)
+		dim = self.renderer.mesh_to_depth_im(mesh, display=False)
 		pose, processed_dim = grasp.extract_tensors_batch(dim)
 		model_pred = self.run(pose, processed_dim)[:,0:1]
 		oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer)
@@ -271,6 +276,9 @@ class Attack:
 		title = f"Iteration {iteration}: oracle quality {oracle_qual:.4f}, gqcnn prediction {model_pred.item():.4f}"
 		fname = dir + "it-" + str(iteration) + ".png"
 		self.renderer.display(images=[image, dim, processed_dim, depth_diff], shape=(1,4), title=title, save=fname)
+
+		if not save_mesh:
+			os.remove(mesh_file)
 
 def test_run():
 	"""Test prediction of gqcnn_pytorch model"""
@@ -407,11 +415,17 @@ if __name__ == "__main__":
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=50, model=model, renderer=r, oracle_method="pytorch")
+	run1 = Attack(num_plots=10, steps_per_plot=20, model=model, renderer=r, oracle_method="pytorch")
 
-	run1.attack(mesh=mesh, grasp=grasps[2], dir="exp-results/no-oracle/grasp3/lr0/", lr=1e-5, momentum=0.0, loss_alpha=None, method="no-oracle")
-	run1.attack(mesh=mesh, grasp=grasps[2], dir="exp-results/no-oracle/grasp3/lr1/", lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
-	run1.attack(mesh=mesh, grasp=grasps[2], dir="exp-results/no-oracle/grasp3/lr2/", lr=1e-5, momentum=0.99, loss_alpha=None, method="no-oracle")
-	run1.attack(mesh=mesh, grasp=grasps[2], dir="exp-results/no-oracle/grasp3/lr3/", lr=1e-4, momentum=0.0, loss_alpha=None, method="no-oracle")
-	run1.attack(mesh=mesh, grasp=grasps[2], dir="exp-results/no-oracle/grasp3/lr4/", lr=1e-4, momentum=0.9, loss_alpha=None, method="no-oracle")
-	run1.attack(mesh=mesh, grasp=grasps[2], dir="exp-results/no-oracle/grasp3/lr5/", lr=1e-4, momentum=0.99, loss_alpha=None, method="no-oracle")
+	print("ATTACK 1\n")
+	run1.attack(mesh=mesh, grasp=grasps[5], dir="exp-results/no-oracle-grad/grasp6/lr0/", lr=1e-5, momentum=0.0, loss_alpha=None, method="no-oracle-grad")
+	print("ATTACK 2")
+	run1.attack(mesh=mesh, grasp=grasps[5], dir="exp-results/no-oracle-grad/grasp6/lr1/", lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle-grad")
+	print("ATTACK 3\n")
+	run1.attack(mesh=mesh, grasp=grasps[5], dir="exp-results/no-oracle-grad/grasp6/lr2/", lr=1e-5, momentum=0.99, loss_alpha=None, method="no-oracle-grad")
+	print("ATTACK 4\n")
+	run1.attack(mesh=mesh, grasp=grasps[5], dir="exp-results/no-oracle-grad/grasp6/lr3/", lr=1e-4, momentum=0.0, loss_alpha=None, method="no-oracle-grad")
+	print("ATTACK 5\n")
+	run1.attack(mesh=mesh, grasp=grasps[5], dir="exp-results/no-oracle-grad/grasp6/lr4/", lr=1e-4, momentum=0.9, loss_alpha=None, method="no-oracle-grad")
+	print("ATTACK 6\n")
+	run1.attack(mesh=mesh, grasp=grasps[5], dir="exp-results/no-oracle-grad/grasp6/lr5/", lr=1e-4, momentum=0.99, loss_alpha=None, method="no-oracle-grad")
