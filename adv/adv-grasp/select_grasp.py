@@ -142,7 +142,7 @@ class Grasp:
 		if isinstance(prediction, float):
 			self.prediction = torch.tensor([prediction]).to(device).float().unsqueeze(0)
 		elif isinstance(prediction, list):
-			self.prediction = torch.from_numpy(np.array(quality)).to(device).float()
+			self.prediction = torch.from_numpy(np.array(prediction)).to(device).float()
 		if self.prediction != None and self.prediction.dim() == 1:
 			self.prediction = self.prediction.unsqueeze(0)
 
@@ -1054,6 +1054,77 @@ class Grasp:
 
 		return self.quality
 
+	def vis_grasp_dataset(self, obj_file, directory, renderer):
+		"""Visualize a dataset of grasps in the given directory"""
+
+		if not os.path.isdir(directory): os.mkdir(directory)
+
+		if directory[-1] == "/": directory = directory[:-1]
+		batch_fname, img_fname, dimg_fname = directory + "/grasp-batch.json", directory + "/grasp-object.png", directory + "/depth-im.png"
+		pdimg_fname, gimg_fname, gsphimg_fname = directory + "/processed-depth-im.png", directory + "/grasp-vis.png", directory + "/grasp-sphere.png"
+
+		# save top level info
+		self.save(batch_fname)
+		mesh, im = renderer.render_object(obj_file, display=False)
+		depth_im = renderer.mesh_to_depth_im(mesh, display=False)
+		renderer.display(im, title=obj_file.split("/")[-1], save=img_fname)
+		renderer.display(depth_im, title=obj_file.split("/")[-1], save=dimg_fname)
+
+		# save grasp specific information
+		if self.num_grasps() == 1:
+			qual_title = ""
+			if self.quality is not None: qual_title += f"\nQuality: {self.quality.item()}"
+			if self.prediction is not None: qual_title += f"\nPrediction: {self.prediction.item()}"
+
+			# processed depth image
+			_, p_dim = self.extract_tensors(depth_im)
+			title = "Depth image w.r.t. grasp" + qual_title
+			renderer.display(p_dim, title=title, save=pdimg_fname)
+
+			# grasp sphere rendering
+			title = "Grasp visualization" + qual_title
+			contacts = [self.c0, self.c1] if (self.c0 is not None and self.c1 is not None) else None
+			if contacts is not None: 
+				gsphere_mesh = renderer.grasp_sphere(center=contacts, obj=mesh, display=False)
+			else:
+				gsphere_mesh = renderer.grasp_sphere(center=self.world_center, obj=mesh, display=False)
+			renderer.display(gsphere_mesh, title=title, save=gsphimg_fname)
+
+			# if applicable: draw grasp/grasp vis
+			if contacts is not None:
+				renderer.draw_grasp(mesh, contacts[0], contacts[1], title=title, save=gimg_fname, display=False)
+
+			return None
+		
+		for i, g in enumerate(self):
+			# nested directory for each grasp
+			local_dir = directory + f"/grasp_{i}/"
+			if not os.path.isdir(local_dir): os.mkdir(local_dir)
+			pdimg_fname, gimg_fname, gsphimg_fname = local_dir + pdimg_fname.split("/")[-1], local_dir + gimg_fname.split("/")[-1], local_dir + gsphimg_fname.split("/")[-1]
+			
+			qual_title = ""
+			if g.quality is not None: qual_title += f"\nQuality: {g.quality.item()}"
+			if g.prediction is not None: qual_title += f"\nPrediction: {g.prediction.item()}"
+
+			# processed depth image
+			_, p_dim = g.extract_tensors(depth_im)
+			title = f"Depth image w.r.t. grasp {i}" + qual_title
+			renderer.display(p_dim, title=title, save=pdimg_fname)
+
+			# grasp sphere rendering
+			title = f"Grasp visualization for grasp {i}" + qual_title
+			contacts = [g.c0, g.c1] if (g.c0 is not None and g.c1 is not None) else None
+			if contacts is not None: 
+				gsphere_mesh = renderer.grasp_sphere(center=contacts, grasp_obj=mesh, display=False)
+			else:
+				gsphere_mesh = renderer.grasp_sphere(center=g.world_center, grasp_obj=mesh, display=False)
+			renderer.display(gsphere_mesh, title=title, save=gsphimg_fname)
+
+			# if applicable: draw grasp/grasp vis
+			if contacts is not None:
+				renderer.draw_grasp(mesh, contacts[0], contacts[1], title=title, save=gimg_fname, display=False)
+
+
 def save_nparr(image, filename):
 	""" 
 	Save numpy.ndarray image in the shared dir
@@ -1705,4 +1776,10 @@ if __name__ == "__main__":
 	# vis_rand_grasps()
 	# check_grasp_dataset()
 	# test_pytorch_oracle()
-	test_select_grasp_pytorch()
+	# test_select_grasp_pytorch()
+ 
+	# visualize grasp-batch.json
+	r = Renderer()
+	g = Grasp.read("grasp-batch.json")
+	g.trans_world_to_im(camera=r.camera)
+	g.vis_grasp_dataset(obj_file="data/new_barclamp.obj", directory="grasp-dataset", renderer=r)
