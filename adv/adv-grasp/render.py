@@ -250,6 +250,8 @@ class Renderer:
 		else:
 			plt.show()
 
+		plt.close()
+
 	def draw_grasp(self, obj, contact0, contact1, title=None, save="", display=True):
 
 		if isinstance(obj, Meshes):
