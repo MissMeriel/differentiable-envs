@@ -505,16 +505,6 @@ class Grasp:
 		# render mesh
 		mesh, _ = renderer.render_object(obj_f, display=False)
 
-		# oracle set up
-		config_dict = {
-			"torque_scaling":1000,
-			"soft_fingers":1,
-			"friction_coef": 0.8,
-			"antipodality_pctile": 1.0 
-		}
-		width = torch.tensor([[0.05]],device=device)
-		com_qual_func = CannyFerrariQualityFunction(config_dict)
-
 		# track grasps
 		num_grasps, it, grasp_dict = 0, 0, {}
 		grasp_dict["world_axis"] = []
@@ -538,28 +528,32 @@ class Grasp:
 			norms = norms[mask]
 			c0 = samples_c0[mask, :]
 			c1 = samples_c1[mask, :]
-			contacts = torch.stack((c0, c1), 0)
 		
 			# compute grasp center and axis, then check quality
 			world_centers = (c0 + c1) / 2
 			world_axes = (c1 - c0) / norms.unsqueeze(1)
-			quals = torch.zeros(world_centers.shape[0], 1, dtype=torch.float64, device="cuda:0")
 
-			for i in range(world_centers.shape[0]):
+			# update 3D axis based on 2D transformation
+			camera = renderer.camera
+			axis = camera.get_world_to_view_transform().transform_normals(world_axes)
+			axis[..., 2] = 0
+			axis = torch.nn.functional.normalize(axis, dim=-1)
+			world_axes = camera.get_world_to_view_transform().inverse().transform_normals(axis)
+
+			# temporary dictionary for candidate grasps
+			temp_dict = {"world_axis": world_axes.detach().cpu().numpy().tolist(), "world_center": world_centers.detach().cpu().numpy().tolist(), "c0": c0.detach().cpu().numpy().tolist(), "c1": c1.detach().cpu().numpy().tolist()}
+			temp_qual = torch.zeros(world_centers.shape[0], 1, dtype=torch.float64, device="cuda:0")
+
+			cand_grasps = Grasp.init_from_dict(temp_dict)
+			for i, g in enumerate(cand_grasps):
 				if i % 100 == 0:
 					cls.logger.info(f"Checking grasp {i} of {world_centers.shape[0]} in iteration {it}.")
-				try:
-					grasp_torch = GraspTorch(center=world_centers[i], axis3D=world_axes[i], width=width, camera_intr=renderer.camera, contact_points = contacts[:, i, :], friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-					qual = com_qual_func.quality(mesh, grasp_torch)
-					# print(f"qual: {qual}")
-					quals[i] = qual
-				except QhullError:
-					cls.logger.error("QhullError caught")
-					quals[i] = 0.0
-   
-			mask = (quals >= kwargs["min_qual"]) & (quals <= kwargs["max_qual"])
+				temp_qual[i] = g.oracle_eval(obj_f, oracle_method="pytorch", renderer=renderer)
+
+			# check what grasps are in quality range
+			mask = (temp_qual >= kwargs["min_qual"]) & (temp_qual <= kwargs["max_qual"])
 			mask = mask.squeeze()
-			quals = quals[mask]
+			temp_qual = temp_qual[mask]
 			c0 = c0[mask, :]
 			c1 = c1[mask, :]
 			world_centers = world_centers[mask, :]
@@ -567,7 +561,7 @@ class Grasp:
 
 			grasp_dict["world_axis"] = grasp_dict["world_axis"] + world_axes.detach().cpu().numpy().tolist()
 			grasp_dict["world_center"] = grasp_dict["world_center"] + world_centers.detach().cpu().numpy().tolist()
-			grasp_dict["quality"] = grasp_dict["quality"] + quals.detach().cpu().numpy().tolist()
+			grasp_dict["quality"] = grasp_dict["quality"] + temp_qual.detach().cpu().numpy().tolist()
 			grasp_dict["c0"] = grasp_dict["c0"] + c0.detach().cpu().numpy().tolist()
 			grasp_dict["c1"] = grasp_dict["c1"] + c1.detach().cpu().numpy().tolist()
 			num_grasps += torch.sum(mask).item()
@@ -575,7 +569,6 @@ class Grasp:
 			cls.logger.info(f"# successful grasps on iteration {it}: {torch.sum(mask)}")
   
 		# sort in descending order of quality
-
 		grasp = Grasp.init_from_dict(grasp_dict)
 		if kwargs["sort"]:
 			sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
@@ -585,7 +578,10 @@ class Grasp:
 			grasp.c1 = torch.index_select(grasp.c1, 0, sort_indices)
 			grasp.quality = torch.index_select(grasp.quality, 0, sort_indices)
 
-		return grasp
+		if grasp.num_grasps() > num_samples:
+			return grasp[:num_samples]
+		else:
+			return grasp
 
 	@classmethod
 	def sample_grasps_dexnet(cls, obj_f, num_samples, renderer, **kwargs):
@@ -1050,8 +1046,13 @@ class Grasp:
 			contact_points = None
 		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 		
-		com_qual_func = CannyFerrariQualityFunction(config_dict)
-		return com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
+		try:
+			com_qual_func = CannyFerrariQualityFunction(config_dict)
+			self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
+		except QhullError:
+			self.quality = 0.0
+
+		return self.quality
 
 def save_nparr(image, filename):
 	""" 
@@ -1110,6 +1111,33 @@ def test_select_grasp():
 	# 	renderer1.display(image, title=t)	#, save=True, fname=fname)
 
 	Grasp.logger.info("Finished running test_select_grasp.")
+
+def test_select_grasp_pytorch():
+	Grasp.logger.info("Testing grasp sampling with pytorch - test_select_grasp_pytorch")
+
+	fname, num = "temp_0.json", 1
+	while os.path.isfile(fname):
+		fname = "temp_" + str(num) + ".json"
+		num += 1
+
+	r = Renderer()
+	g = Grasp.sample_grasps("data/new_barclamp.obj", 5, renderer=r)
+	assert g.num_grasps() == 5
+	qual = g.quality
+	g.save(fname)
+
+	g = Grasp.read(fname)
+	os.remove(fname)
+	assert torch.max(torch.sub(qual, g.quality)).item() == 0
+
+	qual2 = g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	assert torch.max(torch.sub(qual, qual2)).item() == 0
+
+	g.trans_world_to_im(camera=r.camera)
+	qual3 = g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	assert torch.max(torch.sub(qual, qual3)).item() == 0
+
+	Grasp.logger.info("Finished testing grasp sampling with pytorch - test_select_grasp_pytorch")
 
 def test_save_and_load_grasps():
 	Grasp.logger.info("Running test_save_and_load_grasps...")
@@ -1607,32 +1635,6 @@ def test_random_grasps():
 
 	Grasp.logger.info("Finished testing random_grasps.")
 
-def generate_grasp_dataset(dataset_dir):
-	Grasp.logger.info(f"Generating grasp dataset in directory {dataset_dir}...")
-
-	renderer = Renderer()
-	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
-
-	grasps = Grasp.sample_grasps("data/bar_clamp.obj", 10, renderer=renderer, min_qual=0.002, save_grasp=dataset_dir)
-
-	Grasp.logger.info(f"Finished generating grasp dataset to directory {dataset_dir}")
-
-def check_grasp_dataset():
-	r = Renderer()
-	grasps = Grasp.read("grasp-dataset/grasp_batch.json")
-	grasps.oracle_eval("data/new_barclamp.obj", renderer=r, robust=False)
-	print("non-robust qualities:", grasps.quality)
-
-	# grasps2 = Grasp.read("example-grasps/batch-test.json")
-	# print("grasps2 qualities:\n", grasps2.quality, "\n")
-	# grasps2.oracle_eval("data/new_barclamp.obj", renderer=r)
-	# print(grasps2.quality)
-
-	# grasps3 = Grasp.read("experiment-results/ex01/grasp.json")
-	# print("\ngrasp3 qualities:", grasps3.quality, "\n")
-	# grasps3.oracle_eval("data/new_barclamp.obj", renderer=r)
-	# print(grasps3.quality)
-
 def test_pytorch_oracle():
 	Grasp.logger.info("Running test_pytorch_oracle() to test PyTorch oracle.")
 
@@ -1687,7 +1689,6 @@ def test_pytorch_oracle():
 		qual = grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
 		assert torch.sub(qual, batch_qual[i]).item() < EPS
 
-
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
@@ -1704,19 +1705,4 @@ if __name__ == "__main__":
 	# vis_rand_grasps()
 	# check_grasp_dataset()
 	# test_pytorch_oracle()
- 
-	# testing grasp sampling with pytorch
-	r = Renderer()
-	# g = Grasp.sample_grasps("data/new_barclamp.obj", 10, renderer=r)
-	# g.save("grasp-batch.json")
-	g = Grasp.read("grasp-batch.json")
-	qual = g.oracle_eval("data/new_barclamp.obj", renderer=r)
-	# print("\nquality 1:", qual)
-	g.trans_world_to_im(camera=r.camera)
-	qual2 = g.oracle_eval("data/new_barclamp.obj", renderer=r)
-	print("max difference:", torch.max(torch.sub(g.quality, qual)).item())
-	print("\nquality 0:", g.quality)
-	print("\nquality 2:", qual2)
-	diff = torch.sub(g.quality, qual2)
-	print("differences:", diff)
-	print("max difference:", torch.max(diff).item())
+	test_select_grasp_pytorch()
