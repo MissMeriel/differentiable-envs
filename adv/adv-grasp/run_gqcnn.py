@@ -191,18 +191,18 @@ class Attack:
 			adv_mesh: perturbed mesh structure
 		"""
 
-		# # RANDOM FUZZ PERTURBATION
-		# v = normal sample(dims)
-		# v = v / torch.linalg.norm(v)
-		# random_step = self.learning_rate * v
-		# adv_mesh = mesh.offset_verts(param)
-		# return adv_mesh
+		# RANDOM FUZZ PERTURBATION
+		v = torch.normal(0.0, 1.0, param.shape).to(param.device)
+		v = torch.nn.functional.normalize(v)
+		random_step = self.learning_rate * v
+		adv_mesh = mesh.offset_verts(random_step)
+		return adv_mesh
   
-		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
-		adv_mesh = mesh.offset_verts(param)
-		loss = self.calc_loss(adv_mesh, grasp)
+		# # NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
+		# adv_mesh = mesh.offset_verts(param)
+		# loss = self.calc_loss(adv_mesh, grasp)
 
-		return loss, adv_mesh
+		# return loss, adv_mesh
 
 	def attack_setup(self, dir, logfile, grasp, method):
 		"""Set up attack by saving info and resetting losses"""
@@ -266,31 +266,31 @@ class Attack:
 		self.snapshot(mesh=mesh, grasp=grasp, dir=dir, iteration=0, orig_pdim=orig_pdim)
 
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
-		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
+		# optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
 		adv_mesh = mesh.clone()
 
 		# ADVERSARIAL LOOP
 		for i in range(1, self.num_steps):
 
-			try:
-				optimizer.zero_grad()
-				loss, adv_mesh = self.perturb(mesh, param, grasp)
-				loss.backward()
-				optimizer.step()
-			except:
-				break
+			# optimizer.zero_grad()
+			# loss, adv_mesh = self.perturb(mesh, param, grasp)
+			# loss.backward()
+			# optimizer.step()
+   
+			# RANDOM FUZZ
+			adv_mesh = self.perturb(mesh, param, grasp)
 
 			if i % self.steps_per_plot == 0:
 				# snapshot
 				self.snapshot(mesh=adv_mesh, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim)
 
 		# plot losses
-		Attack.plot_losses(self.losses, dir)
+		# Attack.plot_losses(self.losses, dir)
 		Attack.plot_qual(self.track_qual, dir)
 
 		# save final object
-		final_mesh = mesh.offset_verts(param)
+		final_mesh = adv_mesh #mesh.offset_verts(param)
 		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, save_mesh=True)
 
 		return final_mesh
@@ -307,7 +307,11 @@ class Attack:
 		if isinstance(oracle_qual, torch.Tensor): oracle_qual = oracle_qual.item()
 		if orig_pdim is not None: depth_diff = orig_pdim - processed_dim
 
-		title = f"(Oracle gradient) Iteration {iteration}: oracle quality {oracle_qual:.4f}, gqcnn prediction {model_pred.item():.4f}"
+		# RANDOM FUZZ
+		self.track_qual["gqcnn prediction"].append(model_pred.item())
+		self.track_qual["oracle quality"].append(oracle_qual / 0.004)
+
+		title = f"(Random Fuzz) Iteration {iteration}: oracle quality {oracle_qual:.4f}, gqcnn prediction {model_pred.item():.4f}"
 		fname = dir + "it-" + str(iteration) + ".png"
 		self.renderer.display(images=[image, dim, processed_dim, depth_diff], shape=(1,4), title=title, save=fname)
 
@@ -448,51 +452,31 @@ if __name__ == "__main__":
 	g = Grasp.read("grasp-batch.json")
 	grasps = [g[0], g[1], g[3], g[4], g[5], g[6]]
 
+	d = "exp-results/random-fuzz/"
+	grasp_dirs = {d+"grasp0/": g[0], d+"grasp1/": g[1], d+"grasp3/": g[2], d+"grasp4/": g[3], d+"grasp5/": g[4], d+"grasp6/": g[5]}
+
+	# oracle_grad_lr = [(1e-6, 0.0), (1e-6, 0.99), (1e-5, 0.0), (1e-5, 0.9), (1e-5, 0.99), (1e-4, 0.0), (1e-4, 0.9)]	# learning rate and momentum combinations
+	# oracle_grad_alpha = [0.1, 0.3, 0.5, 0.7]
+ 
+	# learning rate and momentum combinations
+	random_fuzz_lr = {"lr0": 1e-6, "lr1":1e-5, "lr3": 1e-4}
+
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=r, oracle_method="pytorch")
+	run1 = Attack(num_plots=10, steps_per_plot=20, model=model, renderer=r, oracle_method="pytorch")
 
-	grasp = grasps[5]
-	d = "exp-results/oracle-grad/grasp6/"
+	for d in grasp_dirs.keys():
+		for ext in random_fuzz_lr.keys():
+			save = d + ext + "/"
+			lr = random_fuzz_lr[ext]
+			grasp = grasp_dirs[d]
+			print(f"saving to: {save} with learning rate {lr}")
+			run1.attack(mesh=mesh, grasp=grasp, dir=save, lr=lr, momentum=None, loss_alpha=None, method="random-fuzz")
 
-	print("ATTACK SET 1\n")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight0/", lr=1e-6, momentum=0.0, loss_alpha=0.1, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight1/", lr=1e-6, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight2/", lr=1e-6, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight3/", lr=1e-6, momentum=0.0, loss_alpha=0.7, method="oracle-grad")
+	
 
-	print("ATTACK SET 2")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr1-weight0/", lr=1e-6, momentum=0.99, loss_alpha=0.1, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr1-weight1/", lr=1e-6, momentum=0.99, loss_alpha=0.3, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr1-weight2/", lr=1e-6, momentum=0.99, loss_alpha=0.5, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr1-weight3/", lr=1e-6, momentum=0.99, loss_alpha=0.7, method="oracle-grad")
-
-	print("ATTACK SET 3\n")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr2-weight0/", lr=1e-5, momentum=0.0, loss_alpha=0.1, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr2-weight1/", lr=1e-5, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr2-weight2/", lr=1e-5, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr2-weight3/", lr=1e-5, momentum=0.0, loss_alpha=0.7, method="oracle-grad")
-
-	print("ATTACK SET 4")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr3-weight0/", lr=1e-5, momentum=0.9, loss_alpha=0.1, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr3-weight1/", lr=1e-5, momentum=0.9, loss_alpha=0.3, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr3-weight2/", lr=1e-5, momentum=0.9, loss_alpha=0.5, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr3-weight3/", lr=1e-5, momentum=0.9, loss_alpha=0.7, method="oracle-grad")
-
-	# print("ATTACK SET 5\n")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr4-weight0/", lr=1e-5, momentum=0.99, loss_alpha=0.1, method="oracle-grad")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr4-weight1/", lr=1e-5, momentum=0.99, loss_alpha=0.3, method="oracle-grad")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr4-weight2/", lr=1e-5, momentum=0.99, loss_alpha=0.5, method="oracle-grad")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr4-weight3/", lr=1e-5, momentum=0.99, loss_alpha=0.7, method="oracle-grad")
-
-	print("ATTACK SET 6\n")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr5-weight0/", lr=1e-4, momentum=0.0, loss_alpha=0.1, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr5-weight1/", lr=1e-4, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr5-weight2/", lr=1e-4, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
-	run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr5-weight3/", lr=1e-4, momentum=0.0, loss_alpha=0.7, method="oracle-grad")
-
-	# print("ATTACK SET 7\n")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr6-weight0/", lr=1e-4, momentum=0.9, loss_alpha=0.1, method="oracle-grad")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr6-weight1/", lr=1e-4, momentum=0.9, loss_alpha=0.3, method="oracle-grad")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr6-weight2/", lr=1e-4, momentum=0.9, loss_alpha=0.5, method="oracle-grad")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr6-weight3/", lr=1e-4, momentum=0.9, loss_alpha=0.7, method="oracle-grad")
+	# print("ATTACK SET 1\n")
+	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight0/", lr=1e-6, momentum=0.0, loss_alpha=0.1, method="oracle-grad")
+	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight1/", lr=1e-6, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
+	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight2/", lr=1e-6, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
+	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight3/", lr=1e-6, momentum=0.0, loss_alpha=0.7, method="oracle-grad")
