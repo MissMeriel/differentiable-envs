@@ -75,6 +75,11 @@ class Attack:
 		return self.model(pose_tensor, image_tensor)
 
 	@staticmethod
+	def scale_oracle(x):
+		"""Scale the oracle quality to be more like the model prediction"""
+		return 1 / (1 + torch.exp(-2500 * (x - torch.tensor(0.001))))
+
+	@staticmethod
 	def plot_losses(losses, dir):
 		fig = plt.figure(figsize=(13, 5))
 		ax = fig.gca()
@@ -142,9 +147,10 @@ class Attack:
 		pose, image = grasp.extract_tensors_batch(dim)
 		out = self.run(pose, image)
 		cur_pred = out[:,0:1].to(adv_mesh.device)
-		oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer) / 0.004 	# scaled so 0.002 --> 0.5
+		oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
+		oracle_pred = self.scale_oracle(oracle_pred)
 		# loss = torch.sub(1.0, torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))))
-		loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))
+		loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))		# use means for batches
 
 		self.losses["prediction"].append(loss.item())
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
@@ -155,7 +161,7 @@ class Attack:
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		# loss = torch.sub(1.0, torch.abs(torch.sub(torch.mean(cur_pred), torch.mean(oracle_pred))))
-		loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))		# use means for batches
+		loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))		
 
 		# ignore regularization losses for now
 		# # WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
@@ -167,12 +173,6 @@ class Attack:
 		# self.losses["edge"].append(edge_loss.item())
 		# self.losses["normal"].append(normal_loss.item())
 		# self.losses["smoothing"].append(smooth_loss.item())
-
-		# data = ("\n\tModel prediction: " + str(cur_pred.detach().cpu().numpy().tolist()) + f"\n\tPrediction loss: {loss}")	
-		#\n\tNormal consistency loss: {normal_loss}\n\tLaplacian smoothing loss: {smooth_loss}\n\tMesh edge loss: {edge_loss}\n\tWeighted loss: {weighted_loss} + "\n\tModel prediction mean: " + str(torch.mean(cur_pred).item()) + 
-
-		# return weighted_loss, torch.mean(cur_pred), data
-		return loss, cur_pred
 
 	def perturb(self, mesh, param, grasp):
 		"""
@@ -191,18 +191,18 @@ class Attack:
 			adv_mesh: perturbed mesh structure
 		"""
 
-		# RANDOM FUZZ PERTURBATION
-		v = torch.normal(0.0, 1.0, param.shape).to(param.device)
-		v = torch.nn.functional.normalize(v)
-		random_step = self.learning_rate * v
-		adv_mesh = mesh.offset_verts(random_step)
-		return adv_mesh
+		# # RANDOM FUZZ PERTURBATION
+		# v = torch.normal(0.0, 1.0, param.shape).to(param.device)
+		# v = torch.nn.functional.normalize(v)
+		# random_step = self.learning_rate * v
+		# adv_mesh = mesh.offset_verts(random_step)
+		# return adv_mesh
   
-		# # NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
-		# adv_mesh = mesh.offset_verts(param)
-		# loss = self.calc_loss(adv_mesh, grasp)
+		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
+		adv_mesh = mesh.offset_verts(param)
+		loss = self.calc_loss(adv_mesh, grasp)
 
-		# return loss, adv_mesh
+		return loss, adv_mesh
 
 	def attack_setup(self, dir, logfile, grasp, method):
 		"""Set up attack by saving info and resetting losses"""
@@ -263,61 +263,80 @@ class Attack:
 		_, orig_pdim = grasp.extract_tensors_batch(dim)
 
 		# snapshot
-		self.snapshot(mesh=mesh, grasp=grasp, dir=dir, iteration=0, orig_pdim=orig_pdim)
+		self.snapshot(mesh=mesh, grasp=grasp, dir=dir, iteration=0, orig_pdim=orig_pdim, logfile=logfile)
 
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
-		# optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
+		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
 		adv_mesh = mesh.clone()
 
 		# ADVERSARIAL LOOP
 		for i in range(1, self.num_steps):
 
-			# optimizer.zero_grad()
-			# loss, adv_mesh = self.perturb(mesh, param, grasp)
-			# loss.backward()
-			# optimizer.step()
+			optimizer.zero_grad()
+			loss, adv_mesh = self.perturb(mesh, param, grasp)
+			loss.backward()
+			optimizer.step()
    
-			# RANDOM FUZZ
-			adv_mesh = self.perturb(mesh, param, grasp)
+			# # RANDOM FUZZ
+			# adv_mesh = self.perturb(mesh, param, grasp)
 
 			if i % self.steps_per_plot == 0:
 				# snapshot
-				self.snapshot(mesh=adv_mesh, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim)
+				mesh2 = adv_mesh.clone()
+				self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile)
 
 		# plot losses
-		# Attack.plot_losses(self.losses, dir)
+		Attack.plot_losses(self.losses, dir)
 		Attack.plot_qual(self.track_qual, dir)
 
 		# save final object
-		final_mesh = adv_mesh #mesh.offset_verts(param)
-		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, save_mesh=True)
+		final_mesh = mesh.offset_verts(param)
+		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, logfile=logfile, save_mesh=True)
 
 		return final_mesh
 
-	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim, save_mesh=False):
+	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim, logfile, save_mesh=False):
 		"""Save information at current point in attack."""
 		# TODO: Implement for batch of grasps in attack
-
+  
+		mesh_file = dir + f"it-{iteration}.obj"
+		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		image = self.renderer.render_mesh(mesh, display=False)
+
 		dim = self.renderer.mesh_to_depth_im(mesh, display=False)
 		pose, processed_dim = grasp.extract_tensors_batch(dim)
 		model_pred = self.run(pose, processed_dim)[:,0:1]
-		oracle_qual = grasp.oracle_eval(mesh, renderer=self.renderer)
-		if isinstance(oracle_qual, torch.Tensor): oracle_qual = oracle_qual.item()
+		oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer)
+		oracle_qual_scaled = self.scale_oracle(oracle_qual)
+		if isinstance(oracle_qual_scaled, torch.Tensor): oracle_qual_scaled = oracle_qual_scaled.item()
 		if orig_pdim is not None: depth_diff = orig_pdim - processed_dim
 
-		# RANDOM FUZZ
-		self.track_qual["gqcnn prediction"].append(model_pred.item())
-		self.track_qual["oracle quality"].append(oracle_qual / 0.004)
+		# # RANDOM FUZZ
+		# self.track_qual["gqcnn prediction"].append(model_pred.item())
+		# self.track_qual["oracle quality"].append(oracle_qual / 0.004)
 
-		title = f"(Random Fuzz) Iteration {iteration}: oracle quality {oracle_qual:.4f}, gqcnn prediction {model_pred.item():.4f}"
+		title = f"Iteration {iteration}: oracle quality {oracle_qual_scaled:.4f}, gqcnn prediction {model_pred.item():.4f}"
 		fname = dir + "it-" + str(iteration) + ".png"
-		self.renderer.display(images=[image, dim, processed_dim, depth_diff], shape=(1,4), title=title, save=fname)
+		image = image.squeeze(0)
+		image = image[140:340, 270:370, :]
+		self.renderer.display(images=[image, processed_dim, depth_diff], shape=(1,3), title=title, save=fname)
+		print(f"save: {fname}")
 
-		if save_mesh:
-			mesh_file = dir + f"it-{iteration}.obj"
-			save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+		if not save_mesh:
+			os.remove(mesh_file)
+
+		# add info to logfile
+		if isinstance(oracle_qual, torch.Tensor): oracle_qual = oracle_qual.item()
+		data = {
+			"iteration": iteration,
+			"model prediction": model_pred.item(),
+			"oracle quality raw": oracle_qual,
+			"oracle quality scaled": oracle_qual_scaled,
+		}
+		with open(logfile, "a") as f:
+			json.dump(data, f, indent=4)
+			
 
 def test_run():
 	"""Test prediction of gqcnn_pytorch model"""
@@ -452,31 +471,31 @@ if __name__ == "__main__":
 	g = Grasp.read("grasp-batch.json")
 	grasps = [g[0], g[1], g[3], g[4], g[5], g[6]]
 
-	d = "exp-results/random-fuzz/"
-	grasp_dirs = {d+"grasp0/": g[0], d+"grasp1/": g[1], d+"grasp3/": g[2], d+"grasp4/": g[3], d+"grasp5/": g[4], d+"grasp6/": g[5]}
+	# d = "exp-results/random-fuzz/"
+	# grasp_dirs = {d+"grasp0/": g[0], d+"grasp1/": g[1], d+"grasp3/": g[2], d+"grasp4/": g[3], d+"grasp5/": g[4], d+"grasp6/": g[5]}
 
 	# oracle_grad_lr = [(1e-6, 0.0), (1e-6, 0.99), (1e-5, 0.0), (1e-5, 0.9), (1e-5, 0.99), (1e-4, 0.0), (1e-4, 0.9)]	# learning rate and momentum combinations
 	# oracle_grad_alpha = [0.1, 0.3, 0.5, 0.7]
  
 	# learning rate and momentum combinations
-	random_fuzz_lr = {"lr0": 1e-6, "lr1":1e-5, "lr3": 1e-4}
+	# random_fuzz_lr = {"lr0": 1e-6, "lr1":1e-5, "lr3": 1e-4}
 
 	model = KitModel("weights.npy")
 	model.eval()
-	run1 = Attack(num_plots=10, steps_per_plot=20, model=model, renderer=r, oracle_method="pytorch")
+	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=r, oracle_method="pytorch")
 
-	for d in grasp_dirs.keys():
-		for ext in random_fuzz_lr.keys():
-			save = d + ext + "/"
-			lr = random_fuzz_lr[ext]
-			grasp = grasp_dirs[d]
-			print(f"saving to: {save} with learning rate {lr}")
-			run1.attack(mesh=mesh, grasp=grasp, dir=save, lr=lr, momentum=None, loss_alpha=None, method="random-fuzz")
-
-	
+	# for d in grasp_dirs.keys():
+	# 	for ext in random_fuzz_lr.keys():
+	# 		save = d + ext + "/"
+	# 		lr = random_fuzz_lr[ext]
+	# 		grasp = grasp_dirs[d]
+	# 		print(f"saving to: {save} with learning rate {lr}")
+	# 		run1.attack(mesh=mesh, grasp=grasp, dir=save, lr=lr, momentum=None, loss_alpha=None, method="random-fuzz")
 
 	# print("ATTACK SET 1\n")
-	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight0/", lr=1e-6, momentum=0.0, loss_alpha=0.1, method="oracle-grad")
+	grasp = grasps[1]
+	dir = "test/no-oracle/"
+	run1.attack(mesh=mesh, grasp=grasp, dir=dir, lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight1/", lr=1e-6, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight2/", lr=1e-6, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight3/", lr=1e-6, momentum=0.0, loss_alpha=0.7, method="oracle-grad")

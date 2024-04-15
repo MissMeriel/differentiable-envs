@@ -160,7 +160,7 @@ class Renderer:
 
 		return ret_tens 
 
-	def display(self, images, shape=None, title=None, save=""):
+	def display(self, images, shape=None, title=None, save="", crop=False):
 		"""
 		Display multiple images in one figure
 		Parameters
@@ -210,7 +210,7 @@ class Renderer:
 
 		# check titles
 		if isinstance(title, str):
-			fig.suptitle(title)
+			fig.suptitle(title, fontsize=30)
 		elif title and (not isinstance(title, list) or len(title) != num_ims):
 			title = None
 
@@ -236,14 +236,33 @@ class Renderer:
 			elif image != "":
 				Renderer.logger.error("display - List elements of 'images' must be Torch.tensors, np.ndarrays, and/or Meshes objects")
 				return None
+			
+			if crop:
+				x, y = image.shape[0], image.shape[1]
+				if x != y:
+					if x > y:
+						x_start = (x - y) // 2
+						if len(image.shape) == 3: image = image[x_start:x_start+y, :, :]
+						else: image = image[x_start:x_start+y, :]
+					else:
+						y_start = (y - x) // 2
+						if len(image.shape) == 3: image = image[:, y_start:y_start+x, :]
+						else: image = image[:, y_start:y_start+x]
 
 			# if image != "":
-			fig.add_subplot(rows, cols, i+1)
-			plt.axis('off') 
-			# showing image 
-			plt.imshow(image) 
+			if len(image.shape) == 2:
+				ax = fig.add_subplot(rows, cols, i+1)
+				ax.axis('off')
+				plot = ax.imshow(image, cmap="Spectral")
+				fig.colorbar(plot)
+
+			else:
+				fig.add_subplot(rows, cols, i+1)
+				plt.axis('off')
+				plt.imshow(image)
+
 			if isinstance(title, list) and isinstance(title[i], str):
-				plt.title(title[i])		
+				plt.title(title[i])
 
 		if save != "":
 			plt.savefig(save)
@@ -383,6 +402,26 @@ class Renderer:
 			image = self.display(mesh, title=title, save=save)
 		
 		return mesh
+
+	@staticmethod
+	def volume_diff(mesh1, mesh2):
+		"""Calculate the total volume displacement between two meshes"""
+		Renderer.logger.error("volume_diff method not yet implemented")
+		return None
+	
+	@staticmethod
+	def vertex_diff(mesh1, mesh2, abs=True):
+		"""Calculate the average Euclidean distance between vertices of two meshes"""
+		verts1 = mesh1.verts_list()[0]
+		verts2 = mesh2.verts_list()[0]
+		if not verts1.shape == verts2.shape:
+			Renderer.logger.error("vertex_diff method requires both meshes to have the same number of vertices.")
+			return None
+		
+		if abs:
+			return torch.mean(torch.abs(torch.sub(verts2, verts1)))
+		else:
+			return torch.mean(torch.sub(verts2, verts1))
 
 def test_renderer():
 	Renderer.logger.debug("Running test_renderer...")
