@@ -1049,7 +1049,7 @@ class Grasp:
 		
 		try:
 			com_qual_func = CannyFerrariQualityFunction(config_dict)
-			self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
+			self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)	#.requires_grad_(True)
 		except QhullError:
 			self.quality = 0.0
 
@@ -1782,6 +1782,7 @@ if __name__ == "__main__":
  
 	# visualize grasp-batch.json
 	r = Renderer()
-	g = Grasp.read("grasp-batch.json")
+	# g = Grasp.read("grasp-batch.json")
+	g = Grasp.sample_grasps("data/new_barclamp.obj", 10, r, min_qual=0.002, max_qual=0.005)
 	g.trans_world_to_im(camera=r.camera)
-	g.vis_grasp_dataset(obj_file="data/new_barclamp.obj", directory="grasp-dataset", renderer=r)
+	g.vis_grasp_dataset(obj_file="data/new_barclamp.obj", directory="grasp-dataset2", renderer=r)

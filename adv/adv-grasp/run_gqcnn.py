@@ -94,14 +94,16 @@ class Attack:
 
 	@staticmethod
 	def plot_qual(losses, dir):
-		fig = plt.figure(figsize=(13, 5))
+		fig = plt.figure(figsize=(7, 5))
 		ax = fig.gca()
 		for k, l in losses.items():
 			ax.plot(l, label=k)
+		ax.axhline(y=0.5, color='r', linestyle='--', label='threshold')
 		ax.legend(fontsize="16")
 		ax.set_xlabel("Iteration", fontsize="16")
 		ax.set_ylabel("Quality (Scaled)", fontsize="16")
 		ax.set_title("Oracle and GQCNN Quality Over Time", fontsize="18")
+		ax.set_ylim(0, 1.1)
 		plt.savefig(dir+"qual.png")
 		plt.close()
 
@@ -125,6 +127,7 @@ class Attack:
 		# out = self.run(pose, image)
 		# cur_pred = out[:,0:1].to(adv_mesh.device)
 		# loss = cur_pred
+
 		# return loss
 
 		# # NO ORACLE GRADIENT - check current model prediction
@@ -134,12 +137,11 @@ class Attack:
 		# out = self.run(pose, image)
 		# cur_pred = out[:,0:1].to(adv_mesh.device)
 		# if isinstance(grasp.quality, torch.Tensor):
-		# 	oracle_pred = torch.clone(grasp.quality) / 0.004	# scale to model range
+		# 	# oracle_pred = torch.clone(grasp.quality) / 0.004	# scale to model range
+		# 	oracle_pred = Attack.scale_oracle(grasp.quality)
 		# else:
 		# 	oracle_pred = torch.zeros(1, 1).to(adv_mesh.device)
 		# loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
-		# self.losses["prediction"].append(loss.item())
-		# return loss
 	
 		# ORACLE GRADIENT
 		adv_mesh_clone = adv_mesh.clone()
@@ -150,18 +152,19 @@ class Attack:
 		oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
 		oracle_pred = self.scale_oracle(oracle_pred)
 		# loss = torch.sub(1.0, torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))))
-		loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))		# use means for batches
+		# loss = torch.sub(1.0, torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))))		# use means for batches
+		loss = torch.sub(1.0, torch.abs(torch.sub(oracle_pred, cur_pred)))
 
 		self.losses["prediction"].append(loss.item())
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
 		if isinstance(oracle_pred, torch.Tensor): self.track_qual["oracle quality"].append(oracle_pred.item())
 		else: self.track_qual["oracle quality"].append(oracle_pred)
-		
+
 		return loss
 
 		# MAXIMIZE DIFFERENCE BETWEEN CURRENT PREDICTION AND ORACLE PREDICTION
 		# loss = torch.sub(1.0, torch.abs(torch.sub(torch.mean(cur_pred), torch.mean(oracle_pred))))
-		loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))		
+		# loss = torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))		
 
 		# ignore regularization losses for now
 		# # WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
@@ -196,11 +199,20 @@ class Attack:
 		# v = torch.nn.functional.normalize(v)
 		# random_step = self.learning_rate * v
 		# adv_mesh = mesh.offset_verts(random_step)
+
 		# return adv_mesh
   
 		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
 		adv_mesh = mesh.offset_verts(param)
 		loss = self.calc_loss(adv_mesh, grasp)
+
+		# dim = self.renderer.mesh_to_depth_im(adv_mesh, display=False)
+		# pose, processed_dim = grasp.extract_tensors_batch(dim)
+		# model_pred = self.run(pose, processed_dim)[:,0:1]
+		# oracle_qual_scaled = self.scale_oracle(grasp.quality)
+		# if isinstance(oracle_qual_scaled, torch.Tensor): oracle_qual_scaled = oracle_qual_scaled.item()
+		# self.track_qual["gqcnn prediction"].append(model_pred.item())
+		# self.track_qual["oracle quality"].append(oracle_qual_scaled)
 
 		return loss, adv_mesh
 
@@ -287,11 +299,12 @@ class Attack:
 				self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile)
 
 		# plot losses
-		Attack.plot_losses(self.losses, dir)
+		# Attack.plot_losses(self.losses, dir)
 		Attack.plot_qual(self.track_qual, dir)
 
 		# save final object
 		final_mesh = mesh.offset_verts(param)
+		# final_mesh = adv_mesh
 		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, logfile=logfile, save_mesh=True)
 
 		return final_mesh
@@ -314,7 +327,7 @@ class Attack:
 
 		# # RANDOM FUZZ
 		# self.track_qual["gqcnn prediction"].append(model_pred.item())
-		# self.track_qual["oracle quality"].append(oracle_qual / 0.004)
+		# self.track_qual["oracle quality"].append(oracle_qual_scaled)
 
 		title = f"Iteration {iteration}: oracle quality {oracle_qual_scaled:.4f}, gqcnn prediction {model_pred.item():.4f}"
 		fname = dir + "it-" + str(iteration) + ".png"
