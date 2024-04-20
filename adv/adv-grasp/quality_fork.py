@@ -274,9 +274,8 @@ class GraspTorch(object):
         in_normal = -self.contact_normals
 
         normal_force_mag = torch.sum(torch.mul(in_normal, in_direction_norm),-1)
-        # allow backface normals
-        return torch.abs(normal_force_mag)
-#        return torch.nn.functional.relu(normal_force_mag)
+
+        return torch.nn.functional.relu(normal_force_mag)
         
     @staticmethod
     def compute_mesh_COM(mesh): 
@@ -403,7 +402,7 @@ class GraspTorch(object):
         return friction_cone
 
         
-    def apply_to_mesh(self, mesh, contact_points=None): 
+    def apply_to_mesh(self, mesh, contact_points=None, ignore_backface_check=False): 
         """Compute where grasp contacts a mesh, state is meshes pytorch3D object"""
             # for grasp in grasp 
         # for each ray (2)
@@ -459,7 +458,11 @@ class GraspTorch(object):
         # verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
         # vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = mesh.faces_normals_packed()[faces_index,:]
         # (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(self.contact_points, mesh)
-        normsContinuous = GraspTorch.avgSphereArcNormal(mesh, self.contact_points, ray_d)
+        normsContinuous = GraspTorch.avgSphereArcNormal(mesh, self.contact_points)
+
+        # optional correction if allowing mesh backfaces (vertex order reversed)
+        if(ignore_backface_check):
+            normsContinuous = normsContinuous * -torch.sign(torch.sum(normsContinuous * ray_d, dim=-1,keepdim=True))
         # normsDexnet = self.svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
         # normsSphereAvg = self.avgSpherePoints(state, idxs_face, masks, self.contact_points)
         #torch.mean(verts, dim=-2,keepdim=True)
@@ -544,7 +547,7 @@ class GraspTorch(object):
         return idxs_face, dists, face_edge_shared
 
     @staticmethod
-    def avgSphereArcNormal(mesh, surface_point, in_rays):
+    def avgSphereArcNormal(mesh, surface_point):
         radius,_ = GraspTorch.dexnetRadius(mesh)
         verts_packed = mesh.verts_packed()
         faces_packed = mesh.faces_packed()
@@ -705,62 +708,63 @@ class GraspTorch(object):
         # get overall center of mass from weighted average
         arc_mass = radius_2D.unsqueeze(-1) * dif_angles
         arc_mass[torch.logical_not(mid_point_in_tri)] = 0
-        arc_com_total = torch.sum(arc_mass.unsqueeze(-1) * arc_com_3D,dim=(-3,-2)) / torch.sum(arc_mass,dim=(-1,-2)).unsqueeze(-1) 
-        #arc_com_total = surface_point
 
-        # alternative: could also do weighted average normal
+
+        # solution 1: smoother weighted average normal
         arc_mass_per_face = torch.sum(arc_mass,dim=-1,keepdim=True)
         normalContribution = mesh.faces_normals_packed().reshape(rm_shape[:-1]) * arc_mass_per_face
         surface_normals_avg = torch.nn.functional.normalize(torch.sum(normalContribution,dim=-2), dim=-1)
 
+        # # solution 2: more dexnet like, SVD on intersections. Does weird stuff at corners
+        # # moment of inertia -> Cov -> SVD
+        # arc_com_total = torch.sum(arc_mass.unsqueeze(-1) * arc_com_3D,dim=(-3,-2)) / torch.sum(arc_mass,dim=(-1,-2)).unsqueeze(-1) 
+        # 
+        # moment_of_inertia_vec = torch.cat((moment_of_inertia_1.unsqueeze(-1),moment_of_inertia_2.unsqueeze(-1),moment_of_inertia_3.unsqueeze(-1)),dim=-1)
+        # moment_of_inertia_local = torch.diag_embed(moment_of_inertia_vec)
+        # moment_of_inertia_local[torch.logical_not(mid_point_in_tri)] = 0
+        # moment_of_inertia_local = moment_of_inertia_local * (radius_2D*radius_2D).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
+        # # transform to shared CoM 
+        # # https://en.m.wikipedia.org/wiki/Moment_of_inertia#Inertia_tensor_of_rotation
+        # arc_displacement = (arc_com_total.unsqueeze(-2).unsqueeze(-2) - arc_com_3D)
+        # moment_of_inertia_local_aligned = torch.matmul(torch.matmul(fac_rot, moment_of_inertia_local),  fac_rot_inverse)
+        # # outter product
+        # m_o_i_2 = torch.matmul(arc_displacement.unsqueeze(-1), arc_displacement.unsqueeze(-2))
+        # # inner product
+        # m_o_i_1 = torch.matmul(arc_displacement.unsqueeze(-2), arc_displacement.unsqueeze(-1)).squeeze(-1)
+        # m_o_i_1 = torch.diag_embed(m_o_i_1.expand(list(m_o_i_1.shape)[:-1]+[3]))
+        # moment_of_inertia_global = moment_of_inertia_local_aligned + m_o_i_1 - m_o_i_2
+        # moment_of_inertia_global[torch.logical_not(mid_point_in_tri)] = 0
 
-        # moment of inertia -> Cov -> SVD
-        moment_of_inertia_vec = torch.cat((moment_of_inertia_1.unsqueeze(-1),moment_of_inertia_2.unsqueeze(-1),moment_of_inertia_3.unsqueeze(-1)),dim=-1)
-        moment_of_inertia_local = torch.diag_embed(moment_of_inertia_vec)
-        moment_of_inertia_local[torch.logical_not(mid_point_in_tri)] = 0
-        moment_of_inertia_local = moment_of_inertia_local * (radius_2D*radius_2D).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        # transform to shared CoM 
-        # https://en.m.wikipedia.org/wiki/Moment_of_inertia#Inertia_tensor_of_rotation
-        arc_displacement = (arc_com_total.unsqueeze(-2).unsqueeze(-2) - arc_com_3D)
-        moment_of_inertia_local_aligned = torch.matmul(torch.matmul(fac_rot, moment_of_inertia_local),  fac_rot_inverse)
-        # outter product
-        m_o_i_2 = torch.matmul(arc_displacement.unsqueeze(-1), arc_displacement.unsqueeze(-2))
-        # inner product
-        m_o_i_1 = torch.matmul(arc_displacement.unsqueeze(-2), arc_displacement.unsqueeze(-1)).squeeze(-1)
-        m_o_i_1 = torch.diag_embed(m_o_i_1.expand(list(m_o_i_1.shape)[:-1]+[3]))
-        moment_of_inertia_global = moment_of_inertia_local_aligned + m_o_i_1 - m_o_i_2
-        moment_of_inertia_global[torch.logical_not(mid_point_in_tri)] = 0
-
-        moment_of_inertia_total = torch.sum(moment_of_inertia_global,dim=(-4,-3))
-        moment_of_inertia_total_diag = torch.diagonal(moment_of_inertia_total,dim1=-1,dim2=-2)
-        moment_of_inertia_total_trace = torch.sum(moment_of_inertia_total_diag,keepdim=True,dim=-1)
-        moment_of_inertia_total_trace_mat = torch.diag_embed(moment_of_inertia_total_trace.expand(list(moment_of_inertia_total_trace.shape)[:-1]+[3]))
-        cov = moment_of_inertia_total_trace_mat/2-moment_of_inertia_total
-        eig_return = torch.linalg.eigh(cov)
-        surface_normals = torch.real(eig_return.eigenvectors[...,0])
+        # moment_of_inertia_total = torch.sum(moment_of_inertia_global,dim=(-4,-3))
+        # moment_of_inertia_total_diag = torch.diagonal(moment_of_inertia_total,dim1=-1,dim2=-2)
+        # moment_of_inertia_total_trace = torch.sum(moment_of_inertia_total_diag,keepdim=True,dim=-1)
+        # moment_of_inertia_total_trace_mat = torch.diag_embed(moment_of_inertia_total_trace.expand(list(moment_of_inertia_total_trace.shape)[:-1]+[3]))
+        # cov = moment_of_inertia_total_trace_mat/2-moment_of_inertia_total
+        # eig_return = torch.linalg.eigh(cov)
+        # surface_normals = torch.real(eig_return.eigenvectors[...,0])
 
         # savemat('segments.mat',{'segments':segments_3D[linearized_segments_mask].numpy(force=True),'eigvec':torch.real(eig_return[1]).numpy(force=True),'eigval':torch.real(eig_return[0]).numpy(force=True)})
 
         #return surface_normals * -torch.sign(torch.sum(surface_normals * in_rays, dim=-1,keepdim=True))
         return surface_normals_avg
 
-    @staticmethod
-    def avgSpherePointsNormal(self, mesh, idxs_face, masks, surface_point):
-        normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-        for maskInd in range(len(masks)):
-            normals[maskInd,:] = torch.mean(mesh.faces_normals_packed()[idxs_face.squeeze()[maskInd, masks[maskInd].squeeze()],:], dim=0)
-        normals = normals.reshape(surface_point.shape)
-        return normals
+    # @staticmethod
+    # def avgSpherePointsNormal(self, mesh, idxs_face, masks, surface_point):
+    #     normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+    #     for maskInd in range(len(masks)):
+    #         normals[maskInd,:] = torch.mean(mesh.faces_normals_packed()[idxs_face.squeeze()[maskInd, masks[maskInd].squeeze()],:], dim=0)
+    #     normals = normals.reshape(surface_point.shape)
+    #     return normals
 
-    @staticmethod
-    def svdSpherePointsNormal(self, surface_point, sphereDirs, masks, in_rays):
+    # @staticmethod
+    # def svdSpherePointsNormal(self, surface_point, sphereDirs, masks, in_rays):
 
-        normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-        for maskInd in range(len(masks)):
-            (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
-            normals[maskInd,:] = V[:, -1]
-        normals = normals.reshape(surface_point.shape)
-        return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
+    #     normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+    #     for maskInd in range(len(masks)):
+    #         (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
+    #         normals[maskInd,:] = V[:, -1]
+    #     normals = normals.reshape(surface_point.shape)
+    #     return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
 
 
     @property
@@ -903,21 +907,34 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
     def qp_wrap(facets):
         ### TODO solve QP over G to figure out sign
         # square facet matrix
-        Gsquared  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
+        Gsquared_full  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
         wrench_regularizer=1e-10
-        regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = facets.device, dtype=facets.dtype))
-        n_dim = Gsquared.shape[1]
-        n_batch = Gsquared.shape[0]
-        P = 2 * (Gsquared + regulizer_mat).transpose(1,2)
-        q = torch.zeros((n_batch,n_dim), device = facets.device, dtype=facets.dtype)
-        G = -torch.eye(n_dim, device = facets.device, dtype=facets.dtype).unsqueeze(0).expand((n_batch,n_dim,n_dim))
-        h = torch.zeros((n_batch,n_dim), device = facets.device, dtype=facets.dtype)
-        A = torch.ones((n_batch,1,n_dim), device = facets.device, dtype=facets.dtype)
-        b = torch.ones((n_batch,1),device = facets.device, dtype=facets.dtype)
+        # find all facets where the inputs are less than the regularizer, so we can ignore the qp results
+        non_zero_wrench_facets = torch.logical_not(torch.all(torch.all(torch.abs(Gsquared_full) < wrench_regularizer,dim=-1),dim=-1))
+        dist_full = torch.zeros_like(Gsquared_full[...,0:1,0:1])
+        x_full = torch.zeros_like(Gsquared_full[...,0])
+        P = None
+        if torch.any(non_zero_wrench_facets):
+            Gsquared = Gsquared_full[non_zero_wrench_facets]
 
-        x = QPFunction(check_Q_spd=True)(P, q, G, h, A , b)
-        dist = torch.sqrt(torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))/2)
-        return dist, x, P
+            regulizer_mat = (wrench_regularizer * torch.eye(Gsquared.shape[1], device = facets.device, dtype=facets.dtype))
+            n_dim = Gsquared.shape[1]
+            n_batch = Gsquared.shape[0]
+            P = 2 * (Gsquared + regulizer_mat).transpose(1,2)
+            q = torch.zeros((n_batch,n_dim), device = facets.device, dtype=facets.dtype)
+            G = -torch.eye(n_dim, device = facets.device, dtype=facets.dtype).unsqueeze(0).expand((n_batch,n_dim,n_dim))
+            h = torch.zeros((n_batch,n_dim), device = facets.device, dtype=facets.dtype)
+            A = torch.ones((n_batch,1,n_dim), device = facets.device, dtype=facets.dtype)
+            b = torch.ones((n_batch,1),device = facets.device, dtype=facets.dtype)
+
+            x = QPFunction(check_Q_spd=True)(P, q, G, h, A , b)
+            dist = torch.sqrt(torch.matmul(x.unsqueeze(1), torch.matmul(P, x.unsqueeze(2)))/2)
+        
+
+            dist_full[non_zero_wrench_facets] = dist
+            x_full[non_zero_wrench_facets] = x
+
+        return dist_full, x_full, P
    
     @staticmethod
     def distWrap(G_unwrapped):
@@ -935,13 +952,13 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         ## maybe we only (re)compute the important one in pytorch, drop others for memory
         with record_function("qp_wrap"):
             dist,x,P = CannyFerrariQualityFunction.qp_wrap(facets)
-        return dist, lengths, x, facets
+        return dist, lengths
     
     @staticmethod
     def find_min_dist_to_hull(G):       
         original_shape = G.shape
         G_unwrapped = G.view((original_shape[0]*original_shape[1], -1, 6))
-        dist, lengths, x, facets = CannyFerrariQualityFunction.distWrap(G_unwrapped)
+        dist, lengths = CannyFerrariQualityFunction.distWrap(G_unwrapped)
 
         start_ind = 0
         closest = torch.zeros(len(lengths),1, dtype=torch.float64)
@@ -958,6 +975,10 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
 class qHullTorch(torch.autograd.Function):
     @staticmethod
     def forward(_, miniG):
+        # both fingers hit a backface, so convex hull will throw an error
+        if torch.all(miniG == 0):
+            return torch.tensor([range(6)],dtype=torch.long)
+        # I don't remember why I was afraid of this, hasn't happened in memory
         if torch.any(torch.isnan(miniG)):
             breakpoint()
         miniGnumpy = miniG.numpy(force=True)
@@ -1120,7 +1141,7 @@ def test_wine():
 
     renderer, device = pytorch_setup()
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("data/Wineglass_800_tex.obj")
+        verts, faces_idx, _ = load_obj("adv-grasp/data/Wineglass_800_tex.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -1145,7 +1166,11 @@ def test_wine():
                         friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
     graspObj = graspObj.apply_to_mesh(mesh)
     original_quality = com_qual_func.quality(mesh, graspObj)   
-    print("original: ", original_quality)
+    print("original (w/backface): ", original_quality)
+
+    graspObj = graspObj.apply_to_mesh(mesh, ignore_backface_check=True)
+    original_quality = com_qual_func.quality(mesh, graspObj)   
+    print("original (ignore backface): ", original_quality)
     axis3D.retain_grad() 
     center3D.retain_grad()
     optimizer = optim.Rprop([axis3D, center3D], lr=0.00001)
@@ -1155,7 +1180,7 @@ def test_wine():
         optimizer.zero_grad()
         graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
                         friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-        noised_grasps = graspObj.generateNoisyGrasps(25).apply_to_mesh(mesh)
+        noised_grasps = graspObj.generateNoisyGrasps(25).apply_to_mesh(mesh, ignore_backface_check=True)
         noised_tensor = com_qual_func.quality(mesh, noised_grasps)
         com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
         qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
@@ -1174,7 +1199,7 @@ def test_quality():
     # load PyTorch3D mesh from .obj file
     renderer, device = pytorch_setup()
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
+        verts, faces_idx, _ = load_obj("adv-grasp/data/new_barclamp.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -1196,7 +1221,7 @@ def test_quality():
     test_grasps_set = []
     dicts = []
     for i in range(0,12):
-        f = open('data/data/data'+str(i)+'.json')
+        f = open('adv-grasp/data/data/data'+str(i)+'.json')
         dicts.append(json.load(f))
         center3D = torch.tensor([dicts[-1]['pytorch_w_center']],device=device,requires_grad=True)
         axis3D = torch.tensor([dicts[-1]['pytorch_w_axis']],device=device,requires_grad=True)
@@ -1259,7 +1284,7 @@ def test_quality():
     #     com_qual_func = CannyFerrariQualityFunction(config_dict)
     #     G = com_qual_func.compute_grasp_matrix(mesh, test_grasps_set[i])
     #     G_unwrapped = G.reshape((G.shape[0]*G.shape[1], -1, 6))
-    #     dists,_,_,_ = minHull.distWrap(G_unwrapped)
+    #     dists,_ = minHull.distWrap(G_unwrapped)
     #     np.testing.assert_allclose(dists.reshape((-1)).numpy(force=True),
     #             np.array(dicts[i]['dists']).T,
     #             atol=0.04,rtol=test[1])
@@ -1284,25 +1309,25 @@ def test_quality():
     #         dicts[i]['ferrari_canny_fc08'],";")
 
     # #torch.autograd.set_detect_anomaly(True)
-    # center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
-    # axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
-    # axis3D.retain_grad() 
-    # center3D.retain_grad()
-    # graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
-    #                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
-    # print('before', axis3D.grad)
-    # qual_tensor = com_qual_func.quality(mesh, graspObj)
-    # print('quality', qual_tensor)
-    # qual_tensor.backward(inputs=axis3D)
-    # print('after', axis3D.grad)
-    # print('value', axis3D)
+    center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
+    axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
+    axis3D.retain_grad() 
+    center3D.retain_grad()
+    graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+                           friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
+    print('before', axis3D.grad)
+    qual_tensor = com_qual_func.quality(mesh, graspObj)
+    print('quality', qual_tensor)
+    qual_tensor.backward(inputs=axis3D)
+    print('after', axis3D.grad)
+    print('value', axis3D)
 
-    # noised_grasps = graspObj.generateNoisyGrasps(25)
-    # noised_tensor = com_qual_func.quality(mesh, noised_grasps)
-    # torch.set_printoptions(precision=8)
-    # print(qual_tensor)
-    # print(noised_tensor)
-    # torch.set_printoptions(precision=4)
+    noised_grasps = graspObj.generateNoisyGrasps(25)
+    noised_tensor = com_qual_func.quality(mesh, noised_grasps)
+    torch.set_printoptions(precision=8)
+    print(qual_tensor)
+    print(noised_tensor)
+    torch.set_printoptions(precision=4)
 
     # center3D = torch.tensor([dicts[2]['pytorch_w_center']],device=device,requires_grad=True)
     # axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
