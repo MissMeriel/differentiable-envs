@@ -1,6 +1,5 @@
-# import Pyro4
+import Pyro4
 import os
-import sys
 import math
 import time
 import logging
@@ -11,6 +10,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MaxNLocator
 
+from scipy.spatial._qhull import QhullError
 from pytorch3d.ops import sample_points_from_meshes
 
 from render import *
@@ -142,7 +142,7 @@ class Grasp:
 		if isinstance(prediction, float):
 			self.prediction = torch.tensor([prediction]).to(device).float().unsqueeze(0)
 		elif isinstance(prediction, list):
-			self.prediction = torch.from_numpy(np.array(quality)).to(device).float()
+			self.prediction = torch.from_numpy(np.array(prediction)).to(device).float()
 		if self.prediction != None and self.prediction.dim() == 1:
 			self.prediction = self.prediction.unsqueeze(0)
 
@@ -165,9 +165,9 @@ class Grasp:
 			if key not in dict_keys:
 				dict[key] = None
 		if "oracle_method" not in dict_keys:
-			dict["oracle_method"] = "dexnet"
+			dict["oracle_method"] = "pytorch"
 		if "oracle_robust" not in dict_keys:
-			dict["oracle_robust"] = True
+			dict["oracle_robust"] = None
 		if "prediction" not in dict_keys:
 			dict["prediction"] = None
 		if "objf" not in dict_keys:
@@ -241,8 +241,8 @@ class Grasp:
 
 		if "objf" in batch_dict.keys():
 			obj_lst = batch_dict["objf"]
-			obj = obj_list.pop(0)
-			for o in obj_list:
+			obj = obj_lst.pop(0)
+			for o in obj_lst:
 				if o != obj:
 					cls.logger.error("read_batch - all grasps must be for the same grasp object.")
 					continue
@@ -322,17 +322,17 @@ class Grasp:
 		"""Returns a string with grasp information in image coordinates"""
 		p_str = "grasp:"
 		
-		if self.quality != None:
-			p_str += "\n\tquality: " + str(self.quality.item())
-		if self.im_center != None:
+		if self.quality is not None:
+			p_str += "\n\tquality: " + str(self.quality)
+		if self.im_center is not None:
 			p_str +=  "\n\timage center: " + str(self.im_center)
-		if self.im_angle != None:
-			p_str += "\n\timage angle: " + str(self.im_angle.item()) 
-		if self.depth != None:
-			p_str += "\n\tdepth: " + str(self.depth.item()) 	
-		if self.world_center != None:
-			p_str += "\n\tworld center: " + str(self.world_center) 
-		if self.world_axis != None:
+		if self.im_angle is not None:
+			p_str += "\n\timage angle: " + str(self.im_angle)
+		if self.depth is not None:
+			p_str += "\n\tdepth: " + str(self.depth)
+		if self.world_center is not None:
+			p_str += "\n\tworld center: " + str(self.world_center)
+		if self.world_axis is not None:
 			p_str += "\n\tworld axis: " + str(self.world_axis)
 
 		return p_str + "\n"
@@ -505,28 +505,25 @@ class Grasp:
 		# render mesh
 		mesh, _ = renderer.render_object(obj_f, display=False)
 
-		# oracle set up
-		config_dict = {
-			"torque_scaling":1000,
-			"soft_fingers":1,
-			"friction_coef": 0.8,
-			"antipodality_pctile": 1.0 
-		}
-		width = torch.tensor([[0.05]],device=device)
-		com_qual_func = CannyFerrariQualityFunction(config_dict)
-
 		# track grasps
 		num_grasps, it, grasp_dict = 0, 0, {}
+		grasp_dict["world_axis"] = []
+		grasp_dict["world_center"] = []
+		grasp_dict["quality"] = []
+		grasp_dict["c0"] = []
+		grasp_dict["c1"] = []
+		grasp_dict["objf"] = obj_f
+		grasp_dict["oracle_method"] = "pytorch"
 
-		while num_grasps < num_samples:
-
+		while (num_grasps < num_samples) and (it < 10):
+			print(f"iteration {it}")
 			# randomly sample surface points for possible grasps
-			samples_c0 = sample_points_from_meshes(mesh, num_samples*1000)[0]
-			samples_c1 = sample_points_from_meshes(mesh, num_samples*1000)[0]
+			samples_c0 = sample_points_from_meshes(mesh, num_samples*200)[0]
+			samples_c1 = sample_points_from_meshes(mesh, num_samples*200)[0]
 			norms = torch.linalg.norm((samples_c1 - samples_c0), dim=1)
 
 			# mask to eliminate grasps that don't fit in the gripper
-			mask = (norms > 0.0) & (norms <= 0.05)
+			mask = (norms > 0.01) & (norms <= 0.05)
 			mask = mask.squeeze()
 			norms = norms[mask]
 			c0 = samples_c0[mask, :]
@@ -534,21 +531,57 @@ class Grasp:
 		
 			# compute grasp center and axis, then check quality
 			world_centers = (c0 + c1) / 2
-			world_axes = (c1 - c0) #/ norms.unsqueeze(1)
-			grasp_torch = GraspTorch(center=world_centers, axis3D=world_axes, width=width, camera_intr=renderer.camera, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-			
-			# filter for qualities between min_qual and max_qual
-			# try:
-			cand_quals = com_qual_func.quality(mesh, grasp_torch)
-			mask = (cand_quals >= kwargs["min_qual"]) & (cand_quals <= kwargs["max_qual"])
-			mask.squeeze()
-			print(f"Iteration {it}: {torch.max(mask).item()} {torch.sum(mask).item()} {torch.max(cand_quals).item()}")
-			# num_grasps += torch.sum(mask)
-			num_grasps += 1
-			it += 1
-			# except:
-			# 	it += 1
+			world_axes = (c1 - c0) / norms.unsqueeze(1)
 
+			# update 3D axis based on 2D transformation
+			camera = renderer.camera
+			axis = camera.get_world_to_view_transform().transform_normals(world_axes)
+			axis[..., 2] = 0
+			axis = torch.nn.functional.normalize(axis, dim=-1)
+			world_axes = camera.get_world_to_view_transform().inverse().transform_normals(axis)
+
+			# temporary dictionary for candidate grasps
+			temp_dict = {"world_axis": world_axes.detach().cpu().numpy().tolist(), "world_center": world_centers.detach().cpu().numpy().tolist(), "c0": c0.detach().cpu().numpy().tolist(), "c1": c1.detach().cpu().numpy().tolist()}
+			temp_qual = torch.zeros(world_centers.shape[0], 1, dtype=torch.float64, device="cuda:0")
+
+			cand_grasps = Grasp.init_from_dict(temp_dict)
+			for i, g in enumerate(cand_grasps):
+				if i % 100 == 0:
+					cls.logger.info(f"Checking grasp {i} of {world_centers.shape[0]} in iteration {it}.")
+				temp_qual[i] = g.oracle_eval(obj_f, oracle_method="pytorch", renderer=renderer)
+
+			# check what grasps are in quality range
+			mask = (temp_qual >= kwargs["min_qual"]) & (temp_qual <= kwargs["max_qual"])
+			mask = mask.squeeze()
+			temp_qual = temp_qual[mask]
+			c0 = c0[mask, :]
+			c1 = c1[mask, :]
+			world_centers = world_centers[mask, :]
+			world_axes = world_axes[mask, :]
+
+			grasp_dict["world_axis"] = grasp_dict["world_axis"] + world_axes.detach().cpu().numpy().tolist()
+			grasp_dict["world_center"] = grasp_dict["world_center"] + world_centers.detach().cpu().numpy().tolist()
+			grasp_dict["quality"] = grasp_dict["quality"] + temp_qual.detach().cpu().numpy().tolist()
+			grasp_dict["c0"] = grasp_dict["c0"] + c0.detach().cpu().numpy().tolist()
+			grasp_dict["c1"] = grasp_dict["c1"] + c1.detach().cpu().numpy().tolist()
+			num_grasps += torch.sum(mask).item()
+			it += 1
+			cls.logger.info(f"# successful grasps on iteration {it}: {torch.sum(mask)}")
+  
+		# sort in descending order of quality
+		grasp = Grasp.init_from_dict(grasp_dict)
+		if kwargs["sort"]:
+			sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
+			grasp.world_center = torch.index_select(grasp.world_center, 0, sort_indices)
+			grasp.world_axis = torch.index_select(grasp.world_axis, 0, sort_indices)
+			grasp.c0 = torch.index_select(grasp.c0, 0, sort_indices)
+			grasp.c1 = torch.index_select(grasp.c1, 0, sort_indices)
+			grasp.quality = torch.index_select(grasp.quality, 0, sort_indices)
+
+		if grasp.num_grasps() > num_samples:
+			return grasp[:num_samples]
+		else:
+			return grasp
 
 	@classmethod
 	def sample_grasps_dexnet(cls, obj_f, num_samples, renderer, **kwargs):
@@ -936,7 +969,7 @@ class Grasp:
 
 		"""
 		check_method = (oracle_method in ["dexnet", "pytorch"])
-		if oracle_method == "dexnet" or (not check_method and (self.oracle_method == "dexnet")):
+		if oracle_method == "dexnet" or (self.oracle_method == "dexnet"):
 			if isinstance(robust, bool):
 				# Grasp.logger.debug("Oracle eval - dexnet, robust %r", robust)
 				return self.oracle_eval_dexnet(obj_file, robust=robust)
@@ -987,7 +1020,7 @@ class Grasp:
 
 		return self.quality
 
-	def oracle_eval_pytorch(self, obj_file, renderer):
+	def oracle_eval_pytorch(self, obj, renderer):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
@@ -1005,12 +1038,94 @@ class Grasp:
 			"antipodality_pctile": 1.0 
     	}
 
-		mesh, _ = renderer.render_object(obj_file, display=False)
-		width = torch.tensor([[0.05]],device=device)
-		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+		if isinstance(obj, Meshes): mesh = obj
+		else: mesh, _ = renderer.render_object(obj, display=False)
+
+		if self.c0 is not None and self.c1 is not None: contact_points = torch.stack((self.c0, self.c1), 0)
+		else: contact_points = None
 		
-		com_qual_func = CannyFerrariQualityFunction(config_dict)
-		return com_qual_func.quality(mesh, grasp_torch)
+		width = torch.tensor([[0.05]], device=device)
+		grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+		
+		try:
+			com_qual_func = CannyFerrariQualityFunction(config_dict)
+			self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)	#.requires_grad_(True)
+		except QhullError:
+			self.quality = 0.0
+
+		return self.quality
+
+
+	def vis_grasp_dataset(self, obj_file, directory, renderer):
+		"""Visualize a dataset of grasps in the given directory"""
+
+		if not os.path.isdir(directory): os.mkdir(directory)
+
+		if directory[-1] == "/": directory = directory[:-1]
+		batch_fname, img_fname, dimg_fname = directory + "/grasp-batch.json", directory + "/grasp-object.png", directory + "/depth-im.png"
+		pdimg_fname, gimg_fname, gsphimg_fname = directory + "/processed-depth-im.png", directory + "/grasp-vis.png", directory + "/grasp-sphere.png"
+
+		# save top level info
+		self.save(batch_fname)
+		mesh, im = renderer.render_object(obj_file, display=False)
+		depth_im = renderer.mesh_to_depth_im(mesh, display=False)
+		renderer.display(im, title=obj_file.split("/")[-1], save=img_fname)
+		renderer.display(depth_im, title=obj_file.split("/")[-1], save=dimg_fname)
+
+		# save grasp specific information
+		if self.num_grasps() == 1:
+			qual_title = ""
+			if self.quality is not None: qual_title += f"\nQuality: {self.quality.item()}"
+			if self.prediction is not None: qual_title += f"\nPrediction: {self.prediction.item()}"
+
+			# processed depth image
+			_, p_dim = self.extract_tensors(depth_im)
+			title = "Depth image w.r.t. grasp" + qual_title
+			renderer.display(p_dim, title=title, save=pdimg_fname)
+
+			# grasp sphere rendering
+			title = "Grasp visualization" + qual_title
+			contacts = [self.c0, self.c1] if (self.c0 is not None and self.c1 is not None) else None
+			if contacts is not None: 
+				gsphere_mesh = renderer.grasp_sphere(center=contacts, obj=mesh, display=False)
+			else:
+				gsphere_mesh = renderer.grasp_sphere(center=self.world_center, obj=mesh, display=False)
+			renderer.display(gsphere_mesh, title=title, save=gsphimg_fname)
+
+			# if applicable: draw grasp/grasp vis
+			if contacts is not None:
+				renderer.draw_grasp(mesh, contacts[0], contacts[1], title=title, save=gimg_fname, display=False)
+
+			return None
+		
+		for i, g in enumerate(self):
+			# nested directory for each grasp
+			local_dir = directory + f"/grasp_{i}/"
+			if not os.path.isdir(local_dir): os.mkdir(local_dir)
+			pdimg_fname, gimg_fname, gsphimg_fname = local_dir + pdimg_fname.split("/")[-1], local_dir + gimg_fname.split("/")[-1], local_dir + gsphimg_fname.split("/")[-1]
+			
+			qual_title = ""
+			if g.quality is not None: qual_title += f"\nQuality: {g.quality.item()}"
+			if g.prediction is not None: qual_title += f"\nPrediction: {g.prediction.item()}"
+
+			# processed depth image
+			_, p_dim = g.extract_tensors(depth_im)
+			title = f"Depth image w.r.t. grasp {i}" + qual_title
+			renderer.display(p_dim, title=title, save=pdimg_fname)
+
+			# grasp sphere rendering
+			title = f"Grasp visualization for grasp {i}" + qual_title
+			contacts = [g.c0, g.c1] if (g.c0 is not None and g.c1 is not None) else None
+			if contacts is not None: 
+				gsphere_mesh = renderer.grasp_sphere(center=contacts, grasp_obj=mesh, display=False)
+			else:
+				gsphere_mesh = renderer.grasp_sphere(center=g.world_center, grasp_obj=mesh, display=False)
+			renderer.display(gsphere_mesh, title=title, save=gsphimg_fname)
+
+			# if applicable: draw grasp/grasp vis
+			if contacts is not None:
+				renderer.draw_grasp(mesh, contacts[0], contacts[1], title=title, save=gimg_fname, display=False)
+
 
 def save_nparr(image, filename):
 	""" 
@@ -1069,6 +1184,33 @@ def test_select_grasp():
 	# 	renderer1.display(image, title=t)	#, save=True, fname=fname)
 
 	Grasp.logger.info("Finished running test_select_grasp.")
+
+def test_select_grasp_pytorch():
+	Grasp.logger.info("Testing grasp sampling with pytorch - test_select_grasp_pytorch")
+
+	fname, num = "temp_0.json", 1
+	while os.path.isfile(fname):
+		fname = "temp_" + str(num) + ".json"
+		num += 1
+
+	r = Renderer()
+	g = Grasp.sample_grasps("data/new_barclamp.obj", 5, renderer=r)
+	assert g.num_grasps() == 5
+	qual = g.quality
+	g.save(fname)
+
+	g = Grasp.read(fname)
+	os.remove(fname)
+	assert torch.max(torch.sub(qual, g.quality)).item() == 0
+
+	qual2 = g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	assert torch.max(torch.sub(qual, qual2)).item() == 0
+
+	g.trans_world_to_im(camera=r.camera)
+	qual3 = g.oracle_eval("data/new_barclamp.obj", renderer=r)
+	assert torch.max(torch.sub(qual, qual3)).item() == 0
+
+	Grasp.logger.info("Finished testing grasp sampling with pytorch - test_select_grasp_pytorch")
 
 def test_save_and_load_grasps():
 	Grasp.logger.info("Running test_save_and_load_grasps...")
@@ -1566,32 +1708,6 @@ def test_random_grasps():
 
 	Grasp.logger.info("Finished testing random_grasps.")
 
-def generate_grasp_dataset(dataset_dir):
-	Grasp.logger.info(f"Generating grasp dataset in directory {dataset_dir}...")
-
-	renderer = Renderer()
-	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
-
-	grasps = Grasp.sample_grasps("data/bar_clamp.obj", 10, renderer=renderer, min_qual=0.002, save_grasp=dataset_dir)
-
-	Grasp.logger.info(f"Finished generating grasp dataset to directory {dataset_dir}")
-
-def check_grasp_dataset():
-	r = Renderer()
-	grasps = Grasp.read("grasp-dataset/grasp_batch.json")
-	grasps.oracle_eval("data/new_barclamp.obj", renderer=r, robust=False)
-	print("non-robust qualities:", grasps.quality)
-
-	# grasps2 = Grasp.read("example-grasps/batch-test.json")
-	# print("grasps2 qualities:\n", grasps2.quality, "\n")
-	# grasps2.oracle_eval("data/new_barclamp.obj", renderer=r)
-	# print(grasps2.quality)
-
-	# grasps3 = Grasp.read("experiment-results/ex01/grasp.json")
-	# print("\ngrasp3 qualities:", grasps3.quality, "\n")
-	# grasps3.oracle_eval("data/new_barclamp.obj", renderer=r)
-	# print(grasps3.quality)
-
 def test_pytorch_oracle():
 	Grasp.logger.info("Running test_pytorch_oracle() to test PyTorch oracle.")
 
@@ -1616,6 +1732,7 @@ def test_pytorch_oracle():
 	
 	com_qual_func = CannyFerrariQualityFunction(config_dict)
 	print("canny ferrari:", com_qual_func.quality(mesh, grasp1))
+	print("CONTACT SHAPE:", grasp1.contact_points.shape)
 
 	Grasp.logger.info("Comparison of select_grasp.Grasp and quality_fork.GraspTorch")
 	# GraspTorch object
@@ -1645,7 +1762,6 @@ def test_pytorch_oracle():
 		qual = grasp.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
 		assert torch.sub(qual, batch_qual[i]).item() < EPS
 
-
 if __name__ == "__main__":
 
 	# test_trans_world_to_im()
@@ -1662,4 +1778,11 @@ if __name__ == "__main__":
 	# vis_rand_grasps()
 	# check_grasp_dataset()
 	# test_pytorch_oracle()
-	Grasp.sample_grasps("data/new_barclamp.obj", 5, renderer=Renderer())
+	# test_select_grasp_pytorch()
+ 
+	# visualize grasp-batch.json
+	r = Renderer()
+	# g = Grasp.read("grasp-batch.json")
+	g = Grasp.sample_grasps("data/new_barclamp.obj", 10, r, min_qual=0.002, max_qual=0.005)
+	g.trans_world_to_im(camera=r.camera)
+	g.vis_grasp_dataset(obj_file="data/new_barclamp.obj", directory="grasp-dataset2", renderer=r)

@@ -1,0 +1,62 @@
+{
+    "learning_rate": 1e-05,
+    "momentum": 0.0,
+    "optimizer": "SGD",
+    "loss weight (alpha)": null,
+    "method": "no-oracle"
+}{
+    "iteration": 0,
+    "model prediction": 0.8975253105163574,
+    "oracle quality raw": 0.002080670790746808,
+    "oracle quality scaled": 0.937125563621521
+}{
+    "iteration": 10,
+    "model prediction": 0.5535105466842651,
+    "oracle quality raw": 0.0020618666894733906,
+    "oracle quality scaled": 0.934298038482666
+}{
+    "iteration": 20,
+    "model prediction": 0.2187202274799347,
+    "oracle quality raw": 0.002032042481005192,
+    "oracle quality scaled": 0.929570198059082
+}{
+    "iteration": 30,
+    "model prediction": 0.15625682473182678,
+    "oracle quality raw": 0.002020718064159155,
+    "oracle quality scaled": 0.9276940226554871
+}{
+    "iteration": 40,
+    "model prediction": 0.13585513830184937,
+    "oracle quality raw": 0.002018512925133109,
+    "oracle quality scaled": 0.9273233413696289
+}{
+    "iteration": 50,
+    "model prediction": 0.12334898114204407,
+    "oracle quality raw": 0.002017147373408079,
+    "oracle quality scaled": 0.927092969417572
+}{
+    "iteration": 60,
+    "model prediction": 0.11606159806251526,
+    "oracle quality raw": 0.0020177171099931,
+    "oracle quality scaled": 0.9271891117095947
+}{
+    "iteration": 70,
+    "model prediction": 0.10659231245517731,
+    "oracle quality raw": 0.0020186640322208405,
+    "oracle quality scaled": 0.927348792552948
+}{
+    "iteration": 80,
+    "model prediction": 0.10146191716194153,
+    "oracle quality raw": 0.002018059603869915,
+    "oracle quality scaled": 0.9272469282150269
+}{
+    "iteration": 90,
+    "model prediction": 0.0931331217288971,
+    "oracle quality raw": 0.0020185320172458887,
+    "oracle quality scaled": 0.9273265600204468
+}{
+    "iteration": 100,
+    "model prediction": 0.09068750590085983,
+    "oracle quality raw": 0.0020184118766337633,
+    "oracle quality scaled": 0.9273063540458679
+}
