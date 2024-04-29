@@ -3,6 +3,8 @@ import math
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
+import trimesh
+from PIL import Image
 
 from pytorch3d.utils import ico_sphere
 from pytorch3d.io import load_obj, save_obj
@@ -188,6 +190,7 @@ class Renderer:
 				images = [images]
 		elif isinstance(images, np.ndarray):
 			if len(images.shape) == 4:
+				print("check1")
 				images = np.split(images, images.shape[0])
 				images = [np.squeeze(image, axis=0) for image in images]
 			else:
@@ -210,7 +213,7 @@ class Renderer:
 
 		# check titles
 		if isinstance(title, str):
-			fig.suptitle(title, fontsize=30)
+			fig.suptitle(title, fontsize=15)
 		elif title and (not isinstance(title, list) or len(title) != num_ims):
 			title = None
 
@@ -232,6 +235,7 @@ class Renderer:
 				image = image.cpu().detach().numpy()
 			elif isinstance(image, np.ndarray):
 				if image.shape[0] == 1:
+					print("check2")
 					image = np.squeeze(image, axis=0)
 			elif image != "":
 				Renderer.logger.error("display - List elements of 'images' must be Torch.tensors, np.ndarrays, and/or Meshes objects")
@@ -249,17 +253,17 @@ class Renderer:
 						if len(image.shape) == 3: image = image[:, y_start:y_start+x, :]
 						else: image = image[:, y_start:y_start+x]
 
-			# if image != "":
-			if len(image.shape) == 2:
-				ax = fig.add_subplot(rows, cols, i+1)
-				ax.axis('off')
-				plot = ax.imshow(image, cmap="Spectral")
-				fig.colorbar(plot)
+			# # if image != "":
+			# if len(image.shape) == 2:
+			# 	ax = fig.add_subplot(rows, cols, i+1)
+			# 	ax.axis('off')
+			# 	plot = ax.imshow(image, cmap="Spectral")
+			# 	fig.colorbar(plot)
 
-			else:
-				fig.add_subplot(rows, cols, i+1)
-				plt.axis('off')
-				plt.imshow(image)
+			# else:
+			fig.add_subplot(rows, cols, i+1)
+			plt.axis('off')
+			plt.imshow(image)
 
 			if isinstance(title, list) and isinstance(title[i], str):
 				plt.title(title[i])
@@ -404,11 +408,17 @@ class Renderer:
 		return mesh
 
 	@staticmethod
-	def volume_diff(mesh1, mesh2):
+	def volume_diff(meshf1, meshf2):
 		"""Calculate the total volume displacement between two meshes"""
-		Renderer.logger.error("volume_diff method not yet implemented")
-		return None
-	
+		mesh1 = trimesh.load(meshf1, "obj", force="mesh")
+		mesh2 = trimesh.load(meshf2, "obj", force="mesh")
+		if not mesh1.is_volume or not mesh2.is_volume:
+			Renderer.logger.error("At least 1 mesh input to volume_diff does not have the properties to compute a volume")
+			return None
+		
+		mesh1_vol, mesh2_vol = mesh1.volume, mesh2.volume
+		return mesh2_vol / mesh1_vol
+		
 	@staticmethod
 	def vertex_diff(mesh1, mesh2, abs=True):
 		"""Calculate the average Euclidean distance between vertices of two meshes"""
@@ -530,14 +540,27 @@ def test_display_batch():
 if __name__ == "__main__":
 	# test_renderer()
 	# test_draw_grasp()
-	test_display_batch()
+	# test_display_batch()
 
 	# renderer1 = Renderer()
 	# grasp_obj, _ = renderer1.render_object("data/bar_clamp.obj", display=False)
 	# # center = torch.tensor([-0.01691197, -0.02238275, 0.04196089]).to(renderer1.device)
 	# center = torch.tensor([0.04, 0.04, 0.04]).to(renderer1.device)
 	# sphere = renderer1.grasp_sphere(center, grasp_obj, title="vis_grasps/test.obj")
+ 
+	r = Renderer()
+	for i in range(5):
+		print(f"\nlr-{i}: ")
+		for j in range(3):
+			# vol1 = Renderer.volume_diff("data/new_barclamp.obj", f"exp-results2/no-oracle/lr-{i}/grasp-{j}/it-100.obj")
+			# if vol1 is not None: r.render_object(f"exp-results2/no-oracle/lr-{i}/grasp-{j}/it-100.obj", title=(str(vol1 * 100.0) + " percent of original mesh"))
 
+			vol2 = Renderer.volume_diff("data/new_barclamp.obj", f"exp-results2/no-oracle-grad/lr-{i}/grasp-{j}/it-100.obj")
+			if vol2 is not None: r.render_object(f"exp-results2/no-oracle-grad/lr-{i}/grasp-{j}/it-100.obj", title=(str(vol2 * 100.0) + " percent of original mesh"))
+
+			if i < 4:
+				vol3 = Renderer.volume_diff("data/new_barclamp.obj", f"exp-results2/oracle-grad/lr-{i}/grasp-{j}/it-100.obj")
+				if vol3 is not None: r.render_object(f"exp-results2/oracle-grad/lr-{i}/grasp-{j}/it-100.obj", title=(str(vol3 * 100.0) + " percent of original mesh"))
 
 
 
