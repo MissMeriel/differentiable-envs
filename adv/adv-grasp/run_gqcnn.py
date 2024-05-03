@@ -210,7 +210,7 @@ class Attack:
 
 		# save attack info
 		if not os.path.exists(dir):
-			os.mkdir(dir)
+			os.makedirs(dir)
 		grasp.save(dir+"grasp.json")
 
 		data = {

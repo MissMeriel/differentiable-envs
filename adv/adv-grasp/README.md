@@ -49,3 +49,23 @@ Note on parameters:
 - `epsilon` is an optional float value between 0.0 and 1.0 for attack methods ORACLE_GRAD and NO_ORACLE_GRAD. When the difference between the model prediction and the oracle evaluation reaches or surpasses this value, the adversarial loop exits. 
 
 **Also see main.py for an example on how to run attacks.**
+
+pip install Pyro4
+pip install trimesh
+
+main.py 
+grasp
+    momentum/learning rate
+        attack method
+
+TODO: 
+
+compute: volume, convex hull volume, mesh normal consistency
+options:
+1. every time - maybe calc_loss, in run_gqcnn
+2. snapshots (every 10) - snapsot, in run_gqcnn
+
+select_grasp is responsible for converting type of grasps and imports my library
+can put a wrapper for volume into select grasp that takes pytorch meshes
+
+check how much space we're using
