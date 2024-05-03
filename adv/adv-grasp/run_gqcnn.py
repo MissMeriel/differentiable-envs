@@ -56,6 +56,7 @@ class Attack:
 		# 	"smooth": 5
 		# }
 
+		self.loss_alpha = None
 		self.losses = None
 		self.track_qual = None
 		self.attack_method = None
@@ -89,7 +90,7 @@ class Attack:
 
 	@staticmethod
 	def plot_losses(losses, dir):
-		fig = plt.figure(figsize=(13, 5))
+		fig = plt.figure(figsize=(7, 5))
 		ax = fig.gca()
 		for k, l in losses.items():
 			ax.plot(l, label=k + " loss")
@@ -128,12 +129,12 @@ class Attack:
 		float: calculated loss
 		"""
 
-
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
 		pose, image = grasp.extract_tensors_batch(dim)
 		out = self.run(pose, image)
 		cur_pred = out[:,0:1].to(adv_mesh.device)
+		eps_check = False
 
 		# NO ORACLE
 		if method == AttackMethod.NO_ORACLE:
@@ -143,25 +144,32 @@ class Attack:
 
 		# NO ORACLE GRADIENT - check current model prediction
 		elif method == AttackMethod.NO_ORACLE_GRAD:
-			if isinstance(grasp.quality, torch.Tensor):
-				oracle_pred = Attack.scale_oracle(grasp.quality)
-			else:
-				oracle_pred = torch.zeros(1, 1).to(adv_mesh.device)
-			loss = torch.sub(1.0, torch.abs(torch.sub(cur_pred, oracle_pred)))
+			oracle_pred = Attack.scale_oracle(grasp.quality)
+			abs_diff = torch.abs(torch.sub(cur_pred, oracle_pred))
+			loss = torch.sub(1.0, abs_diff)
+			if self.epsilon is not None and abs_diff >= self.epsilon:
+				eps_check = True
 	
 		# ORACLE GRADIENT
 		elif method == AttackMethod.ORACLE_GRAD:
 			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
 			oracle_pred = self.scale_oracle(oracle_pred)
-			# loss = torch.sub(1.0, torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred))))		# use means for batches
-			loss = torch.sub(1.0, torch.abs(torch.sub(oracle_pred, cur_pred)))
+			if self.loss_alpha is not None:
+				abs_diff = torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred)))
+				loss = torch.sub(1.0, abs_diff)		# use means for batches
+			else:
+				abs_diff = torch.abs(torch.sub(oracle_pred, cur_pred))
+				loss = torch.sub(1.0, abs_diff)
+
+			if self.epsilon is not None and abs_diff >= self.epsilon:
+				eps_check = True
+
 
 		self.losses["prediction"].append(loss.item())
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
-		if isinstance(oracle_pred, torch.Tensor): self.track_qual["oracle quality"].append(oracle_pred.item())
-		else: self.track_qual["oracle quality"].append(oracle_pred)
+		self.track_qual["oracle quality"].append(oracle_pred.item())
 
-		return loss		
+		return loss, eps_check
 
 		# ignore regularization losses for now
 		# # WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
@@ -193,9 +201,9 @@ class Attack:
   
 		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
 		adv_mesh = mesh.offset_verts(param)
-		loss = self.calc_loss(adv_mesh, grasp, method)
+		loss, eps_check = self.calc_loss(adv_mesh, grasp, method)
 
-		return loss, adv_mesh
+		return loss, adv_mesh, eps_check
 
 	def attack_setup(self, dir, logfile, grasp, method):
 		"""Set up attack by saving info and resetting losses"""
@@ -258,7 +266,7 @@ class Attack:
 
 		return final_mesh
 
-	def attack(self, mesh, grasp, dir, lr, momentum, loss_alpha, method):
+	def attack(self, mesh, grasp, dir, lr, momentum=None, loss_alpha=None, method=AttackMethod.ORACLE_GRAD, epsilon=None):
 		"""
 		Run an attack on the model for number of steps specified in self.num_steps
 
@@ -276,6 +284,9 @@ class Attack:
 		loss_alpha: float
 		method: MethodAttack
 			Type of attack to run
+		epsilon: float
+			When the difference between the model prediction and oracle evaluation reaches or surpasses epsilon, exit adversarial loop.
+			Only applicable for AttackMethods ORACLE_GRAD and NO_ORACLE_GRAD. 
 		Returns
 		-------
 		pytorch3d.structures.Meshes: adv_mesh
@@ -287,6 +298,10 @@ class Attack:
 		self.learning_rate = lr
 		self.momentum = momentum
 		self.loss_alpha = loss_alpha
+		if epsilon is not None and ((method == AttackMethod.NO_ORACLE_GRAD) or (method == AttackMethod.ORACLE_GRAD)):
+			self.epsilon = epsilon
+		else:
+			self.epsilon = None
 
 		# set up attack: save info + reset losses
 		grasp.c0, grasp.c1 = None, None 	# don't use contact information bc perturbations will change this
@@ -313,14 +328,21 @@ class Attack:
 		for i in range(1, self.num_steps):
 
 			optimizer.zero_grad()
-			loss, adv_mesh = self.perturb(mesh, param, grasp, method)
+			loss, adv_mesh, eps_check = self.perturb(mesh, param, grasp, method)
 			loss.backward()
 			optimizer.step()
 
-			if i % self.steps_per_plot == 0:
+			if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
 				# snapshot
 				mesh2 = adv_mesh.clone()
 				self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, method=method)
+
+			if eps_check:
+				# model prediction and oracle evaluation are sufficiently different, break loop
+				if i % self.steps_per_plot != 0:
+					mesh2 = adv_mesh.clone()
+					self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, method=method)
+				break
 
 		# plot losses/qualities over time
 		Attack.plot_losses(self.losses, dir)
@@ -347,8 +369,7 @@ class Attack:
 			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=False)
 		else:
 			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=True)
-		oracle_qual_scaled = self.scale_oracle(oracle_qual)
-		if isinstance(oracle_qual_scaled, torch.Tensor): oracle_qual_scaled = oracle_qual_scaled.item()
+		oracle_qual_scaled = self.scale_oracle(oracle_qual).item()
 		if orig_pdim is not None: depth_diff = orig_pdim - processed_dim
 
 		# RANDOM FUZZ ONLY
@@ -367,7 +388,7 @@ class Attack:
 			os.remove(mesh_file)
 
 		# add info to logfile
-		if isinstance(oracle_qual, torch.Tensor): oracle_qual = oracle_qual.item()
+		oracle_qual = oracle_qual.item()
 		data = {
 			"iteration": iteration,
 			"model prediction": model_pred.item(),
