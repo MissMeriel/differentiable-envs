@@ -277,37 +277,6 @@ class GraspTorch(object):
 
         return torch.nn.functional.relu(normal_force_mag)
         
-    @staticmethod
-    def compute_mesh_COM(mesh): 
-        """Compute the center of mass for a mesh, assume uniform density."""
-
-        #https://forums.cgsociety.org/t/how-to-calculate-center-of-mass-for-triangular-mesh/1309966
-        mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-        # B, F, 3, 3
-        # assume Faces, verts, coords
-        totalCoords = torch.sum(mesh_unwrapped, 1) # used in both mean and CoM, so split out
-
-        meanVert = torch.sum(totalCoords,0) / (totalCoords.shape[0] * totalCoords.shape[1])
-
-        totalCoords = totalCoords + meanVert
-        com_per_triangle = totalCoords / 4
-
-        # add dims and expand "average vertex" to match mesh. Will be used to go from triangles to
-        # tetrahedrons
-        meanVert_expand = torch.reshape(meanVert, [1, 1, 3]).expand(mesh_unwrapped.shape[0],1,3)
-
-        mesh_tetra = torch.cat([mesh_unwrapped, meanVert_expand], 1)
-        mesh_tetra = torch.cat([mesh_tetra, torch.ones([mesh_tetra.shape[0],4,1],device=mesh_unwrapped.device,dtype=mesh_unwrapped.dtype)], -1)
-        
-        # det([[x1,y1,z1,1],[x2,y2,z2,1],[x3,y3,z3,1],[x4,y4,z4,1]]) / 6 
-        # technically a scaled volume, since we dropped the division by 6
-        # does det on last 2 dims, considers at least first 1 to be batch dim
-        vol_per_triangle = torch.reshape(torch.linalg.det(mesh_tetra),(mesh_tetra.shape[0],1))
-
-        com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / torch.sum(vol_per_triangle)
-
-        return com
-
     @property
     def grasp_matrix(self):
         """ Computes the grasp map between contact forces and wrenchs on the object in its reference frame.
@@ -474,14 +443,14 @@ class GraspTorch(object):
         self.applied_to_object = contactFound.item()
         self.contact_normals = normsContinuous
         self.mesh = mesh
-        self.object_com = GraspTorch.compute_mesh_COM(mesh)
+        self.object_com = compute_mesh_COM(mesh)
         self.faces_index = faces_index
         return self
 
     @staticmethod
     def dexnetRadius(mesh, gridDist=1.5):
         # matches min scaling from:
-        # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/database/mesh_processor.py#L281
+        # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnetdatabase/mesh_processor.py#L281
         sdf_dim = 100
         sdf_padding = 5
 
@@ -842,6 +811,52 @@ class ParallelJawQualityFunction(GraspQualityFunction):
                 self._max_friction_cone_angle)
 
 
+def compute_mesh_tetra_volumes(mesh):
+    """Compute the volume of each mesh tetra, using mean as 4th point. Used in CoM/Volume"""
+    #https://forums.cgsociety.org/t/how-to-calculate-center-of-mass-for-triangular-mesh/1309966
+    mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
+    # B, F, 3, 3
+    # assume Faces, verts, coords
+    totalCoords = torch.sum(mesh_unwrapped, 1) # used in both mean and CoM, so split out
+
+    meanVert = torch.sum(totalCoords,0) / (totalCoords.shape[0] * totalCoords.shape[1])
+
+    totalCoords = totalCoords + meanVert
+    com_per_triangle = totalCoords / 4
+
+    # add dims and expand "average vertex" to match mesh. Will be used to go from triangles to
+    # tetrahedrons
+    meanVert_expand = torch.reshape(meanVert, [1, 1, 3]).expand(mesh_unwrapped.shape[0],1,3)
+
+    mesh_tetra = torch.cat([mesh_unwrapped, meanVert_expand], 1)
+    mesh_tetra = torch.cat([mesh_tetra, torch.ones([mesh_tetra.shape[0],4,1],device=mesh_unwrapped.device,dtype=mesh_unwrapped.dtype)], -1)
+    vol_per_triangle = torch.reshape(torch.linalg.det(mesh_tetra),(mesh_tetra.shape[0],1))
+    # det([[x1,y1,z1,1],[x2,y2,z2,1],[x3,y3,z3,1],[x4,y4,z4,1]]) / 6 
+    # technically a scaled volume, since we dropped the division by 6
+    # does det on last 2 dims, considers at least first 1 to be batch dim
+    return vol_per_triangle, com_per_triangle
+
+def compute_mesh_bounding_volume(mesh):
+    bb = mesh.get_bounding_boxes()
+    ranges = torch.diff(bb,dim=-1).squeeze(-1)[0]
+    return torch.prod(ranges,dim=-1)
+
+def compute_mesh_volume(mesh):
+    """Compute the center of mass for a mesh, assume uniform density."""
+    vol_per_triangle,_ = compute_mesh_tetra_volumes(mesh)
+    return torch.sum(vol_per_triangle)/6
+    
+def compute_mesh_COM(mesh): 
+    """Compute the center of mass for a mesh, assume uniform density."""
+
+    vol_per_triangle, com_per_triangle = compute_mesh_tetra_volumes(mesh)
+
+    
+
+    com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / torch.sum(vol_per_triangle)
+
+    return com
+
 class CannyFerrariQualityFunction(ParallelJawQualityFunction):
     """Measures the distance to the estimated center of mass for antipodal
     parallel-jaw grasps."""
@@ -1141,7 +1156,7 @@ def test_wine():
 
     renderer, device = pytorch_setup()
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("adv-grasp/data/Wineglass_800_tex.obj")
+        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/Wineglass_800_tex.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -1199,7 +1214,7 @@ def test_quality():
     # load PyTorch3D mesh from .obj file
     renderer, device = pytorch_setup()
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("adv-grasp/data/new_barclamp.obj")
+        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/new_barclamp.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -1215,13 +1230,14 @@ def test_quality():
         "friction_coef": 0.8, # TODO use 0.8 in practice
         "antipodality_pctile": 1.0 
     }
-
+    print("mesh vol:", compute_mesh_volume(mesh).numpy(force=True))
+    print("mesh bb vol:", compute_mesh_bounding_volume(mesh).numpy(force=True))
     # Test intersection finding
     test_grasps_compute = []
     test_grasps_set = []
     dicts = []
     for i in range(0,12):
-        f = open('adv-grasp/data/data/data'+str(i)+'.json')
+        f = open('adv/adv-grasp/data/data/data'+str(i)+'.json')
         dicts.append(json.load(f))
         center3D = torch.tensor([dicts[-1]['pytorch_w_center']],device=device,requires_grad=True)
         axis3D = torch.tensor([dicts[-1]['pytorch_w_axis']],device=device,requires_grad=True)
@@ -1410,7 +1426,7 @@ def test_quality():
 
 #     renderer, device = pytorch_setup()
 #     with record_function("load_obj"):
-#         verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
+#         verts, faces_idx, _ = load_obj("adv/adv-grasp/data/new_barclamp.obj")
 #     faces = faces_idx.verts_idx
 #     verts_rgb = torch.ones_like(verts)[None]
 #     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -1427,7 +1443,7 @@ def test_quality():
 #         "antipodality_pctile": 1.0 
 #     }
 #     i=0
-#     f = open('data/data/data'+str(i)+'.json')
+#     f = open('datadatadata'+str(i)+'.json')
 #     grasp_dict = json.load(f)
 
 #     center3D = torch.tensor([grasp_dict['pytorch_w_center']],device=device,requires_grad=True)
