@@ -69,3 +69,5 @@ select_grasp is responsible for converting type of grasps and imports my library
 can put a wrapper for volume into select grasp that takes pytorch meshes
 
 check how much space we're using
+
+test quality_fork after after refactor
