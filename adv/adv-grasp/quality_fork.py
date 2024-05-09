@@ -6,7 +6,7 @@ from torch.profiler import profile, record_function, ProfilerActivity
 import numpy as np
 import math
 import json
-from pytorch3d.io import load_obj
+from pytorch3d.io import load_obj, save_obj
 from pytorch3d import _C
 import pytorch3d.transforms as tf
 from scipy.spatial import ConvexHull
@@ -841,11 +841,28 @@ def compute_mesh_bounding_volume(mesh):
     ranges = torch.diff(bb,dim=-1).squeeze(-1)[0]
     return torch.prod(ranges,dim=-1)
 
-def compute_mesh_volume(mesh):
+def compute_mesh_volume(mesh, ignore_backface_check=False):
     """Compute the center of mass for a mesh, assume uniform density."""
     vol_per_triangle,_ = compute_mesh_tetra_volumes(mesh)
+    if ignore_backface_check:
+        vol_per_triangle = torch.abs(vol_per_triangle)
     return torch.sum(vol_per_triangle)/6
-    
+
+def compute_mesh_hull_volume(mesh):
+    verts = mesh.verts_packed()
+    verts_np = verts.numpy(force=True)
+    hull = ConvexHull(verts_np).simplices
+    # get unique from hull, update hull to use unique indices
+    indices_kept, hull_new = np.unique(hull.reshape(-1),return_inverse=True)
+    hull_new = np.reshape(hull_new, hull.shape)
+    faces = torch.tensor(hull_new, dtype=torch.long, device=mesh.device)
+    verts = verts[indices_kept,:]
+    mesh_hull = Meshes([verts],[faces])
+    # sub sample verts with unique indices
+    return compute_mesh_volume(mesh_hull,ignore_backface_check=True)
+    # construct mesh
+
+
 def compute_mesh_COM(mesh): 
     """Compute the center of mass for a mesh, assume uniform density."""
 
@@ -1232,6 +1249,7 @@ def test_quality():
     }
     print("mesh vol:", compute_mesh_volume(mesh).numpy(force=True))
     print("mesh bb vol:", compute_mesh_bounding_volume(mesh).numpy(force=True))
+    print("mesh hull vol:", compute_mesh_hull_volume(mesh).numpy(force=True))
     # Test intersection finding
     test_grasps_compute = []
     test_grasps_set = []

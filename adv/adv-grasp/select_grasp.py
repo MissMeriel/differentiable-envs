@@ -1107,6 +1107,7 @@ class Grasp:
 		# save top level info
 		self.save(batch_fname)
 		mesh, im = renderer.render_object(obj_file, display=False)
+		vol_mesh, vol_bounding, vol_hull = get_volumes(mesh)
 		depth_im = renderer.mesh_to_depth_im(mesh, display=False)
 		renderer.display(im, title=obj_file.split("/")[-1], save=img_fname)
 		renderer.display(depth_im, title=obj_file.split("/")[-1], save=dimg_fname)
@@ -1116,7 +1117,7 @@ class Grasp:
 			qual_title = ""
 			if self.quality is not None: qual_title += f"\nQuality: {self.quality.item()}"
 			if self.prediction is not None: qual_title += f"\nPrediction: {self.prediction.item()}"
-
+			qual_title += f"\n volumes: mesh {vol_mesh}, bb {vol_bounding}, hull {vol_hull}"
 			# processed depth image
 			_, p_dim = self.extract_tensors(depth_im)
 			title = "Depth image w.r.t. grasp" + qual_title
@@ -1165,6 +1166,11 @@ class Grasp:
 			if contacts is not None:
 				renderer.draw_grasp(mesh, contacts[0], contacts[1], title=title, save=gimg_fname, display=False)
 
+def get_volumes(mesh):
+	vol_bounding = compute_mesh_bounding_volume(mesh)
+	vol_mesh = compute_mesh_volume(mesh)
+	vol_hull = compute_mesh_hull_volume(mesh)
+	return (vol_mesh, vol_bounding, vol_hull)
 
 def save_nparr(image, filename):
 	""" 
