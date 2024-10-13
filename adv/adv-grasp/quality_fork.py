@@ -876,6 +876,7 @@ def compute_mesh_COM(mesh):
     return com
 
 def compute_mesh_unconnectiviy(mesh):
+    """Find all pairs of non-neighbor triangles in a mesh"""
     faces = mesh.faces_packed()
     inverseFaceMap = [[] for _ in range(mesh._V)]
     for rowInd in range(faces.shape[0]):
