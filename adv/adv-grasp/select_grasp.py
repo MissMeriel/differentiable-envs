@@ -1094,6 +1094,34 @@ class Grasp:
 
 		return self.quality
 
+	def eval_self_collision_dist(self, obj):
+		# computes a self collision loss, either comparing minimum distance directly OR computing the distance
+		# energy, https://www.cs.cmu.edu/~kmcrane/Projects/RepulsiveShells/index.html
+		if not hasattr(self, 'unconnectivity'):
+			self.unconnectivity = compute_mesh_unconnectiviy(obj)
+
+		useMin = False
+		if useMin:
+			min_dist = self_collision_min(obj, self.unconnectivity)
+			if not hasattr(self,'reference_dist'):
+				self.reference_dist = min_dist.item()
+		else:
+			all_dist, coords = self_collision(obj, self.unconnectivity)
+			if not hasattr(self,'reference_dist'):
+				self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach()
+				
+			min_dist = torch.min(all_dist)
+
+
+
+		if useMin:
+			dist_loss = -torch.log(min_dist - self.reference_dist/10)
+		else:
+			dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+
+		dist_loss.requires_grad_(True)
+		return dist_loss
+
 
 	def vis_grasp_dataset(self, obj_file, directory, renderer):
 		"""Visualize a dataset of grasps in the given directory"""

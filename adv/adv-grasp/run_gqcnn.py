@@ -10,6 +10,8 @@ from render import *
 from gqcnn_pytorch import KitModel
 from select_grasp import *
 
+import imageio
+
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
 class AttackMethod(Enum):
@@ -92,11 +94,14 @@ class Attack:
 	def plot_losses(losses, dir):
 		fig = plt.figure(figsize=(7, 5))
 		ax = fig.gca()
-		for k, l in losses.items():
-			ax.plot(l, label=k + " loss")
-		ax.legend(fontsize="16")
+		ax2 = ax.twinx()
+		ax2.plot(losses['dist'], label="dist loss",color='tab:blue')
+		index = [0] + (np.nonzero(np.diff(losses['index']))[0]+1).tolist() + [len(losses['index'])-1]
+		ax.vlines(index,ymin=0,ymax=1,color='tab:green')
+		ax.plot(losses['prediction'], label="prediction loss",color='tab:red')
 		ax.set_xlabel("Iteration", fontsize="16")
 		ax.set_ylabel("Loss", fontsize="16")
+		ax2.set_ylabel("Dist", fontsize="16")
 		ax.set_title("Loss vs iterations", fontsize="18")
 		plt.savefig(dir+"losses.png")
 		plt.close()
@@ -116,7 +121,7 @@ class Attack:
 		plt.savefig(dir+"qual.png")
 		plt.close()
 
-	def calc_loss(self, adv_mesh, grasp, method):
+	def calc_loss(self, adv_mesh, grasp, method, index):
 		"""
 		Calculates loss for the adversarial attack to maximize difference between oracle and model prediction
 
@@ -124,10 +129,23 @@ class Attack:
 		----------
 		adv_mesh:
 		grasp:
+		index:
 		Returns
 		-------
 		float: calculated loss
 		"""
+		# local function for merging distance and adverserial loss
+		def loss_mixer(adv_loss, collision_loss):
+			dist_loss_scale = 1000000
+			scale_sat = 19
+			collision_loss_scaled = collision_loss / dist_loss_scale
+			loss_float = collision_loss_scaled.item()
+			if math.isfinite(loss_float) and loss_float > 0:
+				scaling = loss_float / (adv_loss.item() * scale_sat)
+				collision_loss_sat = torch.minimum(collision_loss_scaled, collision_loss_scaled * scaling)
+			else:
+				collision_loss_sat = collision_loss_scaled
+			return collision_loss_sat + adv_loss
 
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
@@ -135,10 +153,11 @@ class Attack:
 		out = self.run(pose, image)
 		cur_pred = out[:,0:1].to(adv_mesh.device)
 		eps_check = False
-
+		dist_loss = grasp.eval_self_collision_dist(adv_mesh_clone)
+		print(dist_loss)
 		# NO ORACLE
 		if method == AttackMethod.NO_ORACLE:
-			loss = cur_pred
+			loss = loss_mixer(cur_pred, dist_loss)
 			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
 			oracle_pred = self.scale_oracle(oracle_pred)
 
@@ -146,7 +165,7 @@ class Attack:
 		elif method == AttackMethod.NO_ORACLE_GRAD:
 			oracle_pred = Attack.scale_oracle(grasp.quality)
 			abs_diff = torch.abs(torch.sub(cur_pred, oracle_pred))
-			loss = torch.sub(1.0, abs_diff)
+			loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 	
@@ -156,16 +175,23 @@ class Attack:
 			oracle_pred = self.scale_oracle(oracle_pred)
 			if self.loss_alpha is not None:
 				abs_diff = torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred)))
-				loss = torch.sub(1.0, abs_diff)		# use means for batches
+				loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)	# use means for batches
 			else:
 				abs_diff = torch.abs(torch.sub(oracle_pred, cur_pred))
-				loss = torch.sub(1.0, abs_diff)
+				print(f'adv: {abs_diff} energy: {dist_loss}')
+				loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)	
 
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 
+		# store variables for plotting
+		if method == AttackMethod.NO_ORACLE:
+			self.losses["prediction"].append(cur_pred.item())
+		else:
+			self.losses["prediction"].append(torch.sub(1.0, abs_diff).item())
 
-		self.losses["prediction"].append(loss.item())
+		self.losses["dist"].append(dist_loss.item()/100000)
+		self.losses["index"].append(index)
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
 		self.track_qual["oracle quality"].append(oracle_pred.item())
 
@@ -182,7 +208,7 @@ class Attack:
 		# self.losses["normal"].append(normal_loss.item())
 		# self.losses["smoothing"].append(smooth_loss.item())
 
-	def perturb(self, mesh, param, grasp, method):
+	def perturb(self, mesh, param, grasp, method, index):
 		"""
 		Perturb the mesh for the adversarial attack
 
@@ -191,6 +217,7 @@ class Attack:
 		mesh: pytorch3d.structures.Meshes
 			Mesh to be perturbed
 		param: torch.tensor
+		index: outer loop index for storing with loss to track successful steps
 		grasp:
 		Returns
 		-------
@@ -201,7 +228,7 @@ class Attack:
   
 		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
 		adv_mesh = mesh.offset_verts(param)
-		loss, eps_check = self.calc_loss(adv_mesh, grasp, method)
+		loss, eps_check = self.calc_loss(adv_mesh, grasp, method, index)
 
 		return loss, adv_mesh, eps_check
 
@@ -226,6 +253,8 @@ class Attack:
 		# reset loss tracking to plot at the end
 		self.losses = {
 			"prediction": [],
+			"dist": [],
+			"index": []
 			# "edge": [],
 			# "normal": [],
 			# "smoothing": []
@@ -320,17 +349,59 @@ class Attack:
 			return self.attack_random_fuzz(mesh, grasp, dir, lr)
 
 		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
-		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
+
+		# option to use steps of fixed size, inspired by fgsm (https://pytorch.org/tutorials/beginner/fgsm_tutorial.html)
+		# otherwise, will use SGD and scale by gradient magnitude
+		use_fixed_step = True
+
+		if not use_fixed_step:
+			optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
 		adv_mesh = mesh.clone()
 
+		# initialize stack of known feasible meshes, for reverting during optimization
+		param_safe=[param.detach().clone()]
+		
+		if  hasattr(grasp,'reference_dist'):
+			delattr(grasp,'reference_dist')
+
+		# ratio between start and end when doing exponential backoff. 2 will take average, 10 will reduce step by 90%
+		backoff = 10
 		# ADVERSARIAL LOOP
 		for i in range(1, self.num_steps):
-
-			optimizer.zero_grad()
-			loss, adv_mesh, eps_check = self.perturb(mesh, param, grasp, method)
-			loss.backward()
-			optimizer.step()
+			attempts = 0 # used to decide whether to revert to previous mesh in param_safe
+			if not use_fixed_step:
+				optimizer.zero_grad()
+			while True:
+				loss, adv_mesh, eps_check = self.perturb(mesh, param, grasp, method, i)
+				# check that both loss AND its derivative are finite, otherwise triggering backoff
+				if torch.isfinite(loss).item():
+					try:
+						loss.backward()
+					except:
+						pass
+					else:
+						# success, so we need to add current mesh to list in case of future reversion
+						param_safe.append(param.detach().clone())
+						break
+				print(f'reducing param diff by {backoff}, try {attempts}')
+				if attempts > 5:
+					print(f'resetting with {len(param_safe)}')
+					attempts = 0
+					param = param_safe.pop(-1)
+				attempts += 1
+				# apply backoff ratio
+				param = ((param + (param_safe[-1]*(backoff-1)))/backoff).detach()
+				param.requires_grad_(requires_grad=True)
+				if not use_fixed_step:
+					optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
+					optimizer.zero_grad()
+			
+			if not use_fixed_step:
+				optimizer.step()
+			else: 
+				param = (param - lr * torch.nn.functional.normalize(param.grad)).detach()
+				param.requires_grad_(requires_grad=True)
 
 			if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
 				# snapshot
@@ -357,7 +428,9 @@ class Attack:
 	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim, logfile, method, save_mesh=False):
 		"""Save information at current point in attack."""
 		# TODO: Implement for batch of grasps in attack
-  
+
+		# different mesh volumes for considering change
+		vol_mesh, vol_bounding, vol_hull = get_volumes(mesh)
 		mesh_file = dir + f"it-{iteration}.obj"
 		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		image = self.renderer.render_mesh(mesh, display=False)
@@ -377,12 +450,23 @@ class Attack:
 			self.track_qual["gqcnn prediction"].append(model_pred.item())
 			self.track_qual["oracle quality"].append(oracle_qual_scaled)
 
-		title = f"Iteration {iteration}: oracle quality {oracle_qual_scaled:.4f}, gqcnn prediction {model_pred.item():.4f}"
+		title = f"Iteration {iteration}: oracle quality {oracle_qual_scaled:.4f}, gqcnn prediction {model_pred.item():.4f}\n volumes: mesh {vol_mesh}, bb {vol_bounding}, hull {vol_hull}"
 		fname = dir + "it-" + str(iteration) + ".png"
 		image = image.squeeze(0)
 		image = image[140:340, 270:370, :]
 		self.renderer.display(images=[image, processed_dim, depth_diff], shape=(1,3), title=title, save=fname)
+		
+		# store renders for creating a .gif animation
+		if hasattr(self, 'renders_list'):
+			self.renders_list += [imageio.imread(fname)]
+		else:
+			self.renders_list = [imageio.imread(fname)]
 		print(f"save: {fname}")
+
+		if save_mesh:
+			imageio.mimsave(dir + f"it.gif", self.renders_list,fps=1,loop=10000)
+			self.renders_list = []
+
 
 		if not save_mesh:
 			os.remove(mesh_file)
