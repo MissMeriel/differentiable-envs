@@ -960,7 +960,7 @@ class Grasp:
 
 		return pose_tensor, dims_transformed
 
-	def oracle_eval(self, obj_file, oracle_method=None, robust=None, renderer=None, grad=True):
+	def oracle_eval(self, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual'):
 		"""
 		Get a final oracle evalution of a mesh object according to oracle_method
 
@@ -997,7 +997,7 @@ class Grasp:
 			if not renderer:
 				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 			else:
-				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad)
+				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
 		"""
@@ -1035,12 +1035,50 @@ class Grasp:
 
 		return self.quality
 
-	def oracle_eval_pytorch(self, obj, renderer, grad=True):
+	def write_grasp_pytorch(self, obj, renderer, path):
+		"""
+			Save a colored mesh of the grasp points for the current object using pytorch version of dexnet library
+		"""
+		if (self.world_center == None or self.world_axis == None):
+			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
+			return None
+
+		config_dict = {
+			"torque_scaling":1000,
+			"soft_fingers":1,
+			"friction_coef": 0.8,
+			"antipodality_pctile": 1.0 
+    	}
+
+		if isinstance(obj, Meshes): mesh = obj
+		else: mesh, _ = renderer.render_object(obj, display=False)
+
+		if self.num_grasps() == 1:
+			self.quality = torch.zeros_like(self.depth)
+			# for i, g in enumerate(self):
+			g = self[0]
+			if g.c0 is not None and g.c1 is not None: contact_points = torch.stack((g.c0, g.c1), 0)
+			else: contact_points = None
+			
+			width = torch.tensor([[0.05]], device=device)
+			grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+			
+			if contact_points == None:
+				grasp_torch = grasp_torch.apply_to_mesh(mesh)
+
+			grasp_torch.write_obj(path, include_coordinate=True, include_line_o_action=True)
+
+	def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual'):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
+
+		if robust:
+			qual_class = RobustCannyFerrariQualityFunction
+		else:
+			qual_class = CannyFerrariQualityFunction
 
 		if (self.world_center == None or self.world_axis == None):
 			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
@@ -1066,7 +1104,7 @@ class Grasp:
 				grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 				
 				try:
-					com_qual_func = CannyFerrariQualityFunction(config_dict)
+					com_qual_func = qual_class(config_dict)
 					quality = com_qual_func.quality(mesh, grasp_torch).float().item()
 				except QhullError:
 					quality =  0.0
@@ -1082,7 +1120,7 @@ class Grasp:
 			grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 			
 			try:
-				com_qual_func = CannyFerrariQualityFunction(config_dict)
+				com_qual_func = qual_class(config_dict)
 				self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
 			except QhullError:
 				self.quality = torch.tensor([0.0]).to(device)
@@ -1097,29 +1135,54 @@ class Grasp:
 	def eval_self_collision_dist(self, obj):
 		# computes a self collision loss, either comparing minimum distance directly OR computing the distance
 		# energy, https://www.cs.cmu.edu/~kmcrane/Projects/RepulsiveShells/index.html
+		
+		# store a graph of mesh connections if it doesn't exist, 
+		# should be first time we reach here per grasp
 		if not hasattr(self, 'unconnectivity'):
-			self.unconnectivity = compute_mesh_unconnectiviy(obj)
+			self.unconnectivity = mesh_unconnectivity(obj)
 
-		useMin = False
-		if useMin:
-			min_dist = self_collision_min(obj, self.unconnectivity)
-			if not hasattr(self,'reference_dist'):
-				self.reference_dist = min_dist.item()
-		else:
+		# configuration. TODO, test and maybe expose
+		use_energy = False
+		use_all_in_min = True
+		# only process full vector if needed
+		if use_energy or use_all_in_min:
 			all_dist, coords = self_collision(obj, self.unconnectivity)
-			if not hasattr(self,'reference_dist'):
-				self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach()
-				
 			min_dist = torch.min(all_dist)
-
-
-
-		if useMin:
-			dist_loss = -torch.log(min_dist - self.reference_dist/10)
 		else:
-			dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+			# only handle minimum distance if we don't need full
+			min_dist = self_collision_min(obj, self.unconnectivity)
 
+		# store a reference distance if it doesn't exist, should be first time we reach here per grasp
+		if not hasattr(self,'reference_dist'):
+			if use_energy:
+				self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach()
+			else: 	
+				self.reference_dist = min_dist.item()
+
+		if use_energy:
+			# repulsive shell formula
+			dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+		else:
+			if use_all_in_min:
+				# allows for us to have a distance threshold, above which we ignore in gradient
+				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
+				# use reference, if valid in barier. Use min/10 if we're closer than reference 
+				if min_dist < self.reference_dist/10:
+					print('inside outer boundary region')
+					dist_loss = -torch.sum(torch.log(clamp_dist - min_dist/10 ))
+				else:
+					dist_loss = -torch.sum(torch.log(clamp_dist - self.reference_dist/10))
+			
+			else:
+				# if we only care about closest pair to collision, then no sum needed
+				clamp_dist = torch.clamp(min_dist, max=2*self.reference_dist)
+				if min_dist < self.reference_dist/10:
+					print('inside outer boundary region')
+					dist_loss = -torch.sum(torch.log(clamp_dist - min_dist/10 ))
+				else:
+					dist_loss = -torch.sum(torch.log(clamp_dist - self.reference_dist/10))
 		dist_loss.requires_grad_(True)
+
 		return dist_loss
 
 
