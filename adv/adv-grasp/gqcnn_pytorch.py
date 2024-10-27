@@ -6,11 +6,9 @@ import math
 import pickle
 import os
 
-_weights_dict = dict()
-
 class KitModel(nn.Module):
 
-    def __load_weights(weight_file):
+    def __load_weights(self, weight_file):
         if weight_file == None:
             return
 
@@ -19,7 +17,7 @@ class KitModel(nn.Module):
         except:
             weights_dict = np.load(weight_file, allow_pickle=True, encoding='bytes').item()
 
-        return weights_dict
+        self._weights_dict=weights_dict
 
     def __normalize_input(self, im_arr, pose_arr):
         """Normalize input before passing to the model"""
@@ -32,7 +30,7 @@ class KitModel(nn.Module):
     def __init__(self, weight_file):
         super(KitModel, self).__init__()
         global _weights_dict
-        _weights_dict = self.__load_weights(weight_file)
+        self.__load_weights(weight_file)
         parent = os.path.dirname(weight_file)
 
         # load in normalization files
@@ -108,30 +106,29 @@ class KitModel(nn.Module):
         return Softmax
 
 
-    @staticmethod
-    def __conv(dim, name, **kwargs):
+    def __conv(self, dim, name, **kwargs):
         if   dim == 1:  layer = nn.Conv1d(**kwargs)
         elif dim == 2:  layer = nn.Conv2d(**kwargs)
         elif dim == 3:  layer = nn.Conv3d(**kwargs)
         else:           raise NotImplementedError()
 
-        temp = torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).to(kwargs.get("device"))
+        temp = torch.permute(torch.from_numpy(self._weights_dict[name]['weights']), (2,3,1,0)).to(kwargs.get("device"))
         # print("\nname:", name)
         # print("weights:", torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).shape)
         # print(torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)))
         # print("conv1_1b:", _other_weights["conv1_1b"])
             
-        layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']).to(kwargs.get("device")))
-        if 'bias' in _weights_dict[name]:
-            layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']).to(kwargs.get("device")))
+        layer.state_dict()['weight'].copy_(torch.from_numpy(self._weights_dict[name]['weights']).to(kwargs.get("device")))
+        if 'bias' in self._weights_dict[name]:
+            layer.state_dict()['bias'].copy_(torch.from_numpy(self._weights_dict[name]['bias']).to(kwargs.get("device")))
             # print("bias:", torch.from_numpy(_weights_dict[name]['bias']))
         return layer
 
-    @staticmethod
-    def __dense(name, **kwargs):
-        layer = nn.Linear(**kwargs)
-        layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']))
-        if 'bias' in _weights_dict[name]:
-            layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
-        return layer
+    # @staticmethod
+    # def __dense(name, **kwargs):
+    #     layer = nn.Linear(**kwargs)
+    #     layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']))
+    #     if 'bias' in _weights_dict[name]:
+    #         layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
+    #     return layer
 
