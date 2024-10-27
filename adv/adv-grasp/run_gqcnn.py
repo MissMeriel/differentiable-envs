@@ -19,6 +19,8 @@ class AttackMethod(Enum):
 	NO_ORACLE = 2
 	NO_ORACLE_GRAD = 3
 	ORACLE_GRAD = 4
+	ORACLE_GRAD_UP = 5
+	ORACLE_GRAD_DOWN = 6
 
 class Attack: 
 
@@ -132,16 +134,20 @@ class Attack:
 		index:
 		Returns
 		-------
-		float: calculated loss
+		Tensor: calculated loss
+		float: "is close" boolean comparing two qualities
+		Tensor: component of loss from self collision distance
+		Tensor: component of loss from adv attack
 		"""
-		# local function for merging distance and adverserial loss
+		
 		def loss_mixer(adv_loss, collision_loss):
-			dist_loss_scale = 1000000
-			scale_sat = 19
+			# local function for merging distance and adverserial loss
+			dist_loss_scale = 10000
+			scale_sat = 99
 			collision_loss_scaled = collision_loss / dist_loss_scale
 			loss_float = collision_loss_scaled.item()
 			if math.isfinite(loss_float) and loss_float > 0:
-				scaling = loss_float / (adv_loss.item() * scale_sat)
+				scaling = (adv_loss.item() * scale_sat) / loss_float
 				collision_loss_sat = torch.minimum(collision_loss_scaled, collision_loss_scaled * scaling)
 			else:
 				collision_loss_sat = collision_loss_scaled
@@ -154,32 +160,41 @@ class Attack:
 		cur_pred = out[:,0:1].to(adv_mesh.device)
 		eps_check = False
 		dist_loss = grasp.eval_self_collision_dist(adv_mesh_clone)
-		print(dist_loss)
+
 		# NO ORACLE
 		if method == AttackMethod.NO_ORACLE:
-			loss = loss_mixer(cur_pred, dist_loss)
+			adv_loss = cur_pred
+			loss = loss_mixer(adv_loss, dist_loss)
 			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
-			oracle_pred = self.scale_oracle(oracle_pred)
+			print(f'adv: {cur_pred.item()} energy: {dist_loss.item()} oracle: {oracle_pred.item()}')
 
 		# NO ORACLE GRADIENT - check current model prediction
 		elif method == AttackMethod.NO_ORACLE_GRAD:
 			oracle_pred = Attack.scale_oracle(grasp.quality)
 			abs_diff = torch.abs(torch.sub(cur_pred, oracle_pred))
-			loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)
+			adv_loss = torch.sub(1.0, abs_diff)
+			loss = loss_mixer(adv_loss, dist_loss)
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 	
 		# ORACLE GRADIENT
-		elif method == AttackMethod.ORACLE_GRAD:
+		elif method in [ AttackMethod.ORACLE_GRAD,  AttackMethod.ORACLE_GRAD_DOWN,  AttackMethod.ORACLE_GRAD_UP]:
 			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
-			oracle_pred = self.scale_oracle(oracle_pred)
+
 			if self.loss_alpha is not None:
+				raise Exception("Sorry, not currently supported")
 				abs_diff = torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred)))
 				loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)	# use means for batches
 			else:
-				abs_diff = torch.abs(torch.sub(oracle_pred, cur_pred))
-				print(f'adv: {abs_diff} energy: {dist_loss}')
-				loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)	
+				# since there is a threshold in robust canny-ferrari, we need
+				# a two different modes to get the gradient we want
+				if method == AttackMethod.ORACLE_GRAD_UP or (method == AttackMethod.ORACLE_GRAD and oracle_pred > cur_pred):
+					abs_diff = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='quality_increase') - cur_pred
+				else :
+					abs_diff = cur_pred - grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='quality_decrease')
+				adv_loss = torch.sub(1.0, abs_diff)
+				loss = loss_mixer(adv_loss, dist_loss)	
+				print(f'adv: {adv_loss.item()} energy: {dist_loss.item()} loss: {loss.item()} gqcnn: {cur_pred.item()} rcf: {oracle_pred.item()} consis: {mesh_normal_consistency(adv_mesh)}')
 
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
@@ -190,12 +205,12 @@ class Attack:
 		else:
 			self.losses["prediction"].append(torch.sub(1.0, abs_diff).item())
 
-		self.losses["dist"].append(dist_loss.item()/100000)
+		self.losses["dist"].append((dist_loss/10000).item())
 		self.losses["index"].append(index)
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
 		self.track_qual["oracle quality"].append(oracle_pred.item())
 
-		return loss, eps_check
+		return loss, eps_check, dist_loss, adv_loss
 
 		# ignore regularization losses for now
 		# # WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
@@ -228,9 +243,9 @@ class Attack:
   
 		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
 		adv_mesh = mesh.offset_verts(param)
-		loss, eps_check = self.calc_loss(adv_mesh, grasp, method, index)
+		loss, eps_check,  dist_loss, adv_loss= self.calc_loss(adv_mesh, grasp, method, index)
 
-		return loss, adv_mesh, eps_check
+		return loss, adv_mesh, eps_check 
 
 	def attack_setup(self, dir, logfile, grasp, method):
 		"""Set up attack by saving info and resetting losses"""
@@ -367,25 +382,47 @@ class Attack:
 
 		# ratio between start and end when doing exponential backoff. 2 will take average, 10 will reduce step by 90%
 		backoff = 10
+		loss_last = 0
 		# ADVERSARIAL LOOP
+		# torch.autograd.set_detect_anomaly(True)
 		for i in range(1, self.num_steps):
 			attempts = 0 # used to decide whether to revert to previous mesh in param_safe
 			if not use_fixed_step:
 				optimizer.zero_grad()
 			while True:
+				fail = False
 				loss, adv_mesh, eps_check = self.perturb(mesh, param, grasp, method, i)
 				# check that both loss AND its derivative are finite, otherwise triggering backoff
 				if torch.isfinite(loss).item():
+					param_back = None # clear local cache variable
 					try:
 						loss.backward()
+						print(f'update mag: {torch.linalg.vector_norm(torch.nn.functional.normalize(param.grad).flatten()).item()}')
+						if torch.all(torch.isfinite(param.grad).flatten()).item() and loss.item() != loss_last:
+							# success, so we need to add current mesh to list in case of future reversion
+							param_back = param.detach().clone()
+							if not use_fixed_step:
+								optimizer.step()
+							else: 
+								param = (param - lr * torch.nn.functional.normalize(param.grad)).detach()
+								param.requires_grad_(requires_grad=True)
+						else:
+							fail=True
 					except:
+						fail=True
 						pass
 					else:
-						# success, so we need to add current mesh to list in case of future reversion
-						param_safe.append(param.detach().clone())
-						break
+						
+						if not fail and torch.any((param != param_back).flatten()).item() and torch.all(torch.isfinite(param).flatten()).item():
+							loss_last = loss.item()
+							param_safe.append(param.detach().clone())
+							
+							# no infs, we can compute loss
+							break
+						
+
 				print(f'reducing param diff by {backoff}, try {attempts}')
-				if attempts > 5:
+				if attempts > 5 or not torch.all(torch.isfinite(param).flatten()).item():
 					print(f'resetting with {len(param_safe)}')
 					attempts = 0
 					param = param_safe.pop(-1)
@@ -397,11 +434,7 @@ class Attack:
 					optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 					optimizer.zero_grad()
 			
-			if not use_fixed_step:
-				optimizer.step()
-			else: 
-				param = (param - lr * torch.nn.functional.normalize(param.grad)).detach()
-				param.requires_grad_(requires_grad=True)
+
 
 			if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
 				# snapshot
@@ -432,6 +465,8 @@ class Attack:
 		# different mesh volumes for considering change
 		vol_mesh, vol_bounding, vol_hull = get_volumes(mesh)
 		mesh_file = dir + f"it-{iteration}.obj"
+		grasp_file = dir + f"it-{iteration}-grasp.obj"
+		grasp.write_grasp_pytorch(mesh, self.renderer, path=grasp_file)
 		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		image = self.renderer.render_mesh(mesh, display=False)
 
@@ -442,7 +477,7 @@ class Attack:
 			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=False)
 		else:
 			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=True)
-		oracle_qual_scaled = self.scale_oracle(oracle_qual).item()
+		oracle_qual_scaled = oracle_qual.item()
 		if orig_pdim is not None: depth_diff = orig_pdim - processed_dim
 
 		# RANDOM FUZZ ONLY
@@ -468,8 +503,8 @@ class Attack:
 			self.renders_list = []
 
 
-		if not save_mesh:
-			os.remove(mesh_file)
+		# if not save_mesh:
+		# 	os.remove(mesh_file)
 
 		# add info to logfile
 		oracle_qual = oracle_qual.item()
