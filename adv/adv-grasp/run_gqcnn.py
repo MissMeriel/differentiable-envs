@@ -531,7 +531,7 @@ def test_run():
 		device = torch.device("cpu")
 
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
-	grasp = Grasp(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929)
+	grasp = Grasp(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929, device=device)
 
 	# load input tensors from gqcnn library for prediction
 	pose0 = torch.from_numpy(np.load("data/pose_tensor1_raw.npy")).float().to(device)
@@ -541,7 +541,7 @@ def test_run():
 	pose1, image1 = grasp.extract_tensors(depth0)
 
 	# tensors from pytorch extraction & pytorch depth image
-	renderer = Renderer()
+	renderer = Renderer(device=device)
 	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
 	pose2, image2 = grasp.extract_tensors(dim)
@@ -552,7 +552,7 @@ def test_run():
 	pose3, image3 = grasp.extract_tensors(dim2)
 
 	# instantiate GQCNN PyTorch model
-	model = KitModel("weights.npy")
+	model = KitModel("weights.npy",device=device)
 	model.eval()
 
 	# instantiate Attack class and run prediction

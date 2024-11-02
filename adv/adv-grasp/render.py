@@ -33,16 +33,17 @@ class Renderer:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, renderer=None, rasterizer=None, raster_settings=None, camera=None, lights=None):
+	def __init__(self, renderer=None, rasterizer=None, raster_settings=None, camera=None, lights=None, device=None):
 
-		# set PyTorch device, use cuda if available
-		if torch.cuda.is_available():
-			self.device = torch.device("cuda:0")
-			torch.cuda.set_device(self.device)
-		else:
-			print("cuda not available")
-			self.device = torch.device("cpu")
-
+		if device is None:
+			# set PyTorch device, use cuda if available
+			if torch.cuda.is_available():
+				device = torch.device("cuda:0")
+				torch.cuda.set_device(device)
+			else:
+				print("cuda not available")
+				device = torch.device("cpu")
+		self.device = device
 		if lights:
 			self.lights = lights
 		else:

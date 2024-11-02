@@ -27,9 +27,17 @@ class KitModel(nn.Module):
 
         return im_arr, pose_arr
         
-    def __init__(self, weight_file):
+    def __init__(self, weight_file, device=None):
+        if device is None:
+			# set PyTorch device, use cuda if available
+            if torch.cuda.is_available():
+                device = torch.device("cuda:0")
+                torch.cuda.set_device(self.device)
+            else:
+                print("cuda not available")
+                device = torch.device("cpu")
         super(KitModel, self).__init__()
-        global _weights_dict
+
         self.__load_weights(weight_file)
         parent = os.path.dirname(weight_file)
 
@@ -45,13 +53,6 @@ class KitModel(nn.Module):
         with open(os.path.join(parent,'variables.pkl'), 'rb') as file:
             variables_to_load = pickle.load(file)
         _other_weights = {name: torch.from_numpy(var) for name, var in zip(names, variables_to_load)}
-
-        if torch.cuda.is_available():
-            device = torch.device("cuda:0")
-            torch.cuda.set_device(device)
-        else:
-            print("cuda not available")
-            device = torch.device("cpu")
 
         # make sizes compatible with PyTorch
         _other_weights["conv1_1b"] = _other_weights["conv1_1b"].unsqueeze(0).unsqueeze(2).unsqueeze(3).to(device)
