@@ -1123,11 +1123,14 @@ class Grasp:
 				else: contact_points = None
 				
 				width = torch.tensor([[0.05]], device=self.device)
-				grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+				grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, 
+							 camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, 
+							 friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 				
 				try:
 					com_qual_func = qual_class(config_dict)
-					quality = com_qual_func.quality(mesh, grasp_torch).float().item()
+					quality = com_qual_func.quality(mesh, grasp_torch, 
+									 is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().item()
 				except QhullError:
 					quality =  0.0
 

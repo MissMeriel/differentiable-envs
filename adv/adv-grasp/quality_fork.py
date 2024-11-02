@@ -143,10 +143,16 @@ class GraspTorch(object):
         sphere_list = [trimesh.transformations.translation_matrix(self.center3D.reshape((3,)).numpy(force=True))]
         sphere_radius = self.finger_radius
         sphere_colors = [[255, 0, 255],[255, 0, 0],[0, 0, 255]]
+        mesh_list = []
         if self.contact_points is not None:
             contact_np = self.contact_points.reshape((2,3)).numpy(force=True)
             for i in [0,1]:
                 sphere_list.append(trimesh.transformations.translation_matrix(contact_np[i,:]))
+                if self.contact_normals is not None:
+                    normal_dir_np = self.contact_normals.reshape((2,3)).numpy(force=True)[i,:]
+                    normal_points_np = np.concatenate((contact_np[(i,),:], contact_np[(i,),:]+normal_dir_np*sphere_radius*2),axis=0)
+                    mesh_list.append(trimesh.creation.cylinder(segment=normal_points_np, radius=sphere_radius/10))
+                    mesh_list[-1].visual.face_colors = sphere_colors[i+1]
         # if self.camera_intr is not None:
         #     transform_np = self.tform_to_camera.numpy(force=True)
         #     trimesh_cam = trimesh.scene.Camera(focal=self.camera_intr.focal_length.reshape(2).numpy(force=True))
@@ -154,7 +160,7 @@ class GraspTorch(object):
         #     cam_mesh = trimesh.util.concatenate(cam_list)
         #     cam_mesh = cam_mesh.apply_transform(transform_np)
 
-        mesh_list = []
+        
         for i in range(len(sphere_list)):
             mesh_list.append(trimesh.creation.uv_sphere(transform=sphere_list[i],radius=sphere_radius))
             mesh_list[-1].visual.face_colors = sphere_colors[i]      
@@ -408,7 +414,7 @@ class GraspTorch(object):
         return friction_cone
 
         
-    def apply_to_mesh(self, mesh, contact_points=None, ignore_backface_check=False): 
+    def apply_to_mesh(self, mesh, contact_points=None, ignore_backface_check=False, is_watertight=True, is_inverted=False): 
         """Compute where grasp contacts a mesh, state is meshes pytorch3D object"""
             # for grasp in grasp 
         # for each ray (2)
@@ -466,9 +472,12 @@ class GraspTorch(object):
         # (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(self.contact_points, mesh)
         normsContinuous = GraspTorch.avgSphereArcNormal(mesh, self.contact_points)
 
-        # optional correction if allowing mesh backfaces (vertex order reversed)
-        if(ignore_backface_check):
+        # optional correction if allowing mesh backfaces (some vertex order reversed)
+        if(ignore_backface_check or not is_watertight):
             normsContinuous = normsContinuous * -torch.sign(torch.sum(normsContinuous * ray_d, dim=-1,keepdim=True))
+        # optional correction if we know that all vertices have order reversed
+        elif(is_inverted):
+            normsContinuous = -normsContinuous
         # normsDexnet = self.svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
         # normsSphereAvg = self.avgSpherePoints(state, idxs_face, masks, self.contact_points)
         #torch.mean(verts, dim=-2,keepdim=True)
@@ -480,7 +489,7 @@ class GraspTorch(object):
         self.applied_to_object = contactFound.item()
         self.contact_normals = normsContinuous
         self.mesh = mesh
-        self.object_com = compute_mesh_COM(mesh)
+        self.object_com = compute_mesh_COM(mesh,is_watertight=is_watertight)
         self.faces_index = faces_index
         return self
 
@@ -553,7 +562,8 @@ class GraspTorch(object):
         return idxs_face, dists, face_edge_shared
 
     @staticmethod
-    def avgSphereArcNormal(mesh, surface_point):
+    def avgSphereArcNormal(mesh, surface_point, drop_opposite_normals=True):
+        # Assumes that nearby triangles have same winding. If winding is inconsistent, mean will be weird
         radius,_ = GraspTorch.dexnetRadius(mesh)
         verts_packed = mesh.verts_packed()
         faces_packed = mesh.faces_packed()
@@ -718,7 +728,18 @@ class GraspTorch(object):
 
         # solution 1: smoother weighted average normal
         arc_mass_per_face = torch.sum(arc_mass,dim=-1,keepdim=True)
-        normalContribution = mesh.faces_normals_packed().reshape(rm_shape[:-1]) * arc_mass_per_face
+        
+        face_normals_reshape = mesh.faces_normals_packed().reshape(rm_shape[:-1]).expand(torch.broadcast_shapes(arc_mass_per_face.size(),rm_shape[:-1]))
+        # optional check for normals that are opposite the one at the collision point, and therefore don't contribute to overall normal
+        if drop_opposite_normals:
+            collision_faces_index = torch.argmax(torch.all(contact_is_above_line,dim=-1,keepdim=True).to(dtype=torch.uint8),dim=-2,keepdim=True)
+            collision_faces_size = list(collision_faces_index.shape)[:-1] + [3]
+            collision_faces_index = collision_faces_index.expand(collision_faces_size)
+            collision_faces = torch.gather(face_normals_reshape,-2, collision_faces_index)
+            dots = torch.linalg.vecdot(collision_faces, face_normals_reshape)
+            arc_mass_per_face[dots < 0] = 0
+            
+        normalContribution = face_normals_reshape * arc_mass_per_face
         surface_normals_avg = torch.nn.functional.normalize(torch.sum(normalContribution,dim=-2), dim=-1)
 
         # # solution 2: more dexnet like, SVD on intersections. Does weird stuff at corners
@@ -847,9 +868,24 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         return (self.friction_cone_angle(action) <
                 self._max_friction_cone_angle)
 
+def compute_mesh_tri_areas(mesh):
+    """Compute the area of each mesh triangle, using mean as 4th point. Used in CoM/Volume for non-watertight"""
+    
+    verts_tri = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
+    com_per_triangle = torch.mean(verts_tri, 1) 
+
+    verts = mesh.verts_packed()
+    verts.requires_grad_(True)
+    # compute all edge vectors
+    edges_tri = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, edge, xyz
+    area_per_triangle = torch.linalg.cross(edges_tri[:,0,:],edges_tri[:,1,:])
+
+    return area_per_triangle, com_per_triangle
+
+    
 
 def compute_mesh_tetra_volumes(mesh):
-    """Compute the volume of each mesh tetra, using mean as 4th point. Used in CoM/Volume"""
+    """Compute the volume of each mesh tetra, using mean as 4th point. Used in CoM/Volume for watertight"""
     #https://forums.cgsociety.org/t/how-to-calculate-center-of-mass-for-triangular-mesh/1309966
     mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
     # B, F, 3, 3
@@ -879,7 +915,7 @@ def compute_mesh_bounding_volume(mesh):
     return torch.prod(ranges,dim=-1)
 
 def compute_mesh_volume(mesh, ignore_backface_check=False):
-    """Compute the center of mass for a mesh, assume uniform density."""
+    """Compute the volume for a mesh, assume uniform density."""
     vol_per_triangle,_ = compute_mesh_tetra_volumes(mesh)
     if ignore_backface_check:
         vol_per_triangle = torch.abs(vol_per_triangle)
@@ -900,20 +936,21 @@ def compute_mesh_hull_volume(mesh):
     # construct mesh
 
 
-def compute_mesh_COM(mesh): 
+def compute_mesh_COM(mesh, is_watertight=True): 
     """Compute the center of mass for a mesh, assume uniform density."""
-
-    vol_per_triangle, com_per_triangle = compute_mesh_tetra_volumes(mesh)
-
-    
+    if is_watertight:
+        vol_per_triangle, com_per_triangle = compute_mesh_tetra_volumes(mesh)
+    else:
+        vol_per_triangle, com_per_triangle = compute_mesh_tri_areas(mesh)
 
     com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / torch.sum(vol_per_triangle)
 
     return com
 
-class mesh_unconnectivity:
+class mesh_properties:
     def __init__(self, mesh):
-        """Find all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
+        """Find properties of a mesh, including topology, watertightness, and handedness
+           topology is all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
 
         # find mapping between vertices and all faces they're part of
         faces = mesh.faces_packed()
@@ -967,6 +1004,13 @@ class mesh_unconnectivity:
         edge_indices = edges_per_face[vert_faces_indices[0], edge_indices_in_face]
         self.edge_unconnectivity = torch.cat((vert_faces_indices[1].unsqueeze(0), edge_indices.unsqueeze(0)),dim=0)
         
+        self.is_watertight = all([len(edge_faces) % 2==0 for edge_faces in inverseFaceEdgeMap])
+
+        if self.is_watertight:
+            volume = compute_mesh_volume(mesh, ignore_backface_check=False)
+            self.is_inverted = volume.item() < 0
+        else:
+            self.is_inverted = False
 
 def self_collision(mesh, unconnectivity, forceNormalDist=True):
     # function to compute the distance between all specified triangles pairs in a mesh.
@@ -1358,7 +1402,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         ParallelJawQualityFunction.__init__(self, config)
 
 
-    def quality(self, state, actions):
+    def quality(self, state, actions, is_watertight=True, is_inverted=False):
         """Given a batch of parallel-jaw grasps, compute the minimum magnitude external
         wrench required to disrupt the grasp.
 
@@ -1378,8 +1422,9 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         """
         if actions.applied_to_object is False :
             with record_function("solveForIntersection"):
-                actions = actions.apply_to_mesh(state)
+                actions = actions.apply_to_mesh(state, is_watertight=is_watertight, is_inverted=is_inverted)
         if actions.applied_to_object is False :
+            # no intersection found, just return 0 quality
             return torch.zeros_like(actions.axis3D[...,0])
         self.Mesh = state
         self.Grasps = actions
@@ -1487,7 +1532,7 @@ class RobustCannyFerrariQualityFunction(CannyFerrariQualityFunction):
         self.min_quality = min_quality
         CannyFerrariQualityFunction.__init__(self, config)
 
-    def quality(self, state, actions, mode='actual'):
+    def quality(self, state, actions, mode='actual', is_watertight=True, is_inverted=False):
         """Given a parallel-jaw grasp, the probability that grasps near it 
         reference grasp will have high Canny Ferrari quality.
 
@@ -1509,8 +1554,8 @@ class RobustCannyFerrariQualityFunction(CannyFerrariQualityFunction):
             Array of the quality for each grasp.
         """
         # 
-        noised_grasps = actions.generateNoisyGrasps(25).apply_to_mesh(state, ignore_backface_check=False)
-        noised_tensor = super().quality(state, noised_grasps)
+        noised_grasps = actions.generateNoisyGrasps(25).apply_to_mesh(state, ignore_backface_check=False, is_watertight=is_watertight, is_inverted=is_inverted)
+        noised_tensor = super().quality(state, noised_grasps, is_watertight=is_watertight, is_inverted=is_inverted)
         if mode == 'actual':
             qual_tensor = torch.mean((noised_tensor > self.min_quality).float())
         elif mode == 'quality_increase':
@@ -1756,7 +1801,7 @@ def test_quality():
         faces=[faces.to(device)],
         textures=textures
     )
-    unconnectivity = mesh_unconnectivity(mesh)
+    unconnectivity = mesh_properties(mesh)
     # with record_function("distfunction"):
         # print(self_collision(mesh, unconnectivity,forceNormalDist=False))
     with record_function("distfunction_n"):
@@ -2059,7 +2104,7 @@ def test_dist():
         faces=[faces.to(device)],
         textures=textures
     )
-    unconnectivity = mesh_unconnectivity(mesh)
+    unconnectivity = mesh_properties(mesh)
     distances,barys = self_collision(mesh, unconnectivity,forceNormalDist=False)
     print(distances)
 
