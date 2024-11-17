@@ -98,6 +98,83 @@ class GraspTorch(object):
         if contact_normals is not None:
             self.contact_normals = contact_normals.double()
 
+    def __getitem__(self,key):
+        if isinstance(key, np.ndarray) or torch.is_tensor(key) or isinstance(key, slice):
+
+
+            if torch.numel(self.center3D[...,0]) > 1:
+                center = self.center3D[key]
+            else:
+                center = self.center3D
+            
+
+
+            if torch.is_tensor(self.axis3D) and torch.numel(self.axis3D[...,0]) > 1 :
+                axis3D = self.axis3D[key]
+            else:
+                axis3D = self.axis3D
+            
+            width = self.width
+            
+            camera_intr=self.camera_intr
+            num_cone_faces=self.num_cone_faces
+            friction_coef=self.friction_coef
+            torque_scaling=self.torque_scaling
+            
+            if hasattr(self, 'contact_points'):
+                contact_points = self.contact_points[:,key]
+            else:
+                contact_points = None
+
+            if hasattr(self, 'contact_normals'):
+                contact_normals = self.contact_normals[:,key]
+            else:
+                contact_normals = None       
+
+            sliced = GraspTorch(center,
+                 width=width,
+                 camera_intr=camera_intr,
+                 contact_points=contact_points,
+                 contact_normals=contact_normals,
+                 axis3D=axis3D,
+                 num_cone_faces=num_cone_faces, 
+                 friction_coef=friction_coef,
+                 torque_scaling=torque_scaling)
+            
+            # if grasp was 2D, add the 2D info back in
+            if hasattr(self,'center'):
+                if torch.numel(self.center[...,0]) > 1:
+                    sliced.center = self.center[key]
+                else:
+                    sliced.center = self.center
+
+
+                if torch.is_tensor(self.angle) and torch.numel(self.angle[...,0]) > 1:
+                    sliced.angle = self.angle[key]
+                else:
+                    sliced.angle = self.angle
+
+                if torch.is_tensor(self.depth) and torch.numel(self.depth[...,0]) > 1 :
+                    sliced.depth = self.depth[key]
+                else:
+                    sliced.depth = self.depth
+
+            if hasattr(self, 'mesh'):
+                sliced.mesh = self.mesh
+            if hasattr(self, 'object_com'):
+                sliced.object_com = self.object_com
+            if hasattr(self, 'contact_mask'):
+                contact_mask = torch.zeros_like(self.contact_mask)
+                contact_inds = torch.nonzero(self.contact_mask.flatten()).squeeze(-1)
+                contact_mask[contact_inds[key]] = 1
+                sliced.contact_mask = contact_mask
+
+            sliced.applied_to_object = self.applied_to_object
+            return sliced
+        
+    def __len__(self,):
+        return self.axis3D[...,0].size
+
     def make2D(self, updateCamera=False,camera_intr=None):
         if camera_intr==None:
             camera_intr = self.camera_intr
@@ -144,21 +221,26 @@ class GraspTorch(object):
         sphere_radius = self.finger_radius
         sphere_colors = [[255, 0, 255],[255, 0, 0],[0, 0, 255]]
         mesh_list = []
-        if self.contact_points is not None:
+        if hasattr(self,'contact_points') and self.contact_points is not None:
             contact_np = self.contact_points.reshape((2,3)).numpy(force=True)
             for i in [0,1]:
                 sphere_list.append(trimesh.transformations.translation_matrix(contact_np[i,:]))
-                if self.contact_normals is not None:
-                    normal_dir_np = self.contact_normals.reshape((2,3)).numpy(force=True)[i,:]
-                    normal_points_np = np.concatenate((contact_np[(i,),:], contact_np[(i,),:]+normal_dir_np*sphere_radius*2),axis=0)
-                    mesh_list.append(trimesh.creation.cylinder(segment=normal_points_np, radius=sphere_radius/10))
-                    mesh_list[-1].visual.face_colors = sphere_colors[i+1]
-        # if self.camera_intr is not None:
-        #     transform_np = self.tform_to_camera.numpy(force=True)
-        #     trimesh_cam = trimesh.scene.Camera(focal=self.camera_intr.focal_length.reshape(2).numpy(force=True))
-        #     cam_list = trimesh.creation.camera_marker(trimesh_cam)
-        #     cam_mesh = trimesh.util.concatenate(cam_list)
-        #     cam_mesh = cam_mesh.apply_transform(transform_np)
+                if hasattr(self,'contact_normals') and self.contact_normals is not None:
+                    try:
+                        normal_dir_np = self.contact_normals.reshape((2,3)).numpy(force=True)[i,:]
+                        normal_points_np = np.concatenate((contact_np[(i,),:], contact_np[(i,),:]+normal_dir_np*sphere_radius*2),axis=0)
+                        mesh_list.append(trimesh.creation.cylinder(segment=normal_points_np, radius=sphere_radius/10))
+                        mesh_list[-1].visual.face_colors = sphere_colors[i+1]
+                    except:
+                        print(f'failed to save normals {self.contact_normals}')
+        if hasattr(self,'camera_intr') and self.camera_intr is not None:
+            transform_np = self.camera_intr.get_world_to_view_transform().inverse().get_matrix().reshape((4,4)).transpose(0,1).numpy(force=True)
+            trimesh_cam = trimesh.scene.Camera(focal=self.camera_intr.focal_length.reshape(2).numpy(force=True),
+                                               resolution=self.camera_intr.image_size.reshape(2).numpy(force=True))
+            cam_list = trimesh.creation.camera_marker(trimesh_cam, origin_size=sphere_radius*2)
+            cam_mesh = trimesh.util.concatenate(cam_list)
+            cam_mesh = cam_mesh.apply_transform(transform_np)
+            mesh_list.append(cam_mesh)
 
         
         for i in range(len(sphere_list)):
@@ -169,7 +251,7 @@ class GraspTorch(object):
         if include_line_o_action:
             p1,p2 = self.endpoints3D
             endpoints_np = np.concatenate((p1.reshape(1,3).numpy(force=True),p2.reshape(1,3).numpy(force=True)))
-            mesh_list.append(trimesh.creation.cylinder(segment=endpoints_np, radius=sphere_radius/10))
+            mesh_list.append(trimesh.creation.cylinder(segment=endpoints_np, radius=sphere_radius/20))
             mesh_list[-1].visual.face_colors = [255, 0, 255]
 
         merged_mesh = trimesh.util.concatenate(mesh_list)
@@ -414,7 +496,7 @@ class GraspTorch(object):
         return friction_cone
 
         
-    def apply_to_mesh(self, mesh, contact_points=None, ignore_backface_check=False, is_watertight=True, is_inverted=False): 
+    def apply_to_mesh(self, mesh, contact_points=None, ignore_backface_check=False, is_watertight=True, is_inverted=False, use_dexnet_normal=False): 
         """Compute where grasp contacts a mesh, state is meshes pytorch3D object"""
             # for grasp in grasp 
         # for each ray (2)
@@ -451,12 +533,13 @@ class GraspTorch(object):
             # (n_rays, n_faces)
             min_out = torch.min(t, -1,keepdim=True)
 
-            intersectionPoints = ray_o + ray_d * min_out.values
+            contact_points = ray_o + ray_d * min_out.values
             faces_index = min_out.indices
-            contactFound = torch.all(torch.logical_not(torch.isinf(min_out.values)))
-            self.contact_points = intersectionPoints
+            grasps_in_contact = torch.all(torch.all(torch.logical_not(torch.isinf(min_out.values)),dim=-1),dim=0)
+            contact_points = contact_points[:,grasps_in_contact]
         else:
-            self.contact_points = contact_points
+            grasps_in_contact = torch.ones(contact_points[...,-1,-1].shape,device=contact_points.device, dtype=torch.bool)
+        
         
         #verts = mesh.verts_packed()[mesh.faces_packed()[faces_index,:]]
         # experimental, weighted vertex normals
@@ -469,29 +552,50 @@ class GraspTorch(object):
         #normsVert = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
         # verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
         # vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = mesh.faces_normals_packed()[faces_index,:]
-        # (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(self.contact_points, mesh)
-        normsContinuous = GraspTorch.avgSphereArcNormal(mesh, self.contact_points)
+        if use_dexnet_normal:
+            (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(contact_points, mesh)
+            normsEstimated = self.svdSpherePointsNormal(contact_points, sphereDirs, masks, ray_d)
+        else:
+            normsEstimated = GraspTorch.avgSphereArcNormal(mesh, contact_points)
 
         # optional correction if allowing mesh backfaces (some vertex order reversed)
         if(ignore_backface_check or not is_watertight):
-            normsContinuous = normsContinuous * -torch.sign(torch.sum(normsContinuous * ray_d, dim=-1,keepdim=True))
+            normsEstimated = normsEstimated * -torch.sign(torch.sum(normsEstimated * ray_d, dim=-1,keepdim=True))
         # optional correction if we know that all vertices have order reversed
         elif(is_inverted):
-            normsContinuous = -normsContinuous
-        # normsDexnet = self.svdSpherePoints(self.contact_points, sphereDirs, masks, ray_d)
+            normsEstimated = -normsEstimated
+
+        if is_watertight:
+            contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d, dim=-1) < 0 ,dim=0)# dot product of normal and finger should be opposite, less than 0
+            grasps_in_contact = torch.logical_and(grasps_in_contact,  contact_is_outside)
+            contact_points = contact_points[:,contact_is_outside]
+            normsEstimated = normsEstimated[:,contact_is_outside]
+        
+
+        grasp_with_contact = self[grasps_in_contact]
         # normsSphereAvg = self.avgSpherePoints(state, idxs_face, masks, self.contact_points)
         #torch.mean(verts, dim=-2,keepdim=True)
         #vertex_normals.scatter_( state.faces_normals_packed()[faces_index,:])
         # TODO, update to use built in https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/ops/interp_face_attrs.html
         #self.contact_normals = (torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2) + torch.squeeze(state.faces_normals_packed()[faces_index,:],-2))/2
         normsFace = torch.squeeze(mesh.faces_normals_packed()[faces_index,:],-2)
-        self.face_normals = normsFace
-        self.applied_to_object = contactFound.item()
-        self.contact_normals = normsContinuous
-        self.mesh = mesh
-        self.object_com = compute_mesh_COM(mesh,is_watertight=is_watertight)
-        self.faces_index = faces_index
-        return self
+        grasp_with_contact.contact_mask = grasps_in_contact
+        grasp_with_contact.face_normals = normsFace
+        grasp_with_contact.applied_to_object = True
+        grasp_with_contact.contact_points = contact_points
+        grasp_with_contact.contact_normals = normsEstimated
+        grasp_with_contact.mesh = mesh
+        grasp_with_contact.object_com = compute_mesh_COM(mesh,is_watertight=is_watertight)
+        grasp_with_contact.faces_index = faces_index
+
+        return grasp_with_contact
+
+    @property
+    def count_misses(self):
+        if hasattr(self, 'contact_mask'):
+            return torch.count_nonzero(torch.logical_not(self.contact_mask))
+        else:
+            return float('nan')
 
     @staticmethod
     def dexnetRadius(mesh, gridDist=1.5):
@@ -562,7 +666,7 @@ class GraspTorch(object):
         return idxs_face, dists, face_edge_shared
 
     @staticmethod
-    def avgSphereArcNormal(mesh, surface_point, drop_opposite_normals=True):
+    def avgSphereArcNormal(mesh, surface_point, drop_opposite_normals=False):
         # Assumes that nearby triangles have same winding. If winding is inconsistent, mean will be weird
         radius,_ = GraspTorch.dexnetRadius(mesh)
         verts_packed = mesh.verts_packed()
@@ -783,15 +887,15 @@ class GraspTorch(object):
     #     normals = normals.reshape(surface_point.shape)
     #     return normals
 
-    # @staticmethod
-    # def svdSpherePointsNormal(self, surface_point, sphereDirs, masks, in_rays):
+    @staticmethod
+    def svdSpherePointsNormal(surface_point, sphereDirs, masks, in_rays):
 
-    #     normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-    #     for maskInd in range(len(masks)):
-    #         (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
-    #         normals[maskInd,:] = V[:, -1]
-    #     normals = normals.reshape(surface_point.shape)
-    #     return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
+        normals = torch.zeros_like(surface_point).reshape((len(masks),3))
+        for maskInd in range(len(masks)):
+            (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
+            normals[maskInd,:] = V[:, -1]
+        normals = normals.reshape(surface_point.shape)
+        return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
 
 
     @property
@@ -816,6 +920,31 @@ class GraspQualityFunction():    #ABC):
     def __call__(self, state, actions, params=None):
         """Evaluates grasp quality for a set of actions given a state."""
         return self.quality(state, actions, params)
+    
+    def savemat(self, path, other_items=None):
+        # TODO move to grasp object and call there, passing quality as a dict
+        # collects a dictionary of interesting internal state, then saves it
+        dict_to_save = {}
+        if self.Grasps is not None:
+            dict_to_save['axis3D'] = self.Grasps.axis3D.numpy(force=True)
+            dict_to_save['center3D'] = self.Grasps.center3D.numpy(force=True)
+            dict_to_save['contact_points']= self.Grasps.contact_points.numpy(force=True)
+            dict_to_save['contact_normals']= self.Grasps.contact_normals.numpy(force=True)
+            dict_to_save['face_normals']= self.Grasps.face_normals.numpy(force=True)
+            dict_to_save['object_com'] = self.Grasps.object_com.numpy(force=True)
+            dict_to_save['faces_index'] =self.Grasps.faces_index.numpy(force=True)
+            dict_to_save['grasp_matrix'] = self.Grasps.grasp_matrix.numpy(force=True)
+            ep0, ep1 = self.Grasps.endpoints3D
+            dict_to_save['endpoints3D'] =torch.cat((ep0.unsqueeze(0),ep1.unsqueeze(0)),dim=0).numpy(force=True)
+
+        if other_items is not None:
+            dict_to_save = dict_to_save | other_items
+        if hasattr(self, 'quality_cache'):
+            dict_to_save['quality'] = self.quality_cache.numpy(force=True)
+
+        savemat(path, dict_to_save)
+
+        return
 
     #@abstractmethod
     def quality(self, state, actions, params=None):
@@ -878,7 +1007,7 @@ def compute_mesh_tri_areas(mesh):
     verts.requires_grad_(True)
     # compute all edge vectors
     edges_tri = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, edge, xyz
-    area_per_triangle = torch.linalg.cross(edges_tri[:,0,:],edges_tri[:,1,:])
+    area_per_triangle = torch.linalg.norm(torch.linalg.cross(edges_tri[:,0,:],edges_tri[:,1,:]),dim=-1,keepdim=True)/2
 
     return area_per_triangle, com_per_triangle
 
@@ -944,7 +1073,9 @@ def compute_mesh_COM(mesh, is_watertight=True):
         vol_per_triangle, com_per_triangle = compute_mesh_tri_areas(mesh)
 
     com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / torch.sum(vol_per_triangle)
-
+    if not torch.any(torch.isfinite(com.flatten())):
+        raise Exception("com computation diverged")
+        breakpoint()
     return com
 
 class mesh_properties:
@@ -952,6 +1083,24 @@ class mesh_properties:
         """Find properties of a mesh, including topology, watertightness, and handedness
            topology is all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
 
+        
+        self.compute_connectivity(mesh)
+        # initially set using a manifold check during connectivity. This also checks for self collision, but that is very expensive for large meshes
+        # self.is_watertight = self.is_watertight and self_collision_min(mesh.detach(), self, forceNormalDist=0) > 0
+
+
+        if self.is_watertight:
+            volume = compute_mesh_volume(mesh, ignore_backface_check=False)
+            bounding_volume = compute_mesh_bounding_volume(mesh)
+            if abs(volume) < bounding_volume * 1e-8 or abs(volume) > bounding_volume:
+                self.is_watertight = False
+                self.is_inverted = False
+            else:
+                self.is_inverted = volume.item() < 0
+        else:
+            self.is_inverted = False
+        
+    def compute_connectivity(self, mesh):
         # find mapping between vertices and all faces they're part of
         faces = mesh.faces_packed()
         inverseFaceMap = [[] for _ in range(mesh._V)]
@@ -1003,14 +1152,9 @@ class mesh_properties:
         edge_indices_in_face = connectivity_vert_ind[vert_faces_indices]
         edge_indices = edges_per_face[vert_faces_indices[0], edge_indices_in_face]
         self.edge_unconnectivity = torch.cat((vert_faces_indices[1].unsqueeze(0), edge_indices.unsqueeze(0)),dim=0)
-        
-        self.is_watertight = all([len(edge_faces) % 2==0 for edge_faces in inverseFaceEdgeMap])
 
-        if self.is_watertight:
-            volume = compute_mesh_volume(mesh, ignore_backface_check=False)
-            self.is_inverted = volume.item() < 0
-        else:
-            self.is_inverted = False
+        self.is_watertight = all([len(edge_faces) % 2==0 for edge_faces in inverseFaceEdgeMap])
+            
 
 def self_collision(mesh, unconnectivity, forceNormalDist=True):
     # function to compute the distance between all specified triangles pairs in a mesh.
@@ -1027,7 +1171,7 @@ def self_collision(mesh, unconnectivity, forceNormalDist=True):
 
     # useful for debugging
     # torch.autograd.set_detect_anomaly(True)
-
+ 
     # since forceNormalDist is not symmetric, we need to duplicate the list of pairs, with the order swapped
     if forceNormalDist:
         tri_unconnectivity = torch.cat((unconnectivity.tri_unconnectivity,torch.flip(unconnectivity.tri_unconnectivity,[0])),dim=1)
@@ -1036,10 +1180,64 @@ def self_collision(mesh, unconnectivity, forceNormalDist=True):
     edge_unconnectivity = unconnectivity.edge_unconnectivity
     vert_unconnectivity = unconnectivity.vert_unconnectivity
 
+    quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri = __assemble_quad_terms(mesh, tri_unconnectivity, edge_unconnectivity, vert_unconnectivity, forceNormalDist)
+    # build inequality constraints: solution falls in triangle (or along edge)
+
+    # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
+    bary_G_tri = torch.cat((-torch.eye(4,device=mesh.device),
+                        torch.tensor([[1,1,0,0]],device=mesh.device),
+                        torch.tensor([[0,0,1,1]],device=mesh.device)), dim=0)
+    bary_h_tri = torch.tensor([1/3,1/3,1/3,1/3,1/3,1/3],device=mesh.device)
+
+    bary_G_edg = torch.cat((-torch.eye(3,device=mesh.device),
+                        torch.tensor([[1,1,0]],device=mesh.device),
+                        torch.tensor([[0,0,1]],device=mesh.device)), dim=0)
+    # center for edge is at [0.5, 0], so slight tweak
+    bary_h_edg = torch.tensor([1/3,1/3,1/2,1/3,1/2],device=mesh.device)
+
+    bary_G_vtx = torch.cat((-torch.eye(2,device=mesh.device),
+                        torch.tensor([[1,1]],device=mesh.device)), dim=0)
+    bary_h_vtx = torch.tensor([1/3,1/3,1/3],device=mesh.device)
+
+    equality_A_edg =  torch.tensor([],device=mesh.device) 
+    equality_b_edg =  torch.tensor([],device=mesh.device) 
+
+    equality_A_vtx =  torch.tensor([],device=mesh.device) 
+    equality_b_vtx =  torch.tensor([],device=mesh.device) 
+
+    # solve qp with our custom wrapper. It returns distance, in addition to solution
+    # it also, in the forceNormalDist case, replaces distance with inf when solution does not exist
+    dist_all_tri, bary_coords_tri = __qp_bary_feasible(quadratic_term_tri, linear_term_tri, const_term_tri, equality_A_tri, equality_b_tri, bary_G_tri, bary_h_tri)
+
+    dist_all_edg, bary_coords_edg = __qp_bary_feasible(quadratic_term_edg, linear_term_edg, const_term_edg, equality_A_edg, equality_b_edg, bary_G_edg, bary_h_edg)
+    
+    dist_all_vtx, bary_coords_vtx = __qp_bary_feasible(quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_vtx, equality_b_vtx, bary_G_vtx, bary_h_vtx)
+
+    # for ease of use outside of this function, we go back to traditional bary-centric coordinates before returning
+    # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
+    # traiditional barycentric 1/3,1/3,1/3 is center and 0,0,0 is corner0
+
+    bary_coords_tri_corrected = bary_coords_tri + 1/3
+
+    # center for edge is at [0.5, 0], so slight tweak
+    # correct first two by 1/3, 3rd by 1/2, add zero column
+    bary_coords_edg_corrected = torch.cat((bary_coords_edg + torch.tensor([[1/3,1/3,1/2]],device=bary_coords_edg.device), torch.zeros_like(bary_coords_edg[:,0:1])),dim=1)
+
+    # correct first two by 1/3, add 2 zero columns
+    bary_coords_vtx_corrected =  torch.cat((bary_coords_vtx + 1/3, torch.zeros_like(bary_coords_vtx)),dim=1)
+
+    # cat all before returning
+    dist_all = torch.cat((dist_all_tri,dist_all_edg,dist_all_vtx),dim=0)
+    bary_coords_corrected = torch.cat((bary_coords_tri_corrected, bary_coords_edg_corrected, bary_coords_vtx_corrected),dim=0)
+
+    return dist_all, bary_coords_corrected
+
+def __assemble_quad_terms(mesh, tri_unconnectivity, edge_unconnectivity, vert_unconnectivity, forceNormalDist):   
     verts = mesh.verts_packed()
     verts.requires_grad_(True)
     # compute all edge vectors
     # NOTE minor repeated calcs with shared edges
+    
     tris = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, corner, xyz
 
     E1 = tris[:, 1] - tris[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
@@ -1179,26 +1377,8 @@ def self_collision(mesh, unconnectivity, forceNormalDist=True):
     quadratic_term_vtx = 2 * torch.cat(
             (TR1_TR1_E1_E1_full_vtx, TR1_TR1_E1_E2_full_vtx,
                 TR1_TR1_E1_E2_full_vtx, TR1_TR1_E2_E2_full_vtx, ),dim=1).reshape([-1,2,2])
-
-    # build inequality constraints: solution falls in triangle (or along edge)
-
-    # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
-    bary_G_tri = torch.cat((-torch.eye(4,device=mesh.device),
-                        torch.tensor([[1,1,0,0]],device=mesh.device),
-                        torch.tensor([[0,0,1,1]],device=mesh.device)), dim=0)
-    bary_h_tri = torch.tensor([1/3,1/3,1/3,1/3,1/3,1/3],device=mesh.device)
-
-    bary_G_edg = torch.cat((-torch.eye(3,device=mesh.device),
-                        torch.tensor([[1,1,0]],device=mesh.device),
-                        torch.tensor([[0,0,1]],device=mesh.device)), dim=0)
-    # center for edge is at [0.5, 0], so slight tweak
-    bary_h_edg = torch.tensor([1/3,1/3,1/2,1/3,1/2],device=mesh.device)
-
-    bary_G_vtx = torch.cat((-torch.eye(2,device=mesh.device),
-                        torch.tensor([[1,1]],device=mesh.device)), dim=0)
-    bary_h_vtx = torch.tensor([1/3,1/3,1/3],device=mesh.device)
-
-    # build equality constraints, if needed
+    
+        # build equality constraints, if needed
     if forceNormalDist:
         # need additional constraint that solution is in normal direction of 1st triangle
         # encoded as an equality constraint in the optimization
@@ -1229,11 +1409,7 @@ def self_collision(mesh, unconnectivity, forceNormalDist=True):
         # compute rejection of vector normal from the vector between triangles
         equality_b_tri = w_diff_vec_tri - (torch.linalg.vecdot(w_diff_vec_tri,normal_vecs_tri).unsqueeze(1) * normal_vecs_tri)
         
-        equality_A_edg =  torch.tensor([],device=mesh.device) 
-        equality_b_edg =  torch.tensor([],device=mesh.device) 
 
-        equality_A_vtx =  torch.tensor([],device=mesh.device) 
-        equality_b_vtx =  torch.tensor([],device=mesh.device) 
 
         # Don't ever do normal constraint for neighbors, since they can pass through each others sides, not just faces
         #
@@ -1258,38 +1434,9 @@ def self_collision(mesh, unconnectivity, forceNormalDist=True):
         equality_A_tri = torch.tensor([],device=mesh.device) 
         equality_b_tri = torch.tensor([],device=mesh.device)
 
-        equality_A_edg = equality_A_tri
-        equality_b_edg = equality_b_tri
-
-        equality_A_vtx = equality_A_tri
-        equality_b_vtx = equality_b_tri
-
-    # solve qp with our custom wrapper. It returns distance, in addition to solution
-    # it also, in the forceNormalDist case, replaces distance with inf when solution does not exist
-    dist_all_tri, bary_coords_tri = __qp_bary_feasible(quadratic_term_tri, linear_term_tri, const_term_tri, equality_A_tri, equality_b_tri, bary_G_tri, bary_h_tri)
-
-    dist_all_edg, bary_coords_edg = __qp_bary_feasible(quadratic_term_edg, linear_term_edg, const_term_edg, equality_A_edg, equality_b_edg, bary_G_edg, bary_h_edg)
     
-    dist_all_vtx, bary_coords_vtx = __qp_bary_feasible(quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_vtx, equality_b_vtx, bary_G_vtx, bary_h_vtx)
+    return quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri
 
-    # for ease of use outside of this function, we go back to traditional bary-centric coordinates before returning
-    # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
-    # traiditional barycentric 1/3,1/3,1/3 is center and 0,0,0 is corner0
-
-    bary_coords_tri_corrected = bary_coords_tri + 1/3
-
-    # center for edge is at [0.5, 0], so slight tweak
-    # correct first two by 1/3, 3rd by 1/2, add zero column
-    bary_coords_edg_corrected = torch.cat((bary_coords_edg + torch.tensor([[1/3,1/3,1/2]],device=bary_coords_edg.device), torch.zeros_like(bary_coords_edg[:,0:1])),dim=1)
-
-    # correct first two by 1/3, add 2 zero columns
-    bary_coords_vtx_corrected =  torch.cat((bary_coords_vtx + 1/3, torch.zeros_like(bary_coords_vtx)),dim=1)
-
-    # cat all before returning
-    dist_all = torch.cat((dist_all_tri,dist_all_edg,dist_all_vtx),dim=0)
-    bary_coords_corrected = torch.cat((bary_coords_tri_corrected, bary_coords_edg_corrected, bary_coords_vtx_corrected),dim=0)
-
-    return dist_all, bary_coords_corrected
 
 def __applyQuad(bary_coords, quadratic_term, linear_term, const_term):
     # computes distance for a batch of quadratic programs and their solutions
@@ -1320,29 +1467,35 @@ def __qp_bary_feasible(quadratic_term, linear_term, const_term, equality_A, equa
     # we compute a lower bound, the size of the smallest (largest negative) eigenvalue, compared to a small
     # positive epsilon (spd_target). We double the size of this target every time we fail to create an spd
     # matrix, then try again, up to max_spd_iter
-    quadratic_term_reg = quadratic_term.clone()
+    quadratic_term_diagonal = torch.diagonal(quadratic_term,dim1=-1,dim2=-2)
+    quadratic_term_orig = quadratic_term_diagonal.clone()
+    quadratic_term_reg = quadratic_term_diagonal.clone()
+    
+    quadratic_term_diagonal
     spd_min_eig=1e-6
     spd_target = spd_min_eig
     max_spd_iter = 4
+    
     while max_spd_iter > 0:
         max_spd_iter-=1
-        eigs = torch.real(torch.linalg.eigvals(quadratic_term_reg))
+        quadratic_term_diagonal.copy_(quadratic_term_reg)
+        eigs = torch.real(torch.linalg.eigvals(quadratic_term.detach()))
         not_spd = torch.any(eigs < spd_min_eig,dim=1)
 
-        #print(f'found {torch.where(not_spd)[0].shape[0]} non spd quadratic terms')
+        # print(f'found {torch.where(not_spd)[0].shape[0]} non spd quadratic terms')
         if not torch.any(not_spd):
             break
         spd_target = spd_target * 2
         dist_regularizer = spd_target  - torch.min(eigs[not_spd],dim=1)[0]
-        
-        regulizer_mat = (dist_regularizer.unsqueeze(1).unsqueeze(2) * torch.eye(quadratic_term.shape[-1], device = quadratic_term.device).unsqueeze(0))
+        quadratic_term_reg[not_spd] += dist_regularizer.unsqueeze(-1)
+        # regulizer_mat = (dist_regularizer.unsqueeze(1).unsqueeze(2) * torch.eye(quadratic_term.shape[-1], device = quadratic_term.device).unsqueeze(0))
 
-        quadratic_term_reg[not_spd] = quadratic_term_reg[not_spd] + regulizer_mat
+        # quadratic_term_reg[not_spd] = quadratic_term_reg[not_spd] + regulizer_mat
 
     # solve all, including infeasible
     qp = QPFunction(check_Q_spd=False)
     __blockPrint()
-    bary_coords = qp(quadratic_term_reg, linear_term.squeeze(2), # optimization
+    bary_coords = qp(quadratic_term, linear_term.squeeze(2), # optimization
                                                 inequality_G, inequality_h, #inequality constraints
                                                 equality_A,equality_b) # equality constraints)
     __enablePrint()
@@ -1350,6 +1503,7 @@ def __qp_bary_feasible(quadratic_term, linear_term, const_term, equality_A, equa
     # we can check that our inequality constraint was met (Gz <= h), which indicates bary coordinates fall outside triangle
     invalid_bary = torch.any(torch.matmul(bary_coords, inequality_G.transpose(0,1)) > inequality_h.unsqueeze(0),dim=1)
 
+    
 
     # if any invalid solutions are found, we need to repeat the computation without them
     # pytorch fails to compute any derivatives if an invalid distance exists
@@ -1363,16 +1517,18 @@ def __qp_bary_feasible(quadratic_term, linear_term, const_term, equality_A, equa
             equality_A_filt = equality_A[valid_bary]
             equality_b_filt = equality_b[valid_bary]
         __blockPrint()
-        bary_coords_feasible = qp(quadratic_term_reg[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
+        bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
                                                 inequality_G, inequality_h, #inequality constraints
                                                 equality_A_filt,equality_b_filt) # equality constraints)
         __enablePrint()
         bary_coords = float('Inf') * torch.ones_like(bary_coords)
         bary_coords[valid_bary] = bary_coords_feasible
+        quadratic_term_diagonal.copy_(quadratic_term_orig)
         dist_feasible = __applyQuad(bary_coords_feasible, quadratic_term[valid_bary], linear_term[valid_bary], const_term[valid_bary])
         dist_all = float('Inf') * torch.ones_like(const_term)
         dist_all[valid_bary] = dist_feasible
     else:
+        quadratic_term_diagonal.copy_(quadratic_term_orig)
         dist_all = __applyQuad(bary_coords, quadratic_term, linear_term, const_term)
 
 
@@ -1387,22 +1543,24 @@ def __blockPrint():
 def __enablePrint():
     sys.stdout = sys.__stdout__
 
-def self_collision_min(mesh, unconnectivity, useRefPointBias=0, forceNormalDist=1):
+def self_collision_min(mesh, unconnectivity, forceNormalDist=1):
     # wrapper on self_collision that returns the minimum valid distance
-    dists_raw, bary_coords_raw = self_collision(mesh=mesh, unconnectivity=unconnectivity, useRefPointBias=useRefPointBias, forceNormalDist=forceNormalDist)
+    dists_raw, bary_coords_raw = self_collision(mesh=mesh, unconnectivity=unconnectivity, forceNormalDist=forceNormalDist)
     invalid_bary = torch.logical_or(torch.all(bary_coords_raw < 0,dim=1),
                                    torch.all(bary_coords_raw[:,[0,2]] + bary_coords_raw[:,[1,3]] > 1,dim=1))
     dists_filtered = dists_raw
     dists_filtered[invalid_bary] = float('Inf')
     return torch.min(dists_filtered)
 
-class CannyFerrariQualityFunction(ParallelJawQualityFunction):
+
+class minWeightQualityFunction(ParallelJawQualityFunction):
     """Computes the minimum external wrench required to disrupt a grasp"""
-    def __init__(self, config):
+    def __init__(self, config, min_quality=0.004):
+        self.min_quality = 0.004
         ParallelJawQualityFunction.__init__(self, config)
 
 
-    def quality(self, state, actions, is_watertight=True, is_inverted=False):
+    def quality(self, state, actions, is_watertight=True, is_inverted=False, mode=None):
         """Given a batch of parallel-jaw grasps, compute the minimum magnitude external
         wrench required to disrupt the grasp.
 
@@ -1430,36 +1588,99 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         self.Grasps = actions
         self.G = actions.grasp_matrix
         with record_function("minHull"):
+            closest = self.find_min_weight(self.G)
+        self.quality_cache = closest
+        return closest / self.min_quality
+    
+    @staticmethod
+    def find_min_weight(G):       
+        original_shape = G.shape
+        G_unwrapped = G.view((original_shape[0]*original_shape[1], -1, 6)).transpose(0,1)
+
+        # https://arxiv.org/pdf/2302.13687
+        #
+        # maximize l
+        # s.t. G * alpha = 0
+        #      sum(alpha) = 1
+        #      alpha - l >=0 (all alpha)
+        #
+        # minimize epsilon @ [alpha; l] @ eye(7) @ [alpha; l] - l
+        # s.t.   [G_unwrapped,zeros] @ [alpha; l] = 0
+        #        [ones(6), 0] @ [alpha; l] = 1
+        #        [eye, 1] >= 0
+        # 
+
+        quadratic_term = 1e-8 * torch.eye(G_unwrapped.shape[1]+1,device=G.device,dtype=G.dtype)
+        linear_term = torch.nn.functional.pad(torch.zeros((G_unwrapped.shape[1],1),device=G.device,dtype=G.dtype),(0,0,0,1),value=-1).squeeze(1)
+        # [G_unwrapped,zeros] @ [alpha; l] = 0
+        # [ones(6), 0] @ [alpha; l] = 1
+        #
+        # 
+        # [batch, 6, n_forces] @ [n_forces,1] = zeros(6)
+        # [batch, 1, n_forces] @ [n_forces,1] = ones(1)
+        equality_A_first = torch.nn.functional.pad(G_unwrapped.transpose(2,1), (0,0,0,1,0,0),value=1)
+        equality_A = torch.nn.functional.pad(equality_A_first, (1,0,0,0,0,0)) # pad 1 zero to last dim
+        equality_b = torch.tensor((0,0,0,0,0,0,1),device=G.device,dtype=G.dtype).unsqueeze(0).expand((equality_A.shape[0],-1))
+
+        #        [eye, 1] >= 0
+        inequality_G = torch.concatenate((-torch.eye(G_unwrapped.shape[1],device=G.device,dtype=G.dtype), 
+                                          torch.ones((G_unwrapped.shape[1],1),device=G.device,dtype=G.dtype)),dim=1)
+        inequality_h =  torch.zeros((G_unwrapped.shape[1]),device=G.device)
+
+        qp = QPFunction(check_Q_spd=False)
+
+        alpha_weights = qp(quadratic_term, linear_term, # optimization
+                                            inequality_G, inequality_h, #inequality constraints
+                                            equality_A,equality_b) # equality constraints)
+        # test feasibility?
+
+        # find minimum value
+        min_alpha = alpha_weights[:,-1]
+        
+        return min_alpha
+
+class CannyFerrariQualityFunction(ParallelJawQualityFunction):
+    """Computes the minimum external wrench required to disrupt a grasp"""
+    def __init__(self, config,min_quality=0.002):
+        self.min_quality = min_quality
+        ParallelJawQualityFunction.__init__(self, config)
+
+    def quality(self, state, actions, is_watertight=True, is_inverted=False):
+        """Given a batch of parallel-jaw grasps, compute the minimum magnitude external
+        wrench required to disrupt the grasp.
+
+        Parameters
+        ----------
+        state : :obj:`Pytorch3D Meshes object `
+            A Meshes object of size 1 containing a watertight mesh
+        action: :obj:`Grasp`
+            A suction grasp in image space that encapsulates center and axis
+        params: dict
+            Stores params used in computing quality.
+
+        Returns
+        -------
+        :obj:`numpy.ndarray`
+            Array of the quality for each grasp.
+        """
+        if actions.applied_to_object is False :
+            with record_function("solveForIntersection"):
+                actions = actions.apply_to_mesh(state, is_watertight=is_watertight, is_inverted=is_inverted)
+        if actions.applied_to_object is False :
+            # no (or bad) intersection found, just return nan quality
+            return torch.full_like(actions.axis3D[...,0], float('nan'))
+        self.Mesh = state
+        self.Grasps = actions
+        self.G = actions.grasp_matrix
+        with record_function("minHull"):
             closest = CannyFerrariQualityFunction.find_min_dist_to_hull(self.G)
         self.quality_cache = closest
-        return closest
-    
-    def savemat(self, path, other_items=None):
-        # collects a dictionary of interesting internal state, then saves it
-        dict_to_save = {}
-        if self.Grasps is not None:
-            dict_to_save['axis3D'] = self.Grasps.axis3D.numpy(force=True)
-            dict_to_save['center3D'] = self.Grasps.center3D.numpy(force=True)
-            dict_to_save['contact_points']= self.Grasps.contact_points.numpy(force=True)
-            dict_to_save['contact_normals']= self.Grasps.contact_normals.numpy(force=True)
-            dict_to_save['face_normals']= self.Grasps.face_normals.numpy(force=True)
-            dict_to_save['object_com'] = self.Grasps.object_com.numpy(force=True)
-            dict_to_save['faces_index'] =self.Grasps.faces_index.numpy(force=True)
-            ep0, ep1 = self.Grasps.endpoints3D
-            dict_to_save['endpoints3D'] =torch.cat((ep0.unsqueeze(0),ep1.unsqueeze(0)),dim=0).numpy(force=True)
-
-        if other_items is not None:
-            dict_to_save = dict_to_save | other_items
-
-        dict_to_save['quality'] = self.quality_cache.numpy(force=True)
-
-        savemat(path, dict_to_save)
-
-        return
+        return closest / self.min_quality
+        
     
     @staticmethod
     def qp_wrap(facets):
-        ### TODO solve QP over G to figure out sign
+        ### TODO Re-enable for in-feasible grasps. Need to make sure sign is negative
         # square facet matrix
         Gsquared_full  = torch.linalg.matmul(facets,torch.permute(facets, [0,2,1]))
         wrench_regularizer=1e-10
@@ -1491,37 +1712,72 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         return dist_full, x_full, P
    
     @staticmethod
-    def distWrap(G_unwrapped):
-        facets_local = []
-        lengths = []
-        with record_function("ConvexHull-Loop"):
-            for batch_idx in range(G_unwrapped.shape[1]):
-                miniG = G_unwrapped[:,batch_idx,:]
-                simplices = qHullTorch.apply(miniG)
-                facet = miniG[simplices,:]
-                facets_local.append(facet)
-                lengths.append(facet.shape[0])
-        facets = torch.cat(facets_local,dim=0)
-        ### reassemble simplices into batch may be too many and need to serialize
-        ## maybe we only (re)compute the important one in pytorch, drop others for memory
-        with record_function("qp_wrap"):
-            dist,x,P = CannyFerrariQualityFunction.qp_wrap(facets)
-        return dist, lengths
+    def compute_hyperplane_above(facets):
+        hull_pad = torch.nn.functional.pad(facets,(0,1,0,1),value=1)
+        hull_pad[...,-1,-1] = 0
+        b_vec = torch.tensor([0,0,0,0,0,0,1],dtype=facets.dtype,device=facets.device).expand((hull_pad.shape[0],7))
+        normals = torch.nn.functional.normalize(torch.linalg.solve_ex(hull_pad, b_vec)[0][:,0:6])
+        dists = torch.abs(torch.linalg.vecdot(torch.mean(facets,dim=1),normals))
+        if torch.any(dists > 0.1):
+            print(torch.max(dists))
+        return dists
     
     @staticmethod
     def find_min_dist_to_hull(G):       
         original_shape = G.shape
         G_unwrapped = G.view((original_shape[0]*original_shape[1], -1, 6))
-        dist, lengths = CannyFerrariQualityFunction.distWrap(G_unwrapped)
+        is_feasible = torch.zeros((G_unwrapped.shape[1]),dtype=torch.bool,device=G.device)
+        facets_infeasible_local = []
+        count_facets_per_grasp = []
+        facets_feasible_local = []
+        with record_function("ConvexHull-Loop"):
+            for batch_idx in range(G_unwrapped.shape[1]):
+                miniG = G_unwrapped[:,batch_idx,:]
+                [simplices,equations] = qHullTorch.apply(miniG)
+                areas = torch.abs(torch.linalg.det(miniG[simplices,:]))
+                finite_size = areas > 1e-8
+                simplices = simplices[finite_size]
+                dist_from_origin = equations[finite_size,-1]
+                is_above_origin = dist_from_origin<0
+                
+                if torch.all(is_above_origin):
+                    is_feasible[batch_idx] = 1
+                    # if all negative, closest point is max (min of abs)
+                    min_dex = torch.argmax(dist_from_origin)
+                    
+                    facet = miniG[simplices[(min_dex),:],:].unsqueeze(0)
+                    facets_feasible_local.append(facet)
+                else:
+                    facet = miniG[simplices[torch.logical_not(is_above_origin),:],:]
+                    facets_infeasible_local.append(facet)
+                    count_facets_per_grasp.append(facet.shape[0])
+        
+        if len(facets_feasible_local) > 0:
+            facets = torch.cat(facets_feasible_local,dim=0)
+            closest_feasible = CannyFerrariQualityFunction.compute_hyperplane_above(facets)
+        allow_neg_fc = 0
+        # TODO re-introduce, consider if we want to still drop zero size facets
+        if allow_neg_fc and len(facets_infeasible_local) > 0:
+            facets = torch.cat(facets_infeasible_local,dim=0)
+            ### reassemble simplices into batch may be too many and need to serialize
+            ## maybe we only (re)compute the important one in pytorch, drop others for memory
+            with record_function("qp_wrap"):
+                dist,x,P = CannyFerrariQualityFunction.qp_wrap(facets)
 
-        start_ind = 0
-        closest = torch.zeros(len(lengths),1, dtype=torch.float64)
-        for index,length in enumerate(lengths):
-            end_ind = start_ind + length
-            dist_local = dist[start_ind:end_ind]
-            minReturn = torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0)
-            closest[index] = minReturn.values
-            start_ind = end_ind
+
+            start_ind = 0
+            closest_infeasible = torch.zeros(len(count_facets_per_grasp),1, dtype=torch.float64)
+            for index,length in enumerate(count_facets_per_grasp):
+                end_ind = start_ind + length
+                dist_local = dist[start_ind:end_ind]
+                minReturn = torch.min(dist_local[torch.logical_not(torch.logical_or(torch.isnan(dist_local),dist_local<0))],dim=0)
+                closest_infeasible[index] = minReturn.values
+                start_ind = end_ind
+        else:
+            closest_infeasible = 0
+        closest = torch.zeros(is_feasible.shape, dtype=G.dtype, device=G.device)
+        closest[is_feasible] = closest_feasible
+        closest[torch.logical_not(is_feasible)] = closest_infeasible
         return closest
 
     dtype=torch.float64
@@ -1529,8 +1785,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
 class RobustCannyFerrariQualityFunction(CannyFerrariQualityFunction):
     """Measures the probability that grasps near a reference grasp will have high Canny Ferrari quality."""
     def __init__(self, config,min_quality=0.002):
-        self.min_quality = min_quality
-        CannyFerrariQualityFunction.__init__(self, config)
+        CannyFerrariQualityFunction.__init__(self, config,min_quality=min_quality)
 
     def quality(self, state, actions, mode='actual', is_watertight=True, is_inverted=False):
         """Given a parallel-jaw grasp, the probability that grasps near it 
@@ -1556,13 +1811,141 @@ class RobustCannyFerrariQualityFunction(CannyFerrariQualityFunction):
         # 
         noised_grasps = actions.generateNoisyGrasps(25).apply_to_mesh(state, ignore_backface_check=False, is_watertight=is_watertight, is_inverted=is_inverted)
         noised_tensor = super().quality(state, noised_grasps, is_watertight=is_watertight, is_inverted=is_inverted)
-        if mode == 'actual':
-            qual_tensor = torch.mean((noised_tensor > self.min_quality).float())
-        elif mode == 'quality_increase':
-            qual_tensor = torch.mean(1-torch.nn.functional.relu(-(noised_tensor - self.min_quality)))
-        elif mode == 'quality_decrease':
-            qual_tensor = torch.mean(1-torch.nn.functional.relu((noised_tensor - self.min_quality)))
+        # expected quality
+        qual_tensor = torch.mean(noised_tensor)
+        # if mode == 'actual':
+        #     qual_tensor = torch.mean(noised_tensor)
+        # elif mode == 'quality_increase':
+        #     qual_tensor = 1-torch.nn.functional.relu(-(torch.mean(noised_tensor) - 1))
+        # elif mode == 'quality_decrease':
+        #     qual_tensor = 1-torch.nn.functional.relu((torch.mean(noised_tensor) - 1))
+
+        # if mode == 'actual':
+        #     qual_tensor = torch.mean((noised_tensor > self.min_quality).float())
+        # elif mode == 'quality_increase':
+        #     qual_tensor = torch.mean(1-torch.nn.functional.relu(-(noised_tensor - self.min_quality)))
+        # elif mode == 'quality_decrease':
+        #     qual_tensor = torch.mean(1-torch.nn.functional.relu((noised_tensor - self.min_quality)))
         return qual_tensor
+
+class hullTorch(torch.autograd.Function):
+    # attempt to keep convex hull computation on gpu. 
+    # complicated algorithm, still missing a lot
+    @staticmethod
+    def forward(_, miniG):
+        miniG_homogeneous = torch.nn.functional.pad(miniG,[0,1],value=1)
+
+        # initial simplex and planes
+        initial_hull, initial_neighbors, points_used = hullTorch.find_initial_set(miniG_homogeneous)
+        
+        planes = hullTorch.computePlanes(miniG_homogeneous,initial_hull)
+        
+        unused_points = miniG_homogeneous[...,torch.logical_not(points_used),:]
+        dists = hullTorch.comparePoints(unused_points, planes)
+        #while(unused_points.shape[-2] > 0):
+        # loop over points
+        # TODO, filter points to only be non-hull
+        
+        # TODO choose point to add to hull (largest positive?)
+        # TODO add point: use comparison to find ridges
+        
+        # remove point from unused points
+        # 
+        # # can we avoid a copy? overwrite by index? 
+        # simplices_removed =
+        # simplices_added =
+        # TODO update hull, update neighbors
+        #
+        # TODO, maintain hull to point comparisons 
+        #    update planes 
+        #  dists_new = hullTorch.comparePoints(unused_points, planes_new)
+        return torch.tensor(initial_hull,dtype=torch.long)
+
+    @staticmethod
+    def find_initial_set(points):
+        extrema = torch.unique(torch.cat((torch.max(points[...,:-1], dim=-1).indices, torch.min(points, dim=-1).indices),dim=-1),dim=-1)
+        non_extrema = hullTorch.setdiff_flat(extrema, torch.arange(points.shape[-2],device=points.device))
+
+        non_extrama_combinations = torch.combinations(non_extrema,r=(points.shape[-1]-extrema.shape[-1]))
+        simplices = torch.cat((extrema.expand((non_extrama_combinations.shape[0],-1)), non_extrama_combinations),dim=-1)
+
+        det_A, _ = hullTorch.hull_det(points, simplices)
+
+        simplex_initial_unique = simplices[torch.max(det_A,dim=-1).indices,:].unsqueeze(-2)
+        simplex_initial_stride = list(simplex_initial_unique.stride())
+        simplex_initial_stride[-2] = 1
+        simplex_initial_stride[-1] = 1
+
+        simplices_hull = torch.as_strided(simplex_initial_unique,[7,6],stride=simplex_initial_stride)
+
+        range_for_neighbors = torch.arange(points.shape[-1],device=points.device).unsqueeze(-2)
+        neighbors_shape = list(range_for_neighbors.shape)
+        neighbors_shape[-2] = 7
+        neighbors = torch.as_strided(range_for_neighbors.repeat(neighbors_shape),[7,6],stride=simplex_initial_stride,storage_offset=1)
+
+        points_used = torch.zeros(points[...,0].shape,device=points.device,dtype=torch.bool)
+        points_used.scatter_(-1, simplex_initial_unique.squeeze(-2),1)
+
+        return simplices_hull, neighbors, points_used
+        # https://github.com/qhull/qhull/blob/c7bee59d068a69f427b1273e71cdc5bc455a5bdd/src/libqhull/poly2.c#L2347
+
+
+    @staticmethod
+    def setdiff_flat(ints1, ints2):
+        # https://stackoverflow.com/a/62407582
+        combined = torch.cat((ints1, ints2),dim=-1)
+        uniques, counts = combined.unique(return_counts=True,dim=-1)
+        difference = uniques[counts == 1]
+        # intersection = uniques[counts > 1]
+        return difference
+
+    @staticmethod
+    def hull_det(points, hull):
+        hull_points = multi_gather_tris(points, hull.contiguous()) # simplices, verts, dims
+        
+        # # if splitting normal and reference point
+        # hull_vecs = torch.nn.functional.pad(hull_points[...,1:,:] - hull_points[...,0:1,:],[0,0,0,1])
+        # hull_vecs[...,-1,-1] = 1
+        if hull_points.shape[-1] == (hull_points.shape[-2]+1):
+            A_matrices = torch.nn.functional.pad(hull_points,[0,0,0,1])
+            A_matrices[...,-1,-1] = 1
+        else:
+            A_matrices = hull_points
+        
+        # # I feel like this is close to a real thing, but can't find evidence of it
+        # hull_points = torch.nn.functional.pad(hull_points,[0,1]).unsqueeze(0).transpose(-2,-1)
+        # data_points = torch.nn.functional.pad(points.unsqueeze(-1).unsqueeze(0),[0,0,0,1],value=1)
+        # shape = list(torch.broadcast_shapes(hull_points.shape[:-2],data_points.shape[:-2])) + [-1,-1]
+        # A_matrices = torch.cat((hull_points.expand(shape),data_points.expand(shape)),dim=-1)
+        
+        det_A = torch.linalg.det(A_matrices)
+        return det_A, A_matrices
+
+    @staticmethod
+    def comparePoints(points, planes):
+        distances = torch.linalg.vecdot(planes.unsqueeze(-2), points.unsqueeze(-3))
+
+        return distances
+
+    @staticmethod
+    def computePlanes(points,hull):
+        # generalized cross product to create planes
+        # https://mathoverflow.net/questions/109949/how-to-efficiently-compute-the-generalized-cross-product
+
+        # alternative: put points in cross product, but inefficient if plane compared repeatedly 
+        # compare all simplices, as points to all points
+        # 
+
+        det_A, A_matrices = hullTorch.hull_det(points, hull)
+        b = torch.zeros_like(A_matrices[...,0:1])
+        b[...,-1,-1] = torch.sign(det_A)
+        
+        planes = torch.linalg.solve(A_matrices,b,left=True).squeeze(-1)
+
+        return planes
+
+
+
 
 class qHullTorch(torch.autograd.Function):
     @staticmethod
@@ -1574,8 +1957,9 @@ class qHullTorch(torch.autograd.Function):
         if torch.any(torch.isnan(miniG)):
             breakpoint()
         miniGnumpy = miniG.numpy(force=True)
-        hull = ConvexHull(miniGnumpy)  
-        return torch.tensor(hull.simplices,dtype=torch.long)
+        hull = ConvexHull(miniGnumpy) # ,qhull_options='QJ'
+        return ( torch.tensor(hull.simplices,dtype=torch.long,device=miniG.device),
+                torch.tensor(hull.equations,dtype=miniG.dtype,device=miniG.device) )
     @staticmethod
     def backward(_, grad_output):
         return None
@@ -1752,11 +2136,26 @@ def test_wine():
 
     com_qual_func = CannyFerrariQualityFunction(config_dict)
 
+    eye = torch.tensor([[0.0, 0.6, 0.0]])	# 
+    up = torch.tensor([[0.0, 0.0, 1.0]])
+    at = torch.tensor([[0.0, 0.0, 0.0]])
+    R, T = look_at_view_transform(eye=eye, up=up, at=at)	# camera located above object, pointing down
+
+    # camera intrinsics
+    fl = torch.tensor([[525.0]])
+    pp = torch.tensor([[319.5, 239.5]]) 
+    im_size = torch.tensor([[480, 640]])
+
+    camera = PerspectiveCameras(focal_length=fl, principal_point=pp, in_ndc=False, image_size=im_size, device=device, R=R, T=T)[0]
+
+
     center3D = torch.tensor([[0.0, -0.00, -0.034]], device=device,requires_grad=True)
     axis3D   = torch.tensor([[1.0,0.0,0.0]], device=device,requires_grad=True)
     graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
-                        friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-    graspObj = graspObj.apply_to_mesh(mesh)
+                        friction_coef=config_dict["friction_coef"], 
+                        torque_scaling=config_dict["torque_scaling"],camera_intr=camera)
+    graspObj = graspObj.apply_to_mesh(mesh,is_watertight=False)
+    graspObj.write_obj('wine_grasp.obj',include_coordinate=True,include_line_o_action=True)
     original_quality = com_qual_func.quality(mesh, graspObj)   
     print("original (w/backface): ", original_quality)
 
@@ -1787,11 +2186,15 @@ def test_wine():
         print('new-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
         print()
 
+    # test slicing
+    a = noised_grasps[0:5]
+    b = a[torch.tensor((0,0,1,0,1),dtype=torch.bool,device=device)]
+    c = b[0]
 def test_quality():
     # load PyTorch3D mesh from .obj file
     renderer, device = pytorch_setup()
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
+        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/new_barclamp.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -2094,7 +2497,7 @@ def test_dist():
         torch.cuda.set_device(device)
 
     with record_function("load_obj"):
-        verts, faces_idx, _ = load_obj("data/new_barclamp.obj")
+        verts, faces_idx, _ = load_obj("adv/adv-grasp/data/new_barclamp.obj")
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
@@ -2116,8 +2519,9 @@ if __name__ == "__main__":
             #model(inputs)
             with torch.enable_grad():        
                 # test_stein()
-                # test_wine()
-                test_dist()
                 test_quality()
+                test_wine()
+                test_dist()
+                
     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
     prof.export_chrome_trace("trace.json")
