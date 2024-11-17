@@ -469,9 +469,11 @@ class GraspTorch(object):
             return torch.nn.functional.normalize(vec3,dim=-1)
         
         normal_in = -self.contact_normals
-        # get unit vectors orthogonal to normal
-        ref = torch.eye(1, m=3,device=self.contact_normals.device, dtype=self.contact_normals.dtype).expand(self.contact_normals.shape)
-        yvec = cross_unit(normal_in, ref) # may be degenerate, so perform twice
+        # get unit vectors orthogonal to normal. Defaults to aligning to x axis, falls back on y axis if normal is exactly parallel to x
+        ref = torch.eye(2, m=3,device=self.contact_normals.device, dtype=self.contact_normals.dtype).expand(list(self.contact_normals.shape[:-1]) + [2,3])
+        yvec = cross_unit(normal_in.unsqueeze(-2), ref) # may be degenerate, so perform twice
+        yvec_error = abs(torch.linalg.vector_norm(yvec,dim=-1) - 1)
+        yvec = torch.gather(input=yvec,index=torch.argmin(yvec_error,dim=-1).unsqueeze(-1).unsqueeze(-1).expand(list(yvec.shape[:-2])+[1,3]),dim=-2).squeeze(-2)
  
         xvec = cross_unit(yvec, normal_in)
         yvec = cross_unit(normal_in, xvec)
@@ -484,14 +486,14 @@ class GraspTorch(object):
             target_shape[0] = num_faces
             return vec.expand(target_shape)
             
-        yvec = reshape_local(yvec, self.num_cone_faces)
-        xvec = reshape_local(xvec, self.num_cone_faces)
+        yvec_expanded = reshape_local(yvec, self.num_cone_faces)
+        xvec_expanded = reshape_local(xvec, self.num_cone_faces)
 
         sampleAngles = torch.linspace(0, 2 * math.pi, self.num_cone_faces+1, device=self.contact_normals.device)
         sampleAngles = sampleAngles[:-1]
-        sampleAngles = torch.reshape(sampleAngles, [self.num_cone_faces] + [1] * (len(xvec.shape)-1))
+        sampleAngles = torch.reshape(sampleAngles, [self.num_cone_faces] + [1] * (len(xvec_expanded.shape)-1))
 
-        tan_vec = torch.mul(xvec, torch.cos(sampleAngles)) + torch.mul(yvec, torch.sin(sampleAngles))
+        tan_vec = torch.mul(xvec_expanded, torch.cos(sampleAngles)) + torch.mul(yvec_expanded, torch.sin(sampleAngles))
         friction_cone = -self.contact_normals + self.friction_coef * tan_vec
         return friction_cone
 
@@ -520,10 +522,11 @@ class GraspTorch(object):
         ray_o_flat = torch.flatten(ray_o, end_dim=-2)
         ray_d_flat = torch.flatten(ray_d, end_dim=-2)
         if contact_points is None:
-            mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-
-            u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped.double())
-
+            with record_function("moller-cramer"):
+                mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
+                u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped.double())
+            with record_function("moller-solve"):
+                tuv = moller_tumbore_solve(ray_o_flat,ray_d_flat,mesh)
             u = torch.unflatten(u, 0, target_shape[:-1])
             v = torch.unflatten(v, 0, target_shape[:-1])
             t = torch.unflatten(t, 0, target_shape[:-1])
@@ -554,20 +557,23 @@ class GraspTorch(object):
         # vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = mesh.faces_normals_packed()[faces_index,:]
         if use_dexnet_normal:
             (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(contact_points, mesh)
-            normsEstimated = self.svdSpherePointsNormal(contact_points, sphereDirs, masks, ray_d)
+            normsEstimated = self.svdSpherePointsNormal(contact_points, sphereDirs, masks, ray_d[:,grasps_in_contact])
         else:
             normsEstimated = GraspTorch.avgSphereArcNormal(mesh, contact_points)
 
+
         # optional correction if allowing mesh backfaces (some vertex order reversed)
         if(ignore_backface_check or not is_watertight):
-            normsEstimated = normsEstimated * -torch.sign(torch.sum(normsEstimated * ray_d, dim=-1,keepdim=True))
+            normsEstimated = normsEstimated * -torch.sign(torch.sum(normsEstimated * ray_d[:,grasps_in_contact], dim=-1,keepdim=True))
         # optional correction if we know that all vertices have order reversed
         elif(is_inverted):
             normsEstimated = -normsEstimated
 
         if is_watertight:
-            contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d, dim=-1) < 0 ,dim=0)# dot product of normal and finger should be opposite, less than 0
-            grasps_in_contact = torch.logical_and(grasps_in_contact,  contact_is_outside)
+            contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d[:,grasps_in_contact], dim=-1) < 0 ,dim=0)# dot product of normal and finger should be opposite, less than 0
+            contact_is_outside_full = torch.zeros_like(grasps_in_contact)
+            contact_is_outside_full[grasps_in_contact] = contact_is_outside
+            grasps_in_contact = torch.logical_and(grasps_in_contact,  contact_is_outside_full)
             contact_points = contact_points[:,contact_is_outside]
             normsEstimated = normsEstimated[:,contact_is_outside]
         
@@ -635,6 +641,8 @@ class GraspTorch(object):
         idxs_face = idxs_face.reshape([-1, steps_cubed, 1])
         minDist = (scaling * np.sqrt(2) / 2)**2  # square meters 
         masks = torch.split(torch.logical_and(dists < minDist,face_edge_shared), dim=0, split_size_or_sections=1)
+        if torch.count_nonzero(masks[1]) < 1:
+            print('bad match')
         return idxs_face, masks, sphereDirs
 
     @staticmethod
@@ -875,7 +883,8 @@ class GraspTorch(object):
         # surface_normals = torch.real(eig_return.eigenvectors[...,0])
 
         # savemat('segments.mat',{'segments':segments_3D[linearized_segments_mask].numpy(force=True),'eigvec':torch.real(eig_return[1]).numpy(force=True),'eigval':torch.real(eig_return[0]).numpy(force=True)})
-
+        if torch.any(torch.linalg.vector_norm(surface_normals_avg,dim=-1)<1e-5):
+            print('bad normal found!')
         #return surface_normals * -torch.sign(torch.sum(surface_normals * in_rays, dim=-1,keepdim=True))
         return surface_normals_avg
 
@@ -1069,13 +1078,16 @@ def compute_mesh_COM(mesh, is_watertight=True):
     """Compute the center of mass for a mesh, assume uniform density."""
     if is_watertight:
         vol_per_triangle, com_per_triangle = compute_mesh_tetra_volumes(mesh)
-    else:
+        total_vol = torch.sum(vol_per_triangle)
+        if abs(total_vol) < 1e-10:
+            print('WARNING: "watertight" mesh has volume 0, treating as non-watertight')
+    
+    if not is_watertight or total_vol < 1e-10: 
         vol_per_triangle, com_per_triangle = compute_mesh_tri_areas(mesh)
+        total_vol = torch.sum(vol_per_triangle)
 
-    com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / torch.sum(vol_per_triangle)
-    if not torch.any(torch.isfinite(com.flatten())):
-        raise Exception("com computation diverged")
-        breakpoint()
+    com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / total_vol
+
     return com
 
 class mesh_properties:
@@ -1141,8 +1153,7 @@ class mesh_properties:
         self.tri_unconnectivity = tri_u_ind[:,unconnectivity_flat_mask]
 
         # convert to tensor of the form (face_index, unconnected_edge_index) and (face_index, unconnected_vert_index)
-        # first vertex of edge matches index, edges_packed()[edges_per_face[:,0]] == faces[:,0]
-        # So opposite edge is always (shared vertex + 1) mod 3 and opposite vert is (shared edge + 2) mod 3  
+        # verts are indexed opposite edges, so edge 0 does not include vert 0
         edge_faces_indices = torch.nonzero(connectivity_edge_bool, as_tuple=True)
         vert_indices_in_face = connectivity_edge_ind[edge_faces_indices]
         vert_indices = faces[edge_faces_indices[0], vert_indices_in_face]
@@ -1666,14 +1677,13 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         if actions.applied_to_object is False :
             with record_function("solveForIntersection"):
                 actions = actions.apply_to_mesh(state, is_watertight=is_watertight, is_inverted=is_inverted)
-        if actions.applied_to_object is False :
-            # no (or bad) intersection found, just return nan quality
-            return torch.full_like(actions.axis3D[...,0], float('nan'))
         self.Mesh = state
         self.Grasps = actions
         self.G = actions.grasp_matrix
+        closest = torch.zeros(actions.contact_mask.shape, device=state.device, dtype=torch.float64)
         with record_function("minHull"):
-            closest = CannyFerrariQualityFunction.find_min_dist_to_hull(self.G)
+            closest[actions.contact_mask] = CannyFerrariQualityFunction.find_min_dist_to_hull(self.G)
+        
         self.quality_cache = closest
         return closest / self.min_quality
         
@@ -1727,6 +1737,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         original_shape = G.shape
         G_unwrapped = G.view((original_shape[0]*original_shape[1], -1, 6))
         is_feasible = torch.zeros((G_unwrapped.shape[1]),dtype=torch.bool,device=G.device)
+        closest = torch.zeros(is_feasible.shape, dtype=G.dtype, device=G.device)
         facets_infeasible_local = []
         count_facets_per_grasp = []
         facets_feasible_local = []
@@ -1740,7 +1751,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
                 dist_from_origin = equations[finite_size,-1]
                 is_above_origin = dist_from_origin<0
                 
-                if torch.all(is_above_origin):
+                if torch.all(is_above_origin) and torch.numel(is_above_origin) > 0:
                     is_feasible[batch_idx] = 1
                     # if all negative, closest point is max (min of abs)
                     min_dex = torch.argmax(dist_from_origin)
@@ -1755,6 +1766,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         if len(facets_feasible_local) > 0:
             facets = torch.cat(facets_feasible_local,dim=0)
             closest_feasible = CannyFerrariQualityFunction.compute_hyperplane_above(facets)
+            closest[is_feasible] = closest_feasible
         allow_neg_fc = 0
         # TODO re-introduce, consider if we want to still drop zero size facets
         if allow_neg_fc and len(facets_infeasible_local) > 0:
@@ -1775,8 +1787,8 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
                 start_ind = end_ind
         else:
             closest_infeasible = 0
-        closest = torch.zeros(is_feasible.shape, dtype=G.dtype, device=G.device)
-        closest[is_feasible] = closest_feasible
+        
+        
         closest[torch.logical_not(is_feasible)] = closest_infeasible
         return closest
 
@@ -1809,7 +1821,8 @@ class RobustCannyFerrariQualityFunction(CannyFerrariQualityFunction):
             Array of the quality for each grasp.
         """
         # 
-        noised_grasps = actions.generateNoisyGrasps(25).apply_to_mesh(state, ignore_backface_check=False, is_watertight=is_watertight, is_inverted=is_inverted)
+        noised_grasps = actions.generateNoisyGrasps(25)
+        noised_grasps = noised_grasps.apply_to_mesh(state, ignore_backface_check=False, is_watertight=is_watertight, is_inverted=is_inverted)
         noised_tensor = super().quality(state, noised_grasps, is_watertight=is_watertight, is_inverted=is_inverted)
         # expected quality
         qual_tensor = torch.mean(noised_tensor)
@@ -2066,6 +2079,30 @@ def moller_trumbore(ray_o, ray_d, tris , eps=1e-8):
 
     return u, v, t
 
+def moller_tumbore_solve(ray_o, ray_d, mesh):
+    verts = mesh.verts_packed()
+    verts.requires_grad_(True)
+    edges = multi_gather_tris(verts, mesh.edges_packed())
+    edge_vectors = edges[..., 1,:] - edges[..., 0,:]
+    edges_per_face = mesh.faces_packed_to_edges_packed()
+    face_edges_1 = -multi_gather_tris(edge_vectors, edges_per_face[...,0:1])
+    face_edges_2 = multi_gather_tris(edge_vectors, edges_per_face[...,1:2])
+
+
+    # shapes rays, faces, [1,3], 3
+    ray_o = ray_o.unsqueeze(-2).unsqueeze(-2)
+    ray_d = ray_d.unsqueeze(-2).unsqueeze(-2)
+    face_edges_1 = face_edges_1.unsqueeze(0)
+    face_edges_2 = face_edges_2.unsqueeze(0)
+    shared_vert = multi_gather_tris(verts, mesh.faces_packed())[:,2:3].unsqueeze(0)
+
+    ray_o,ray_d,face_edges_1,face_edges_2,shared_vert = torch.broadcast_tensors(ray_o,ray_d,face_edges_1,face_edges_2,shared_vert)
+    A = torch.cat((ray_d,face_edges_1,face_edges_2),dim=-2)
+    b = ray_o - shared_vert
+
+    tuv,info = torch.linalg.solve_ex(A,b.squeeze(-2))
+    return tuv
+
 # Our code
 def pytorch_setup():
         # set PyTorch device, use cuda if available
@@ -2134,7 +2171,7 @@ def test_wine():
         "antipodality_pctile": 1.0 
     }
 
-    com_qual_func = CannyFerrariQualityFunction(config_dict)
+    com_qual_func = CannyFerrariQualityFunction(config_dict, min_quality=1)
 
     eye = torch.tensor([[0.0, 0.6, 0.0]])	# 
     up = torch.tensor([[0.0, 0.0, 1.0]])
@@ -2164,7 +2201,7 @@ def test_wine():
     print("original (ignore backface): ", original_quality)
     axis3D.retain_grad() 
     center3D.retain_grad()
-    optimizer = optim.Rprop([axis3D, center3D], lr=0.00001)
+    optimizer = optim.Rprop([axis3D, center3D], lr=0.0001)
     #optimizer = optim.SGD([center3D], lr=0.25, momentum=0.0)
     print('original-grasp', axis3D.squeeze().numpy(force=True), center3D.squeeze().numpy(force=True))
     for i in range(20):
@@ -2172,14 +2209,15 @@ def test_wine():
         graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
                         friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
         noised_grasps = graspObj.generateNoisyGrasps(25).apply_to_mesh(mesh, ignore_backface_check=True)
+        graspObj.write_obj(f'optim-grasp{i}.obj',include_coordinate=True,include_line_o_action=True)
         noised_tensor = com_qual_func.quality(mesh, noised_grasps)
-        com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
-        qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.002)))
+        #com_qual_func.savemat(f'robust_sgd_iterates{i}.mat')
+        qual_tensor = torch.sum(torch.nn.functional.relu(-(noised_tensor - 0.004)))
         # com_qual_func.savemat(f'quality_out{i}.mat')
         qual_tensor.backward()
         print('iteration: ', i)
         print('raw cf: ',noised_tensor.squeeze().numpy(force=True))
-        print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.002))
+        print('count success: ',np.sum(noised_tensor.squeeze().numpy(force=True) > 0.004))
         print('loss score:',qual_tensor.squeeze().numpy(force=True))
         print('grasp-update', axis3D.grad.squeeze().numpy(force=True), center3D.grad.squeeze().numpy(force=True))
         optimizer.step()
@@ -2519,7 +2557,7 @@ if __name__ == "__main__":
             #model(inputs)
             with torch.enable_grad():        
                 # test_stein()
-                test_quality()
+                # test_quality()
                 test_wine()
                 test_dist()
                 
