@@ -94,6 +94,40 @@ class Renderer:
 				)
 			)	
 
+	def pre_process_object(self, verts, faces_idx):
+		if isinstance(verts, np.ndarray):
+			verts = torch.from_numpy(verts).float().to(self.device)
+			faces_idx = torch.from_numpy(faces_idx).to(self.device)
+
+		unique_vals, inverse_indices = torch.unique(verts, sorted=False, return_inverse=True, return_counts=False, dim=0)
+		if (len(unique_vals) != len(verts)):
+			faces_flat = faces_idx.flatten()
+			new_faces_flat = torch.index_select(inverse_indices, 0, faces_flat)
+			faces_idx = new_faces_flat.reshape(faces_idx.shape)
+			verts = unique_vals
+
+		
+		uniques = torch.unique(torch.sort(faces_idx,dim=-1).values,dim=0)
+		if uniques.shape[0] != faces_idx.shape[0]:
+			# need to strip duplicate faces, which is easiest in trimesh
+			mesh_tri = trimesh.Trimesh(faces=faces_idx.numpy(force=True),
+							  vertices=verts.numpy(force=True),process=False, validate=True)
+			faces_idx = torch.tensor(mesh_tri.faces, device=self.device)
+			verts = torch.tensor(mesh_tri.vertices, device=self.device, dtype=verts.dtype)
+
+		#mask[grouping.unique_rows(np.sort(self.faces, axis=1))[0]] = True
+
+		verts_rgb = torch.ones_like(verts)[None]
+
+		textures = TexturesVertex(verts_features=verts_rgb.to(self.device))
+
+		mesh = Meshes(
+			verts=[verts.to(self.device)],
+			faces=[faces_idx.to(self.device)],
+			textures=textures
+		)
+		return mesh
+
 	def render_object(self, obj_file, display=True, title=None):
 		"""
 		Render mesh object and optionally display
@@ -112,24 +146,8 @@ class Renderer:
 		"""
 
 		verts, faces_idx, _ = load_obj(obj_file)
-		faces = faces_idx.verts_idx
-
-		# check that vertices are unique, and fix if not
-		unique_vals, inverse_indices = torch.unique(verts, sorted=False, return_inverse=True, return_counts=False, dim=0)
-		if (len(unique_vals) != len(verts)):
-			faces_flat = faces_idx.verts_idx.flatten()
-			new_faces_flat = torch.index_select(inverse_indices, 0, faces_flat)
-			faces = new_faces_flat.reshape(faces_idx.verts_idx.shape)
-			verts = unique_vals
-
-		verts_rgb = torch.ones_like(verts)[None]
-		textures = TexturesVertex(verts_features=verts_rgb.to(self.device))
-
-		mesh = Meshes(
-			verts=[verts.to(self.device)],
-			faces=[faces.to(self.device)],
-			textures=textures
-		)
+		
+		mesh = self.pre_process_object(verts, faces_idx.verts_idx)
 
 		image = self.render_mesh(mesh, display=display, title=title)
 		dis_image = image[0, ..., :3].cpu().detach().numpy()

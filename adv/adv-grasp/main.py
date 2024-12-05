@@ -5,6 +5,8 @@ import os
 import matplotlib
 import pytorch3d.ops as ops
 matplotlib.use('agg')
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 adv_grasp_dir = 'adv/adv-grasp/'
 DATA_FILE = os.path.join(adv_grasp_dir,"data/new_barclamp.obj")
@@ -28,22 +30,26 @@ grasps = [g[2], g[5], g[7]]
 model = KitModel(os.path.join(adv_grasp_dir,"weights.npy"),device=device)
 model.eval()
 run1 = Attack(num_plots=100, steps_per_plot=5, model=model, renderer=r, oracle_method="pytorch")
+run2 = Attack(num_plots=50, steps_per_plot=2, model=model, renderer=r, oracle_method="pytorch")
 
 #lr_lst = [(1e-5, 0.0), (1e-5, 0.9), (1e-5, 0.99), (1e-4, 0.0), (1e-4, 0.9)]
-lr_lst = [(1e-5, 0), (5e-6, 0)]
+lr_lst = [(1e-5, 0)]
 
 #grasps = [grasps[0]]
-exp_root_dir = os.path.join(adv_grasp_dir,'test_normals_fixed_1-5_5-6_non_normal_non_tri')
+exp_root_dir = os.path.join(adv_grasp_dir,'test_cf-minweight_fixed_1-5_solve_exp_non_normal_non_tri')
 
-for idx,grasp in enumerate(grasps):
-    grasp.c0 = None
-    grasp.c1 = None
+for idx,grasp_name in enumerate(grasps):
+    grasp_name.c0 = None
+    grasp_name.c1 = None
     for lr in lr_lst:
         lr0, mom = lr[0], lr[1]
-         
-        run1.attack(mesh=mesh, grasp=grasp, dir=f"{exp_root_dir}/oracle-grad/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.ORACLE_GRAD)
-        run1.attack(mesh=mesh, grasp=grasp, dir=f"{exp_root_dir}/oracle-grad-DOWN/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.ORACLE_GRAD_DOWN)
-        run1.attack(mesh=mesh, grasp=grasp, dir=f"{exp_root_dir}/oracle-grad-UP/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.ORACLE_GRAD_UP)
-        run1.attack(mesh=mesh, grasp=grasp, dir=f"{exp_root_dir}/no-oracle/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.NO_ORACLE)
-        run1.attack(mesh=mesh, grasp=grasp, dir=f"{exp_root_dir}/no-oracle-grad/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.NO_ORACLE_GRAD)
-        run1.attack(mesh=mesh, grasp=grasp, dir=f"{exp_root_dir}/random-fuzz/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.RANDOM_FUZZ)
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/oracle-grad-UP-minweight-DOWN/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.ORACLE_GRAD_UP,AttackMethod.MINWEIGHT_DOWN])
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/oracle-grad-DOWN-minweight-UP/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.ORACLE_GRAD_DOWN,AttackMethod.MINWEIGHT_UP])
+                
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/oracle-grad/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.ORACLE_GRAD)
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/oracle-grad-DOWN/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.ORACLE_GRAD_DOWN)
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/oracle-grad-UP/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.ORACLE_GRAD_UP)
+
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/minweight-grad/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT)
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/minweight-grad-DOWN/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_DOWN)
+        run1.attack(mesh=mesh, grasp=grasp_name, dir=f"{exp_root_dir}/minweight-grad-UP/grasp{idx}/lr-{lr_lst.index(lr)}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_UP)

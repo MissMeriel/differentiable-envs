@@ -946,8 +946,8 @@ class Grasp:
 
 		#	rotation matrix
 		theta = self.im_angle.squeeze()	# no -1 for counter-clockwise, stay in radians
-		cos = torch.cos(theta)
-		sin = torch.sin(theta)
+		cos = torch.cos(theta).float()
+		sin = torch.sin(theta).float()
 
 		rotation = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]]).expand(batch_size, -1, -1).to(self.device).float()
 		rotation[indices, 0, 0] = cos
@@ -977,7 +977,7 @@ class Grasp:
 
 		return pose_tensor, dims_transformed
 
-	def oracle_eval(self, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual'):
+	def oracle_eval(self, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual',write_path=None):
 		"""
 		Get a final oracle evalution of a mesh object according to oracle_method
 
@@ -1014,7 +1014,7 @@ class Grasp:
 			if not renderer:
 				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 			else:
-				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode)
+				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode, write_path=write_path)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
 		"""
@@ -1052,7 +1052,7 @@ class Grasp:
 
 		return self.quality
 
-	def write_grasp_pytorch(self, obj, renderer, path):
+	def write_grasp_pytorch(self, obj, renderer, path, quality_path=None):
 		"""
 			Save a colored mesh of the grasp points for the current object using pytorch version of dexnet library
 		"""
@@ -1078,24 +1078,43 @@ class Grasp:
 			else: contact_points = None
 			
 			width = torch.tensor([[0.05]], device=self.device)
-			grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-			
-			if contact_points == None:
-				grasp_torch = grasp_torch.apply_to_mesh(mesh)
+			grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+			if not hasattr(self, 'mesh_properties'):
+				self.mesh_properties = mesh_properties(obj)
+			grasp_torch = grasp_torch.apply_to_mesh(mesh,is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted)
 
 			grasp_torch.write_obj(path, include_coordinate=True, include_line_o_action=True)
 
-	def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual'):
+			if quality_path is not None:
+
+				com_qual_func = CannyFerrariQualityFunction(config_dict)
+				com_qual_func.quality(mesh, grasp_torch)
+				com_qual_func.write_obj(quality_path[0])
+
+				com_qual_func = minWeightQualityFunction(config_dict)
+				com_qual_func.quality(mesh, grasp_torch)
+				com_qual_func.write_obj(quality_path[1])
+
+
+	def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual',write_path=None):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
 
-		if robust:
-			qual_class = RobustCannyFerrariQualityFunction
+		if mode == 'minweight':
+			if robust:
+				qual_class = RobustMinWeightQualityFunction
+			else:
+				qual_class = minWeightQualityFunction
 		else:
-			qual_class = CannyFerrariQualityFunction
+			if robust:
+				qual_class = RobustCannyFerrariQualityFunction
+			else:
+				qual_class = CannyFerrariQualityFunction
+
+
 
 		if (self.world_center == None or self.world_axis == None):
 			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
@@ -1129,8 +1148,9 @@ class Grasp:
 				
 				try:
 					com_qual_func = qual_class(config_dict)
-					quality = com_qual_func.quality(mesh, grasp_torch, 
+					quality = com_qual_func.quality(mesh, grasp_torch,
 									 is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().item()
+
 				except QhullError:
 					quality =  0.0
 
@@ -1146,7 +1166,8 @@ class Grasp:
 			
 			try:
 				com_qual_func = qual_class(config_dict)
-				self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
+				self.quality = com_qual_func.quality(mesh, grasp_torch, 
+									 is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().to(self.world_center.device)
 			except QhullError:
 				self.quality = torch.tensor([0.0]).to(self.device)
 
@@ -1154,6 +1175,9 @@ class Grasp:
 			self.quality.requires_grad_(True)
 		else:
 			self.quality.requires_grad_(False)
+
+		if write_path is not None:
+			com_qual_func.savemat(write_path)
 
 		return self.quality
 

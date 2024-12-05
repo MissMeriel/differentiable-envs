@@ -21,6 +21,10 @@ class AttackMethod(Enum):
 	ORACLE_GRAD = 4
 	ORACLE_GRAD_UP = 5
 	ORACLE_GRAD_DOWN = 6
+	MINWEIGHT = 7
+	MINWEIGHT_UP = 8
+	MINWEIGHT_DOWN = 9
+	NO_GQCNN_GRAD = 10
 
 class Attack: 
 
@@ -119,7 +123,7 @@ class Attack:
 		ax.set_xlabel("Iteration", fontsize="16")
 		ax.set_ylabel("Quality (Scaled)", fontsize="16")
 		ax.set_title("Oracle and GQCNN Quality Over Time", fontsize="18")
-		ax.set_ylim(0, 1.1)
+		#ax.set_ylim(0, 1.1)
 		plt.savefig(dir+"qual.png")
 		plt.close()
 
@@ -139,6 +143,9 @@ class Attack:
 		Tensor: component of loss from self collision distance
 		Tensor: component of loss from adv attack
 		"""
+		if  isinstance(method, AttackMethod):
+			method = [method]
+		method = set(method)
 		
 		def loss_mixer(adv_loss, collision_loss):
 			# local function for merging distance and adverserial loss
@@ -147,7 +154,7 @@ class Attack:
 			collision_loss_scaled = collision_loss / dist_loss_scale
 			loss_float = collision_loss_scaled.item()
 			if math.isfinite(loss_float) and loss_float > 0:
-				scaling = (adv_loss.item() * scale_sat) / loss_float
+				scaling = (abs(adv_loss.item()) * scale_sat) / loss_float
 				collision_loss_sat = torch.minimum(collision_loss_scaled, collision_loss_scaled * scaling)
 			else:
 				collision_loss_sat = collision_loss_scaled
@@ -160,26 +167,35 @@ class Attack:
 		cur_pred = out[:,0:1].to(adv_mesh.device)
 		eps_check = False
 		dist_loss = grasp.eval_self_collision_dist(adv_mesh_clone)
+		oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
+
+		# initialize to 0, so we can optionally add to it
+		adv_loss = torch.zeros([len(adv_mesh),grasp.num_grasps()],device=adv_mesh.device)
+		minweight_pred = torch.zeros([len(adv_mesh),grasp.num_grasps()],device=adv_mesh.device)
+
+		if AttackMethod.NO_GQCNN_GRAD in method:
+			cur_pred = cur_pred.detach()
 
 		# NO ORACLE
-		if method == AttackMethod.NO_ORACLE:
+		if AttackMethod.NO_ORACLE in method:
+			other_methods = method - {AttackMethod.NO_ORACLE}
+			if len(other_methods) > 0:
+				print(f'NO_ORACLE may have unknown effects alongside {other_methods}')
 			adv_loss = cur_pred
-			loss = loss_mixer(adv_loss, dist_loss)
-			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
-			print(f'adv: {cur_pred.item()} energy: {dist_loss.item()} oracle: {oracle_pred.item()}')
 
 		# NO ORACLE GRADIENT - check current model prediction
-		elif method == AttackMethod.NO_ORACLE_GRAD:
-			oracle_pred = Attack.scale_oracle(grasp.quality)
+		elif AttackMethod.NO_ORACLE_GRAD in method:
+			other_methods = method - {AttackMethod.NO_ORACLE_GRAD}
+			if len(other_methods) > 0:
+				print(f'NO_ORACLE_GRAD may have unknown effects alongside {other_methods}')
+			oracle_pred = oracle_pred.detach()
 			abs_diff = torch.abs(torch.sub(cur_pred, oracle_pred))
 			adv_loss = torch.sub(1.0, abs_diff)
-			loss = loss_mixer(adv_loss, dist_loss)
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 	
 		# ORACLE GRADIENT
-		elif method in [ AttackMethod.ORACLE_GRAD,  AttackMethod.ORACLE_GRAD_DOWN,  AttackMethod.ORACLE_GRAD_UP]:
-			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
+		if len(method & { AttackMethod.ORACLE_GRAD,  AttackMethod.ORACLE_GRAD_DOWN,  AttackMethod.ORACLE_GRAD_UP}) > 0:
 
 			if self.loss_alpha is not None:
 				raise Exception("Sorry, not currently supported")
@@ -188,27 +204,48 @@ class Attack:
 			else:
 				# since there is a threshold in robust canny-ferrari, we need
 				# a two different modes to get the gradient we want
-				if method == AttackMethod.ORACLE_GRAD_UP or (method == AttackMethod.ORACLE_GRAD and oracle_pred > cur_pred):
-					abs_diff = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='quality_increase') - cur_pred
+				if AttackMethod.ORACLE_GRAD_UP in method or (AttackMethod.ORACLE_GRAD in method and oracle_pred > cur_pred):
+					abs_diff = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='quality_increase') -0.5 - cur_pred
 				else :
-					abs_diff = cur_pred - grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='quality_decrease')
-				adv_loss = torch.sub(1.0, abs_diff)
-				loss = loss_mixer(adv_loss, dist_loss)	
-				print(f'adv: {adv_loss.item()} energy: {dist_loss.item()} loss: {loss.item()} gqcnn: {cur_pred.item()} rcf: {oracle_pred.item()} consis: {mesh_normal_consistency(adv_mesh)}')
+					abs_diff = cur_pred - grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='quality_decrease') +0.5
+				adv_loss += -abs_diff
 
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 
-		# store variables for plotting
-		if method == AttackMethod.NO_ORACLE:
-			self.losses["prediction"].append(cur_pred.item())
-		else:
-			self.losses["prediction"].append(torch.sub(1.0, abs_diff).item())
+
+		if len(method & { AttackMethod.MINWEIGHT,  AttackMethod.MINWEIGHT_DOWN,  AttackMethod.MINWEIGHT_UP}) > 0:
+			minweight_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer,mode='minweight')
+			if self.loss_alpha is not None:
+				raise Exception("Sorry, not currently supported")
+				abs_diff = torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred)))
+				loss = loss_mixer(torch.sub(1.0, abs_diff), dist_loss)	# use means for batches
+			else:
+				# since there is a threshold in robust canny-ferrari, we need
+				# a two different modes to get the gradient we want
+				if AttackMethod.MINWEIGHT_UP in method or (AttackMethod.MINWEIGHT in method and minweight_pred > cur_pred):
+					abs_diff = minweight_pred - cur_pred
+				else :
+					abs_diff = cur_pred - minweight_pred
+				adv_loss += -abs_diff
+
+			if self.epsilon is not None and abs_diff >= self.epsilon:
+				eps_check = True
+
+		loss = loss_mixer(adv_loss, dist_loss)
+		
+		print(f'adv: {adv_loss.item()} energy: {dist_loss.item()} loss: {loss.item()} gqcnn: {cur_pred.item()} rcf: {oracle_pred.item()} mw: {minweight_pred.item()} method: {method}')
+
+
+		self.losses["prediction"].append(adv_loss.item())
+
 
 		self.losses["dist"].append((dist_loss/10000).item())
 		self.losses["index"].append(index)
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
 		self.track_qual["oracle quality"].append(oracle_pred.item())
+		self.track_qual["minweight quality"].append(minweight_pred.item())
+		#self.track_qual["index"].append(index)
 
 		return loss, eps_check, dist_loss, adv_loss
 
@@ -254,13 +291,16 @@ class Attack:
 		if not os.path.exists(dir):
 			os.makedirs(dir)
 		grasp.save(dir+"grasp.json")
-
+		if isinstance(method, AttackMethod):
+			method_string = method.name
+		else:
+			method_string = str([m.name for m in method])
 		data = {
 			"learning_rate": self.learning_rate,
 			"momentum": self.momentum,
 			"optimizer": "SGD",
 			"loss weight (alpha)": self.loss_alpha, 
-			"method": method.name
+			"method": method_string
 		}
 		with open(logfile, "w") as f:
 			json.dump(data, f, indent=4)
@@ -277,7 +317,9 @@ class Attack:
 
 		self.track_qual = {
 			"gqcnn prediction": [],
-			"oracle quality": []
+			"oracle quality": [],
+			"minweight quality": []
+			#"index": []
 		}
 
 	def attack_random_fuzz(self, mesh, grasp, dir, lr):
@@ -336,7 +378,10 @@ class Attack:
 		pytorch3d.structures.Meshes: adv_mesh
 			Final adversarial mesh
 		"""
-		Attack.logger.info(f"Running attack with method {method.name}!")
+		if isinstance(method, AttackMethod):
+			Attack.logger.info(f"Running attack with method {method.name}!")
+		else:
+			Attack.logger.info(f"Running attack with methods {[m.name for m in method]}!")
 
 		# set attack parameters
 		self.learning_rate = lr
@@ -381,12 +426,14 @@ class Attack:
 			delattr(grasp,'reference_dist')
 
 		# ratio between start and end when doing exponential backoff. 2 will take average, 10 will reduce step by 90%
-		backoff = 10
+		backoff = 100
 		loss_last = 0
 		# ADVERSARIAL LOOP
 		# torch.autograd.set_detect_anomaly(True)
+		resets = 0
 		for i in range(1, self.num_steps):
 			attempts = 0 # used to decide whether to revert to previous mesh in param_safe
+			
 			if not use_fixed_step:
 				optimizer.zero_grad()
 			while True:
@@ -416,14 +463,18 @@ class Attack:
 						if not fail and torch.any((param != param_back).flatten()).item() and torch.all(torch.isfinite(param).flatten()).item():
 							loss_last = loss.item()
 							param_safe.append(param.detach().clone())
-							
+							if resets > 0:
+								resets -= 0.5
 							# no infs, we can compute loss
 							break
 						
 
-				print(f'reducing param diff by {backoff}, try {attempts}')
-				if attempts > 5 or not torch.all(torch.isfinite(param).flatten()).item():
+				print(f'reducing param diff by {backoff}, try {attempts} resest counter {resets}')
+				if attempts > 3 or not torch.all(torch.isfinite(param).flatten()).item():
+					if resets > 3:
+						raise Exception(f'reset {resets} times in a row, unlikely to recover')
 					print(f'resetting with {len(param_safe)}')
+					resets += 1
 					attempts = 0
 					param = param_safe.pop(-1)
 				attempts += 1
@@ -466,7 +517,9 @@ class Attack:
 		vol_mesh, vol_bounding, vol_hull = get_volumes(mesh)
 		mesh_file = dir + f"it-{iteration}.obj"
 		grasp_file = dir + f"it-{iteration}-grasp.obj"
-		grasp.write_grasp_pytorch(mesh, self.renderer, path=grasp_file)
+		quality_files = (dir + f"it-{iteration}-cf.obj", dir + f"it-{iteration}-mw.obj")
+		mat_file = dir + f"it-{iteration}-grasp.mat"
+		grasp.write_grasp_pytorch(mesh, self.renderer, path=grasp_file, quality_path=quality_files)
 		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
 		image = self.renderer.render_mesh(mesh, display=False)
 
@@ -474,9 +527,9 @@ class Attack:
 		pose, processed_dim = grasp.extract_tensors_batch(dim)
 		model_pred = self.run(pose, processed_dim)[:,0:1]
 		if method == AttackMethod.NO_ORACLE_GRAD:
-			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=False)
+			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=False, write_path=mat_file)
 		else:
-			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=True)
+			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=True, write_path=mat_file)
 		oracle_qual_scaled = oracle_qual.item()
 		if orig_pdim is not None: depth_diff = orig_pdim - processed_dim
 
@@ -673,9 +726,9 @@ if __name__ == "__main__":
 	# 		run1.attack(mesh=mesh, grasp=grasp, dir=save, lr=lr, momentum=None, loss_alpha=None, method="random-fuzz")
 
 	# print("ATTACK SET 1\n")
-	grasp = grasps[1]
+	grasp_name = grasps[1]
 	dir = "test/no-oracle/"
-	run1.attack(mesh=mesh, grasp=grasp, dir=dir, lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
+	run1.attack(mesh=mesh, grasp=grasp_name, dir=dir, lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight1/", lr=1e-6, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight2/", lr=1e-6, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight3/", lr=1e-6, momentum=0.0, loss_alpha=0.7, method="oracle-grad")
