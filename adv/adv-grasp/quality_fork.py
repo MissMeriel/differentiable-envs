@@ -1,12 +1,12 @@
 import torch
 import torch.optim as optim
-import os
+
 from torch.masked import masked_tensor
+from torchvision import transforms
 from torch.profiler import profile, record_function, ProfilerActivity
 import numpy as np
 import math
 import json
-import itertools
 from pytorch3d.io import load_obj, save_obj
 from pytorch3d import _C
 import pytorch3d.transforms as tf
@@ -23,907 +23,17 @@ from pytorch3d.renderer import (
         PointLights,
         TexturesVertex
 )
-from qpth.qp import QPFunction, QPSolvers
-# used by block print
-import sys
+from qpth.qp import QPFunction
+
 # used to save grasp visualization
 import trimesh
+from grasp import GraspTorch
+from pytorch3d_ext import mesh_properties as mp
+import pytorch3d_ext as p3d_ex
+from gqcnn_pytorch import KitModel
 #from ll4ma_opt.problems.problem import Problem
 #from ll4ma_opt.problems import SteinWrapper
 #from ll4ma_opt.solvers import GradientDescent,BFGSMethod
-
-# Grasp2D class copied from: https://github.com/BerkeleyAutomation/gqcnn/blob/master/gqcnn/grasping/grasp.py
-class GraspTorch(object):
-    """Parallel-jaw grasp in image space.
-
-    Attributes
-    ----------
-    center : :obj:`autolab_core.Point`
-        Point in image space.
-    angle : float
-        Grasp axis angle with the camera x-axis.
-    depth : float
-        Depth of the grasp center in 3D space.
-    width : float
-        Distance between the jaws in meters.
-    camera_intr : :obj:`autolab_core.CameraIntrinsics`
-        Frame of reference for camera that the grasp corresponds to.
-    contact_points : list of :obj:`numpy.ndarray`
-        Pair of contact points in image space.
-    contact_normals : list of :obj:`numpy.ndarray`
-        Pair of contact normals in image space.
-    """
-    def __init__(self,
-                 center,
-                 angle=0.0,
-                 depth=1.0,
-                 width=0.05,
-                 camera_intr=None,
-                 contact_points=None,
-                 contact_normals=None,
-                 axis3D=None,
-                 num_cone_faces=8, 
-                 friction_coef=0.5,
-                 torque_scaling=None):
-        self.width = width
-        self.camera_intr = camera_intr
-        self.num_cone_faces = num_cone_faces
-        self.friction_coef = friction_coef
-        self.applied_to_object = False
-        self.torque_scaling = torque_scaling
-        self.finger_radius=0.005
-        if(center.shape[-1] == 3): # 3D grasp
-            self.center3D = center.double()
-            self.axis3D = axis3D.double()
-           # self.axis3D = torch.nn.functional.normalize(self.axis3D,dim=-1)
-
-
-        elif(center.shape[-1] == 2): # 2D grasp:
-            self.center = center.double()
-            self.angle = angle.double()
-            self.depth = depth.double()
-            self.axis = torch.cat((torch.cos(self.angle), torch.sin(self.angle)), dim=-1) # TODO, do we need to check if last dim is 1?
-
-            center_in_camera = torch.cat((self.center, self.depth), dim=-1)
-            self.center3D = camera_intr.unproject_points(center_in_camera.float(), world_coordinates=True).double()
-            axis_in_camera = torch.cat((self.axis, torch.zeros(list(self.axis.shape)[:-1]+[1], device=self.axis.device, dtype=self.axis.dtype)),dim=-1)
-            self.axis3D =camera_intr.get_world_to_view_transform().inverse().transform_normals(axis_in_camera.float()).double()
-
-        else:
-            # TODO error
-            self = None
-        
-        if contact_points is not None:
-            self.contact_points = contact_points.double()
-        if contact_normals is not None:
-            self.contact_normals = contact_normals.double()
-
-    def __getitem__(self,key):
-        if isinstance(key, np.ndarray) or torch.is_tensor(key) or isinstance(key, slice):
-
-
-            if torch.numel(self.center3D[...,0]) > 1:
-                center = self.center3D[key]
-            else:
-                center = self.center3D
-            
-
-
-            if torch.is_tensor(self.axis3D) and torch.numel(self.axis3D[...,0]) > 1 :
-                axis3D = self.axis3D[key]
-            else:
-                axis3D = self.axis3D
-            
-            width = self.width
-            
-            camera_intr=self.camera_intr
-            num_cone_faces=self.num_cone_faces
-            friction_coef=self.friction_coef
-            torque_scaling=self.torque_scaling
-            
-            if hasattr(self, 'contact_points'):
-                contact_points = self.contact_points[:,key]
-            else:
-                contact_points = None
-
-            if hasattr(self, 'contact_normals'):
-                contact_normals = self.contact_normals[:,key]
-            else:
-                contact_normals = None       
-
-            sliced = GraspTorch(center,
-                 width=width,
-                 camera_intr=camera_intr,
-                 contact_points=contact_points,
-                 contact_normals=contact_normals,
-                 axis3D=axis3D,
-                 num_cone_faces=num_cone_faces, 
-                 friction_coef=friction_coef,
-                 torque_scaling=torque_scaling)
-            
-            # if grasp was 2D, add the 2D info back in
-            if hasattr(self,'center'):
-                if torch.numel(self.center[...,0]) > 1:
-                    sliced.center = self.center[key]
-                else:
-                    sliced.center = self.center
-
-
-                if torch.is_tensor(self.angle) and torch.numel(self.angle[...,0]) > 1:
-                    sliced.angle = self.angle[key]
-                else:
-                    sliced.angle = self.angle
-
-                if torch.is_tensor(self.depth) and torch.numel(self.depth[...,0]) > 1 :
-                    sliced.depth = self.depth[key]
-                else:
-                    sliced.depth = self.depth
-
-            if hasattr(self, 'mesh'):
-                sliced.mesh = self.mesh
-            if hasattr(self, 'object_com'):
-                sliced.object_com = self.object_com
-            if hasattr(self, 'contact_mask'):
-                contact_mask = torch.zeros_like(self.contact_mask)
-                contact_inds = torch.nonzero(self.contact_mask.flatten()).squeeze(-1)
-                contact_mask[contact_inds[key]] = 1
-                sliced.contact_mask = contact_mask
-
-            sliced.applied_to_object = self.applied_to_object
-            return sliced
-        
-    def __len__(self,):
-        return self.axis3D[...,0].size
-
-    def make2D(self, updateCamera=False,camera_intr=None):
-        if camera_intr==None:
-            camera_intr = self.camera_intr
-        if camera_intr==None:
-            # TODO error
-            return None
-
-        if updateCamera: # in order to keep specified axis, we need to update the camera
-            
-            axis3D = camera_intr.get_world_to_view_transform().transform_normals(self.axis3D.float()).double() # in world
-            
-            cameraDir = torch.tensor([0.,0.,1.],device=self.axis3D.device,dtype=axis3D.dtype,requires_grad=True) # camera Z
-            cameraDir = cameraDir.reshape([1]*(len(axis3D.shape)-1)+[3])
-            cameraDir = cameraDir.expand(axis3D.shape)
-            rotVec = torch.cross(cameraDir, axis3D, dim=-1) # vector orthogonal to both
-            rotVecNorm = torch.linalg.vector_norm(rotVec,dim=-1) # includes angle information
-            rotAngle = torch.asin( rotVecNorm ) - math.pi/2 # compare current angle to 90 deg, assume cameraDir, axis3D are unit
-            rodVec = torch.unsqueeze(rotAngle/rotVecNorm,-1) * rotVec # axis scaled by angle
-
-            rotToGraspAxis = tf.Rotate(tf.so3_exp_map(rodVec.reshape(-1,3)))
-            transformOrig = camera_intr.get_world_to_view_transform()
-            transformFull = transformOrig.compose(rotToGraspAxis)
-            R = transformFull.get_matrix()[...,:3,:3]
-            T = transformFull.get_matrix()[..., 3,:3]
-            camera_intr.get_world_to_view_transform(R=R, T=T) # acts as setter for camera_intr
-            self.camera_intr = camera_intr
-
-        else: # to keep specified camera, we need to update the axis
-            axis3D = camera_intr.get_world_to_view_transform().transform_normals(self.axis3D.float()).double()
-            axis3D[...,2] = 0
-            axis3D = torch.nn.functional.normalize(axis3D,dim=-1)
-            axis3D = camera_intr.get_world_to_view_transform().inverse().transform_normals(axis3D.float()).double()
-            self.axis3D = axis3D
-            
-        self.center = camera_intr.get_full_projection_transform().transform_points(self.center3D.float())[..., :2].double()
-        self.depth = camera_intr.get_world_to_view_transform().transform_points(self.center3D.float())[..., [2]].double()
-        self.axis = torch.nn.functional.normalize(camera_intr.get_world_to_view_transform().transform_normals(self.axis3D.float()).double(),dim=-1)[..., :2]
-        self.angle = torch.atan2(self.axis[..., 1],self.axis[..., 0])
-
-        return camera_intr
-
-    def write_obj(self, path, include_coordinate=False, include_line_o_action=False):
-        sphere_list = [trimesh.transformations.translation_matrix(self.center3D.reshape((3,)).numpy(force=True))]
-        sphere_radius = self.finger_radius
-        sphere_colors = [[255, 0, 255],[255, 0, 0],[0, 0, 255]]
-        mesh_list = []
-        if hasattr(self,'contact_points') and self.contact_points is not None and torch.numel(self.contact_points) > 0:
-            contact_np = self.contact_points.reshape((2,3)).numpy(force=True)
-            for i in [0,1]:
-                sphere_list.append(trimesh.transformations.translation_matrix(contact_np[i,:]))
-                if hasattr(self,'contact_normals') and self.contact_normals is not None:
-                    try:
-                        normal_dir_np = self.contact_normals.reshape((2,3)).numpy(force=True)[i,:]
-                        normal_points_np = np.concatenate((contact_np[(i,),:], contact_np[(i,),:]+normal_dir_np*sphere_radius*2),axis=0)
-                        mesh_list.append(trimesh.creation.cylinder(segment=normal_points_np, radius=sphere_radius/10))
-                        mesh_list[-1].visual.face_colors = sphere_colors[i+1]
-                    except:
-                        print(f'failed to save normals {self.contact_normals}')
-        if hasattr(self,'camera_intr') and self.camera_intr is not None:
-            transform_np = self.camera_intr.get_world_to_view_transform().inverse().get_matrix().reshape((4,4)).transpose(0,1).numpy(force=True)
-            trimesh_cam = trimesh.scene.Camera(focal=self.camera_intr.focal_length.reshape(2).numpy(force=True),
-                                               resolution=self.camera_intr.image_size.reshape(2).numpy(force=True))
-            cam_list = trimesh.creation.camera_marker(trimesh_cam, origin_size=sphere_radius*2)
-            cam_mesh = trimesh.util.concatenate(cam_list)
-            cam_mesh = cam_mesh.apply_transform(transform_np)
-            mesh_list.append(cam_mesh)
-
-        
-        for i in range(len(sphere_list)):
-            mesh_list.append(trimesh.creation.uv_sphere(transform=sphere_list[i],radius=sphere_radius))
-            mesh_list[-1].visual.face_colors = sphere_colors[i]      
-        if include_coordinate:
-            mesh_list.append(trimesh.creation.axis(origin_size=sphere_radius/10))
-        if include_line_o_action:
-            p1,p2 = self.endpoints3D
-            endpoints_np = np.concatenate((p1.reshape(1,3).numpy(force=True),p2.reshape(1,3).numpy(force=True)))
-            mesh_list.append(trimesh.creation.cylinder(segment=endpoints_np, radius=sphere_radius/20))
-            mesh_list[-1].visual.face_colors = [255, 0, 255]
-
-        merged_mesh = trimesh.util.concatenate(mesh_list)
-
-        merged_mesh.export(path)
-
-    @staticmethod
-    def normal_diagonal_3D(reference, var_triple, sampleCount, meanZero=False):
-        output_size = [sampleCount] + list(reference.shape)
-        #reference = torch.unsqueeze(reference,0)
-        reference = reference.expand(output_size)
-        output_samples = torch.zeros_like(reference)
-        for i in range(3):
-            output_samples[...,i] = torch.normal(output_samples[...,i], var_triple[i] ** 2, generator=torch.cuda.manual_seed(i))
-        return output_samples
-    
-    def generateNoisyGrasps(self, sampleCount=1):
-                #          center,
-                #  angle=0.0,
-                #  depth=1.0,
-                #  width=0.05,
-                #  camera_intr=None,
-                #  contact_points=None,
-                #  contact_normals=None,
-                #  axis3D=None,
-                #  num_cone_faces=8, 
-                #  friction_coef=0.5,
-                #  torque_scaling=None
-        sigma_grasp_trans_x= math.sqrt(0.005 ** 2 + 0.01 ** 2)
-        sigma_grasp_trans_y= math.sqrt(0.005 ** 2 + 0.01 ** 2)
-        sigma_grasp_trans_z= math.sqrt(0.005 ** 2 + 0.01 ** 2)
-        sigma_grasp_rot_x= math.sqrt(0.001 ** 2 + 0.01 ** 2)
-        sigma_grasp_rot_y= math.sqrt(0.001 ** 2 + 0.01 ** 2)
-        sigma_grasp_rot_z= math.sqrt(0.001 ** 2 + 0.01 ** 2)
-        R_sample_sigma = torch.eye(3,device=self.axis3D.device,dtype=self.axis3D.dtype) # 3x3
-
-        t_var = (sigma_grasp_trans_x,sigma_grasp_trans_y,sigma_grasp_trans_z)
-        r_var = (sigma_grasp_rot_x, sigma_grasp_rot_y, sigma_grasp_rot_z)
-
-        # R_sample_sigma is treated as (1 grasp dim times) x 3 x 3
-        center_in_noise_frame = torch.squeeze(torch.matmul(torch.transpose(R_sample_sigma,-1,-2),torch.unsqueeze(self.center3D,-1)))
-        center_noised_in_noise_frame = self.normal_diagonal_3D(center_in_noise_frame, t_var, sampleCount) + center_in_noise_frame
-        # R_sample_sigma is treated as 1 x (1 grasp dim times) x 3 x 3
-        center3D = torch.squeeze(R_sample_sigma.matmul(torch.unsqueeze(center_noised_in_noise_frame,-1)),-1)
-
-        axis_in_noise_frame = torch.matmul(torch.transpose(R_sample_sigma,-1,-2), torch.unsqueeze(self.axis3D,-1))
-        randRotVel = self.normal_diagonal_3D(self.axis3D, r_var, sampleCount)
-        randRotVel = torch.reshape(randRotVel, (-1,3))
-        randRelRotMat = tf.so3_exp_map(randRotVel)
-        randRelRotMat = torch.reshape(randRelRotMat, list(center3D.shape)+[3])
-        # R_sample_sigma is treated as 1 x (1 grasp dim times) x 3 x 3
-        axis3D = torch.squeeze(torch.matmul(R_sample_sigma, torch.matmul(randRelRotMat, axis_in_noise_frame)),-1)
-        return GraspTorch(center3D, axis3D=axis3D, 
-                          friction_coef=self.friction_coef, num_cone_faces=self.num_cone_faces,
-                          torque_scaling=self.torque_scaling, width=self.width,
-                          camera_intr=self.camera_intr)
-    
-    @property
-    def ray_directions(self):
-        axisBatched = torch.unsqueeze(self.axis3D,0)
-        return torch.cat([axisBatched, -axisBatched], 0)
-    
-    @property
-    def tform_to_camera(self):
-        """Returns a pytorch3d transform to go from world to camera (pixel) coordinates"""
-        return self.camera_intr.get_full_projection_transform()
-    
-    @property
-    def endpoints(self):
-        """Returns the grasp endpoints."""
-        p1 = self.center - (self.width_px / 2) * self.axis
-        p2 = self.center + (self.width_px / 2) * self.axis
-        return p1, p2
-    
-    @property
-    def endpoints3D(self):
-        """Returns the grasp endpoints."""
-        p1 = self.center3D - (self.width / 2) * self.axis3D
-        p2 = self.center3D + (self.width / 2) * self.axis3D
-        return p1, p2
-
-
-    @property
-    def width_px(self):
-        """Returns the width in pixels."""
-        if self.camera_intr is None:
-            missing_camera_intr_msg = ("Must specify camera intrinsics to"
-                                       " compute gripper width in 3D space.")
-            raise ValueError(missing_camera_intr_msg)
-        # Form the jaw locations in 3D space at the given depth.
-        p1 =torch.cat((torch.zeros([self.depth.shape[0],2],device=self.depth.device,dtype=self.depth.dtype), self.depth), dim=-1)
-        p2 =torch.cat((self.depth, torch.zeros([self.depth.shape[0],1],device=self.depth.device,dtype=self.depth.dtype), self.depth), dim=1)
-
-        # Project into pixel space.
-        u1 = self.camera_intr.transform_points(p1.float())
-        u2 = self.camera_intr.transform_points(p2.float())
-        return torch.norm(u1 - u2,dim=-1)
-    
-    @property
-    def friction_torques(self):
-        """
-        Get the torques that can be applied by a set of force vectors at the contact point.
-
-        Parameters
-        ----------
-        forces : 3xN :obj:`numpy.ndarray`
-            the forces applied at the contact
-
-        Returns
-        -------
-        success : bool
-            whether or not computation was successful
-        torques : 3xN :obj:`numpy.ndarray`
-            the torques that can be applied by given forces at the contact
-        """
-        # TODO error
-        if self.friction_cone is None:
-            return None   
-        
-        
-
-        n_force = self.normal_force_magnitude.unsqueeze(-1).unsqueeze(0)
-        forces = torch.mul(self.friction_cone, n_force)
-
-        momentArm = self.contact_points - self.object_com
-        momentArm = momentArm.expand([forces.shape[0]]+list(momentArm.shape))
-        torques = torch.linalg.cross(momentArm, forces, dim=-1)
-        if torch.any(torch.isnan(torques)):
-            breakpoint()
-        return torques
-    
-    @property
-    def normal_force_magnitude(self):
-        """ Returns the component of the force that the contact would apply along the normal direction.
-
-        Returns
-        -------
-        float
-            magnitude of force along object surface normal
-        """
-        if self.applied_to_object is False:
-            return None   
-        in_direction_norm = torch.nn.functional.normalize(self.ray_directions,dim=-1)
-
-        in_normal = -self.contact_normals
-
-        normal_force_mag = torch.sum(torch.mul(in_normal, in_direction_norm),-1)
-
-        return torch.nn.functional.relu(normal_force_mag)
-        
-    @property
-    def grasp_matrix(self):
-        """ Computes the grasp map between contact forces and wrenchs on the object in its reference frame.
-
-        Returns
-        -------
-        G : 6xM :obj:`numpy.ndarray`
-            grasp map
-        """
-        if self.applied_to_object is False:
-            return None  
-        bounding_box = self.mesh.get_bounding_boxes()
-        bounding_lengths = torch.diff(bounding_box, dim=-1 )
-        if self.torque_scaling == None:
-            median_length = torch.median(bounding_lengths)
-            torque_scaling = torch.pow(median_length, -1)
-        else:
-            torque_scaling = self.torque_scaling
-
-        n_force = self.normal_force_magnitude.unsqueeze(-1)
-        normals = torch.mul(-self.contact_normals , n_force)
-        soft_fingers = True
-        finger_radius=self.finger_radius
-
-        n_force = n_force.unsqueeze(0)
-        forces = torch.mul(self.friction_cone, n_force)
-        torques = torch.mul(self.friction_torques, n_force)
-
-        G = torch.cat([forces, torques*torque_scaling], dim=-1)
-        if soft_fingers:
-            torsion = np.pi * finger_radius**2 * self.friction_coef * normals * torque_scaling
-            G_torsion = torch.zeros(torsion.shape, device=torsion.device, dtype=torsion.dtype)
-            G_torsion = torch.cat((G_torsion, torsion),-1)
-            G_torsion = G_torsion.unsqueeze(0)
-            G = torch.cat((G, G_torsion, -G_torsion), 0)
-
-        return G
-
-    @property
-    def friction_cone(self):
-        """ Computes the friction cone and normal for all contact points.
-
-        Parameters
-        ----------
-        num_cone_faces : int
-            number of cone faces to use in discretization
-        friction_coef : float 
-            coefficient of friction at contact point
-        
-        Returns
-        -------
-        success : bool
-            False when cone can't be computed
-        cone_support : :obj:`numpy.ndarray`
-            array where each column is a vector on the boundary of the cone
-        normal : normalized 3x1 :obj:`numpy.ndarray`
-            outward facing surface normal
-        """
-
-        if self.applied_to_object is False:
-            return None
-
-        def cross_unit(vec1, vec2):
-            vec3 =  torch.linalg.cross(vec1, vec2, dim=-1)
-            return torch.nn.functional.normalize(vec3,dim=-1)
-        
-        normal_in = -self.contact_normals
-        # get unit vectors orthogonal to normal. Defaults to aligning to x axis, falls back on y axis if normal is exactly parallel to x
-        ref = torch.eye(2, m=3,device=self.contact_normals.device, dtype=self.contact_normals.dtype).expand(list(self.contact_normals.shape[:-1]) + [2,3])
-        yvec = cross_unit(normal_in.unsqueeze(-2), ref) # may be degenerate, so perform twice
-        yvec_error = abs(torch.linalg.vector_norm(yvec,dim=-1) - 1)
-        yvec = torch.gather(input=yvec,index=torch.argmin(yvec_error,dim=-1).unsqueeze(-1).unsqueeze(-1).expand(list(yvec.shape[:-2])+[1,3]),dim=-2).squeeze(-2)
- 
-        xvec = cross_unit(yvec, normal_in)
-        yvec = cross_unit(normal_in, xvec)
-        # TODO check if contact would slip https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnet/grasping/contacts.py#L251
-
-
-        def reshape_local(vec, num_faces):
-            vec = vec.unsqueeze(0)
-            target_shape = list(vec.shape)
-            target_shape[0] = num_faces
-            return vec.expand(target_shape)
-            
-        yvec_expanded = reshape_local(yvec, self.num_cone_faces)
-        xvec_expanded = reshape_local(xvec, self.num_cone_faces)
-
-        sampleAngles = torch.linspace(0, 2 * math.pi, self.num_cone_faces+1, device=self.contact_normals.device)
-        sampleAngles = sampleAngles[:-1]
-        sampleAngles = torch.reshape(sampleAngles, [self.num_cone_faces] + [1] * (len(xvec_expanded.shape)-1))
-
-        tan_vec = torch.mul(xvec_expanded, torch.cos(sampleAngles)) + torch.mul(yvec_expanded, torch.sin(sampleAngles))
-        friction_cone = -self.contact_normals + self.friction_coef * tan_vec
-        return friction_cone
-
-        
-    def apply_to_mesh(self, mesh, contact_points=None, ignore_backface_check=False, is_watertight=True, is_inverted=False, use_dexnet_normal=False, use_cramer=False): 
-        """Compute where grasp contacts a mesh, state is meshes pytorch3D object"""
-            # for grasp in grasp 
-        # for each ray (2)
-        # for each triangle (vectorize for parallel)
-        #  compute intersection
-
-            # find intersection
-            # 1. Inside triangle
-            # 2. In direction for ray
-            # 3. Closest to start point (gripper closes until contact)
-            # that intersection is contact_point
-            # angle between ray and normal is contact_normal
-        #https://en.m.wikipedia.org/wiki/M%C3%B6ller%E2%80%93Trumbore_intersection_algorithm
-        opposite_dir_rays = self.ray_directions
-        ray_o = self.center3D - (opposite_dir_rays * self.width / 2)
-        ray_d = opposite_dir_rays # [axis3d, -axis3d]
-        # ray is n, 3
-        
-        target_shape = ray_o.shape
-        # moller_trumbore assumes flat list of rays (2d Nx3)
-        ray_o_flat = torch.flatten(ray_o, end_dim=-2)
-        ray_d_flat = torch.flatten(ray_d, end_dim=-2)
-        if contact_points is None:
-            if use_cramer:
-                with record_function("moller-cramer"):
-                    mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-                    u, v, t = moller_trumbore(ray_o_flat, ray_d_flat, mesh_unwrapped.double())
-            else:
-                with record_function("moller-solve"):
-                    u, v, t  = moller_tumbore_solve(ray_o_flat,ray_d_flat,mesh)
-                    t = t.clone()
-            u = torch.unflatten(u, 0, target_shape[:-1])
-            v = torch.unflatten(v, 0, target_shape[:-1])
-            t = torch.unflatten(t, 0, target_shape[:-1])
-            # correct dir, not too far, actually hits triangle
-            inside1 = ((t >= 0.0) * (t < self.width) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()  # (n_rays, n_faces)
-            t[torch.logical_not(inside1)] = float('Inf')
-            # (n_rays, n_faces)
-            min_out = torch.min(t, -1,keepdim=True)
-
-            contact_points = ray_o + ray_d * min_out.values
-            faces_index = min_out.indices
-            grasps_in_contact = torch.all(torch.all(torch.logical_not(torch.isinf(min_out.values)),dim=-1),dim=0)
-            contact_points = contact_points[:,grasps_in_contact]
-        else:
-            grasps_in_contact = torch.ones(contact_points[...,-1,-1].shape,device=contact_points.device, dtype=torch.bool)
-        
-        
-        #verts = mesh.verts_packed()[mesh.faces_packed()[faces_index,:]]
-        # experimental, weighted vertex normals
-        #vertex_normals = mesh.verts_normals_packed()[mesh.faces_packed()[faces_index,:]]
-        #u_vals = torch.gather(u, 2, faces_index).unsqueeze(3).unsqueeze(4)
-        #v_vals = torch.gather(v, 2, faces_index).unsqueeze(3).unsqueeze(4)
-        #w_vals = 1 - u_vals - v_vals
-        #weights = torch.cat((w_vals,u_vals,v_vals),-2)
-        #minReturn=torch.min(weights,dim=-2)
-        #normsVert = torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2)
-        # verts[[0,1],:,:,minReturn.indices.squeeze(),:] = torch.mean(verts, dim=-2,keepdim=False)
-        # vertex_normals[[0,1],:,:,minReturn.indices.squeeze(),:] = mesh.faces_normals_packed()[faces_index,:]
-        if torch.any(grasps_in_contact):
-            if use_dexnet_normal:
-                (idxs_face, masks, sphereDirs) = GraspTorch.sphereSamples(contact_points, mesh)
-                normsEstimated = self.svdSpherePointsNormal(contact_points, sphereDirs, masks, ray_d[:,grasps_in_contact])
-            else:
-                normsEstimated = GraspTorch.avgSphereArcNormal(mesh, contact_points)
-
-
-            # optional correction if allowing mesh backfaces (some vertex order reversed)
-            if(ignore_backface_check or not is_watertight):
-                normsEstimated = normsEstimated * -torch.sign(torch.sum(normsEstimated * ray_d[:,grasps_in_contact], dim=-1,keepdim=True))
-            # optional correction if we know that all vertices have order reversed
-            elif(is_inverted):
-                normsEstimated = -normsEstimated
-
-            if is_watertight:
-                contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d[:,grasps_in_contact], dim=-1) < 0 ,dim=0)# dot product of normal and finger should be opposite, less than 0
-                contact_is_outside_full = torch.zeros_like(grasps_in_contact)
-                contact_is_outside_full[grasps_in_contact] = contact_is_outside
-                grasps_in_contact = torch.logical_and(grasps_in_contact,  contact_is_outside_full)
-                contact_points = contact_points[:,contact_is_outside]
-                normsEstimated = normsEstimated[:,contact_is_outside]
-                if torch.numel(normsEstimated) > 0 and torch.any( torch.linalg.vector_norm(normsEstimated) < 0.95):
-                    print('found bad normal')
-
-        grasp_with_contact = self[grasps_in_contact]
-        # normsSphereAvg = self.avgSpherePoints(state, idxs_face, masks, self.contact_points)
-        #torch.mean(verts, dim=-2,keepdim=True)
-        #vertex_normals.scatter_( state.faces_normals_packed()[faces_index,:])
-        # TODO, update to use built in https://pytorch3d.readthedocs.io/en/latest/_modules/pytorch3d/ops/interp_face_attrs.html
-        #self.contact_normals = (torch.sum(torch.multiply(vertex_normals,weights),dim=-2).squeeze(-2) + torch.squeeze(state.faces_normals_packed()[faces_index,:],-2))/2
-        normsFace = torch.squeeze(mesh.faces_normals_packed()[faces_index,:],-2)
-        grasp_with_contact.contact_mask = grasps_in_contact
-        grasp_with_contact.face_normals = normsFace
-        grasp_with_contact.applied_to_object = True
-        grasp_with_contact.contact_points = contact_points
-        if torch.any(grasps_in_contact):
-            grasp_with_contact.contact_normals = normsEstimated
-        else:
-            grasp_with_contact.contact_normals = contact_points
-        grasp_with_contact.mesh = mesh
-        grasp_with_contact.object_com = compute_mesh_COM(mesh,is_watertight=is_watertight)
-        grasp_with_contact.faces_index = faces_index
-
-        return grasp_with_contact
-
-    @property
-    def count_misses(self):
-        if hasattr(self, 'contact_mask'):
-            return torch.count_nonzero(torch.logical_not(self.contact_mask))
-        else:
-            return float('nan')
-
-    @staticmethod
-    def dexnetRadius(mesh, gridDist=1.5):
-        # matches min scaling from:
-        # https://github.com/BerkeleyAutomation/dex-net/blob/cccf93319095374b0eefc24b8b6cd40bc23966d2/src/dexnetdatabase/mesh_processor.py#L281
-        sdf_dim = 100
-        sdf_padding = 5
-
-        maxDim = torch.max(torch.diff(mesh.get_bounding_boxes(),dim=-1))
-        scaling = (maxDim / (sdf_dim - sdf_padding * 2)) # box to meters
-        sphereRadius = scaling * gridDist
-        return sphereRadius, scaling
-
-    @staticmethod
-    def sphereSamples(surface_point, mesh):
-        # rejection ish samples around surface_point that are on mesh
-        point = surface_point.unsqueeze(-2) # add dim for samples
-
-        steps = 3 # positive int, probably odd
-        steps_cubed = steps**3
-        obj_target_scale = 0.040
-        sphereRadius,scaling = GraspTorch.dexnetRadius(mesh)
-        step_ends = (steps-1)/2
-        step_tensor = torch.linspace(start=-step_ends,end=step_ends,steps=steps,device=mesh.device,dtype=surface_point.dtype)
-        sphereDirsTuple = torch.meshgrid(step_tensor,step_tensor,step_tensor,indexing='ij')
-        sphereDirs = torch.cat((sphereDirsTuple[0].reshape(steps_cubed,1),sphereDirsTuple[1].reshape(steps_cubed,1),sphereDirsTuple[2].reshape(steps_cubed,1)),1)
-        sphereDirs = torch.nn.functional.normalize(sphereDirs.double(),dim=-1) * sphereRadius
-        sphereDirs = sphereDirs.reshape([1]*(len(point.shape)-2)+ [steps_cubed, 3])
-        pointSphere = sphereDirs + point
-        origShape = pointSphere.shape
-        pointSphereCloud = Pointclouds([pointSphere.reshape(-1,3)])
-
-        (idxs_face, dists, face_edge_shared) = GraspTorch.checkSamplesAreOnMesh(pointSphereCloud, mesh)
-
-        dists = dists.reshape([-1, steps_cubed, 1])
-        face_edge_shared = face_edge_shared.reshape([-1, steps_cubed, 1])
-        idxs_face = idxs_face.reshape([-1, steps_cubed, 1])
-        minDist = (scaling * np.sqrt(2) / 2)**2  # square meters 
-        masks = torch.split(torch.logical_and(dists < minDist,face_edge_shared), dim=0, split_size_or_sections=1)
-        if torch.count_nonzero(masks[1]) < 1:
-            print('bad match')
-        return idxs_face, masks, sphereDirs
-
-    @staticmethod
-    def checkSamplesAreOnMesh(samples, mesh):
-        # check if sample points are near surface of mesh
-        verts_packed = mesh.verts_packed()
-        faces_packed = mesh.faces_packed()
-        tris = verts_packed[faces_packed]
-        edges_packed = mesh.edges_packed()
-        segms = verts_packed[edges_packed]
-
-        dists_face, idxs_face = _C.point_face_dist_forward(samples.points_packed().float(), 
-                                                samples.cloud_to_packed_first_idx(), 
-                                                tris.float(), 
-                                                mesh.mesh_to_faces_packed_first_idx(), 
-                                                samples.num_points_per_cloud().max().item(),
-                                                5e-6)
-        dists_edge, idxs_edge = _C.point_edge_dist_forward(samples.points_packed().float(), 
-                                                samples.cloud_to_packed_first_idx(), 
-                                                segms.float(), 
-                                                mesh.mesh_to_edges_packed_first_idx(), 
-                                                samples.num_points_per_cloud().max().item(),
-                                                )
-        dists = dists_edge
-        edges_to_check = mesh.faces_packed_to_edges_packed()[idxs_face,:]
-        face_edge_shared = torch.any(edges_to_check == idxs_edge.unsqueeze(1), dim=1)
-        dists[face_edge_shared] = dists_face[face_edge_shared]
-        
-        return idxs_face, dists, face_edge_shared
-
-    @staticmethod
-    def avgSphereArcNormal(mesh, surface_point, drop_opposite_normals=False):
-        # Assumes that nearby triangles have same winding. If winding is inconsistent, mean will be weird
-        radius,_ = GraspTorch.dexnetRadius(mesh)
-        verts_packed = mesh.verts_packed()
-        faces_packed = mesh.faces_packed()
-        tris = verts_packed[faces_packed]
-
-        # find reference frame for each face
-        face_normals_unsqeeze = mesh.faces_normals_packed().unsqueeze(-1)
-        edge_dir = torch.nn.functional.normalize(tris[:,1,:]-tris[:,0,:],dim=-1).unsqueeze(-1)
-        face_rot_ms = torch.cat((edge_dir, torch.cross(face_normals_unsqeeze,edge_dir),face_normals_unsqeeze),-1)
-        
-        # rotate each face to that frame
-        tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
-        # rotate contacts to that frame
-        sp_shape = list(surface_point.shape[:-1]) + [1] * len(face_rot_ms.shape[:-1]) + [3]
-        rm_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [3,3]
-        surface_point_rot = torch.matmul(surface_point.reshape(sp_shape), face_rot_ms.double().reshape(rm_shape)).squeeze(-2)
-        tris_2D = tris_rot[...,:-1]
-        sphere_plane_dist = surface_point_rot[...,-1] - tris_rot[...,0,-1]
-        intersects_plane = torch.abs(sphere_plane_dist) < radius
-        sphere_center_2D = surface_point_rot[...,:-1]
-        # get radius of projection of sphere to triangle plane, 0 out all non-intersections
-        radius_2D = torch.zeros_like(sphere_plane_dist)
-        radius_compare = radius**2 - sphere_plane_dist**2
-        radius_compare_positive = radius_compare > 0
-        radius_2D[radius_compare_positive] = torch.sqrt( radius_compare[radius_compare_positive] )
-        radius_2D_inv = torch.zeros_like(radius_2D)
-        radius_2D_inv[intersects_plane] = 1 / radius_2D[intersects_plane]
-        # triangle centered at projection with radius 0 
-        tris_2D_unit = (tris_2D - sphere_center_2D.unsqueeze(-2)) * radius_2D_inv.unsqueeze(-1).unsqueeze(-1)
-    #    # masking to reduce computation, che 
-    #    tris_2D_unit = tris_2D_unit[intersects_plane]
-
-        # # can filter on mesh_on_contact_proj all less than face_radius
-
-        edge_dir_2D = tris_2D_unit[...,(1,2,0),:] - tris_2D_unit
-        # # mesh_on_contact_proj and edge_dir_2D define line segment
-        # # solve for intersection with unit circle
-        # https://mathworld.wolfram.com/Circle-LineIntersection.html
-        edge_length_2D_sq = torch.sum(edge_dir_2D**2,dim=-1)
-        # # x1y2 - x2y1
-        edge_det_2D = tris_2D_unit[...,0] * tris_2D_unit[...,(1,2,0),1] - tris_2D_unit[...,1] * tris_2D_unit[...,(1,2,0),0]
-        edge_disc_2D = edge_length_2D_sq - edge_det_2D ** 2
-        edge_length_2D_sq_finite = edge_length_2D_sq!=0
-        projection_contact_on_edge_2D = torch.zeros_like(edge_dir_2D[...,(1,0)])
-        projection_contact_on_edge_2D[edge_length_2D_sq_finite] = edge_dir_2D[...,(1,0)][edge_length_2D_sq_finite] * torch.cat((edge_det_2D[edge_length_2D_sq_finite].unsqueeze(-1),-edge_det_2D[edge_length_2D_sq_finite].unsqueeze(-1)),dim=-1) / edge_length_2D_sq[edge_length_2D_sq_finite].unsqueeze(-1)
-        projection_contact_on_edge_2D_norm = torch.sum((projection_contact_on_edge_2D - tris_2D_unit) * edge_dir_2D,dim=-1) / edge_length_2D_sq
-        edge_norm_2d = torch.cat((edge_dir_2D[...,(1)].unsqueeze(-1),-edge_dir_2D[...,(0)].unsqueeze(-1)),dim=-1)
-        contact_is_above_line = torch.sum(-tris_2D_unit * edge_norm_2d, dim = -1) < 0
-        contact_is_above = torch.all( contact_is_above_line, dim=-1)
-        proj_falls_in_seg = torch.all(
-            torch.logical_and(
-                projection_contact_on_edge_2D_norm > 0,
-                projection_contact_on_edge_2D_norm < 1,
-                ),dim=-1)
-        contains_projected_sphere = torch.logical_and(contact_is_above,
-            torch.all(torch.linalg.vector_norm(projection_contact_on_edge_2D,dim=-1) > 1,dim=-1))
-        contact_fully_contained = torch.logical_and(proj_falls_in_seg, contains_projected_sphere)
-        intersects_line = edge_disc_2D > 0
-        projection_contact_on_edge_2D[torch.isnan(projection_contact_on_edge_2D)] = 0
-        # filter out known bad lines
-        #edge_dir_2D = edge_dir_2D[intersects_line]
-        #edge_det_2D = edge_det_2D[intersects_line]
-        #edge_length_2D_sq = edge_length_2D_sq[intersects_line]
-        #edge_disc_2D = edge_disc_2D[intersects_line]
-        #tris_2D_unit = tris_2D_unit[intersects_line]
-        #projection_contact_on_edge_2D = projection_contact_on_edge_2D[intersects_line]
-        # can filter on disc, if neg, no intersection
-        edge_length_2D_sq = edge_length_2D_sq.unsqueeze(-1)
-        edge_length_2D_sq_non_zero = torch.abs(edge_length_2D_sq) != 0 # torch.finfo(torch.float32).eps
-        x_scale = (torch.sign(edge_dir_2D[...,1]) * edge_dir_2D[...,0]).unsqueeze(-1)
-        y_scale = abs(edge_dir_2D[...,1]).unsqueeze(-1)
-        offset_to_tri_sphere_inter_2D_num = torch.zeros_like(edge_disc_2D.unsqueeze(-1).expand(list(edge_disc_2D.shape)+[2]))
-        offset_to_tri_sphere_inter_2D_num[intersects_line] = torch.cat((x_scale[intersects_line],y_scale[intersects_line]),dim=-1) * torch.sqrt(edge_disc_2D[intersects_line]).unsqueeze(-1)
-        offset_to_tri_sphere_inter_2D = torch.zeros_like(offset_to_tri_sphere_inter_2D_num)
-        offset_to_tri_sphere_inter_2D[edge_length_2D_sq_non_zero.squeeze(-1)] = offset_to_tri_sphere_inter_2D_num[edge_length_2D_sq_non_zero.squeeze(-1)] / edge_length_2D_sq[edge_length_2D_sq_non_zero].unsqueeze(-1)
-        offset_to_tri_sphere_inter_2D=offset_to_tri_sphere_inter_2D.unsqueeze(-2)
-        intersection_sphere_edge_2D = projection_contact_on_edge_2D.unsqueeze(-2) + torch.cat((offset_to_tri_sphere_inter_2D,-offset_to_tri_sphere_inter_2D),dim=-2)
-        intersection_sphere_edge_2D_norm = torch.sum((intersection_sphere_edge_2D - tris_2D_unit.unsqueeze(-2)) * edge_dir_2D.unsqueeze(-2),dim=-1)[edge_length_2D_sq_non_zero.squeeze(-1)] / edge_length_2D_sq[edge_length_2D_sq_non_zero].unsqueeze(-1)
-        intersects_segment = torch.logical_and(intersection_sphere_edge_2D_norm > 0,intersection_sphere_edge_2D_norm < 1)
-        
-        intersection_sphere_edge_2D_finite = torch.logical_and(torch.all(torch.logical_not(torch.isnan(intersection_sphere_edge_2D)),dim=-1),intersection_sphere_edge_2D[...,0]!=0)
-        
-        intersects_tri = torch.any(torch.any(intersects_segment,dim=-1),dim=-1)
-        intersection_angles = torch.zeros_like(intersection_sphere_edge_2D[...,1])
-        intersection_angles[intersection_sphere_edge_2D_finite] = torch.atan2(intersection_sphere_edge_2D[intersection_sphere_edge_2D_finite][:,1],intersection_sphere_edge_2D[intersection_sphere_edge_2D_finite][:,0])
-        #
-
-        ## sort (or mask, seems equivalent?) intersections on angle, filling missing with pi, append the -pi,pi
-        
-        #intersection_angles[torch.logical_not(intersects_segment)] = float('nan')
-        intersection_angles_shape = list(intersection_angles.shape[:-2]) + [-1]
-        intersection_angles = torch.reshape(intersection_angles, intersection_angles_shape)
-        pad_size = list(intersection_angles.shape[:-1]) + [1]
-        #start_pad = -math.pi * torch.ones(pad_size, dtype=intersection_angles.dtype, device=intersection_angles.device)
-        #end_pad = math.pi * torch.ones(pad_size, dtype=intersection_angles.dtype, device=intersection_angles.device)
-        #intersection_angles = torch.cat((start_pad, intersection_angles, end_pad),dim=-1)
-        intersection_angles = torch.sort(intersection_angles, dim=-1).values
-        
-        ## for each pair of interesections, check if point at intermediate angle is inside triangle
-        
-        dif_angles = torch.cat((torch.diff(intersection_angles, dim=-1), torch.full_like(intersection_angles[...,0:1],torch.nan)),dim=-1)
-        dif_wrap = intersection_angles[...,0:1] - intersection_angles
-        dif_wrap[torch.isnan(dif_wrap)] = 0
-        dif_wrap = torch.min(dif_wrap,keepdim=True, dim=-1)
-        dif_angles = dif_angles.scatter_(-1, dif_wrap.indices, dif_wrap.values + 2 * math.pi )
-        intersection_angles[intersection_angles.isnan()] = 0
-
-        dif_angles_nan=torch.isnan(dif_angles)
-        dif_angles_finite = torch.logical_and(torch.logical_not(dif_angles_nan), dif_angles!=0)
-        dif_angles_clean = dif_angles[dif_angles_finite]
-        dif_angles[dif_angles_nan] = 0
-
-        mid_angles = intersection_angles + dif_angles/2
-
-        mid_points = torch.cat((torch.cos(mid_angles).unsqueeze(-1),torch.sin(mid_angles).unsqueeze(-1)),dim=-1)
-        mid_points[torch.isnan(mid_points)] = 0
-        dif_angles_half = torch.zeros_like(dif_angles)
-        dif_angles_half = dif_angles_clean/2
-
-        arc_com_2D_unit_scale = torch.zeros_like(dif_angles)
-        arc_com_2D_unit_scale[dif_angles_finite] = (torch.sin(dif_angles_half)/(dif_angles_half))
-        arc_com_2D_unit = arc_com_2D_unit_scale.unsqueeze(-1) * mid_points
-        arc_com_2D = arc_com_2D_unit * radius_2D.unsqueeze(-1).unsqueeze(-1) + sphere_center_2D.unsqueeze(-2)
-
-        mid_points = mid_points.unsqueeze(-2)
-        edge_dir_2D = edge_dir_2D.unsqueeze(-3)
-        tris_2D_unit = tris_2D_unit.unsqueeze(-3)
-        # ## if inside of triangle, add the angle between them to count for that triangle/circle combo
-        # ## check if midpoints is inside triangle by checking if it is on same side of all edges
-        # ## https://stackoverflow.com/a/3461533
-        mid_point_in_tri = torch.all(edge_dir_2D[...,0] * (mid_points[...,1]-tris_2D_unit[...,1]) - edge_dir_2D[...,1] * (mid_points[...,0]-tris_2D_unit[...,0]) > 0,dim=-1)   
-
-
-        sin_dif_over_dif = torch.sin(dif_angles_clean)/dif_angles_clean
-    
-        moment_of_inertia_1 = torch.zeros_like(dif_angles)
-        moment_of_inertia_2 = torch.zeros_like(dif_angles)
-        # only compute where dif angle exists
-        moment_of_inertia_1[dif_angles_finite] = 0.5 * (1 + sin_dif_over_dif - 2 * torch.square(torch.sin(dif_angles_clean))/torch.square(dif_angles_clean))
-        moment_of_inertia_2[dif_angles_finite] = 0.5 * (1 - sin_dif_over_dif)
-        moment_of_inertia_3 = moment_of_inertia_1+moment_of_inertia_2
-        # match size back up
-
-        # rotation matrix used a couple places
-        face_rot_shape = [1] * len(surface_point.shape[:-1]) + [face_rot_ms.shape[0]] + [1] + [3] * 2
-        # rotate stuff back to 3D
-        # tris_rot = torch.matmul(tris.unsqueeze(-2), face_rot_ms.unsqueeze(-3)).squeeze(-2)
-        fac_rot = face_rot_ms.double().reshape(face_rot_shape)
-        fac_rot_inverse = fac_rot.transpose(-2,-1)
-
-        # get arc center of mass into mesh coordinates
-        dim_3 =  torch.zeros_like(arc_com_2D[...,0:1])
-        tri_shape = len(surface_point.shape[:-1]) * [1] + [-1] + 2 * [1]
-        center_local_3D = torch.cat((arc_com_2D,dim_3+tris_rot[...,0,2:3].reshape(tri_shape)),-1).unsqueeze(-2)
-        arc_com_3D = torch.matmul(center_local_3D, fac_rot_inverse).squeeze(-2)
-        arc_com_3D[torch.logical_not(mid_point_in_tri)] = 0
-
-        # get overall center of mass from weighted average
-        arc_mass = radius_2D.unsqueeze(-1) * dif_angles
-        arc_mass[torch.logical_not(mid_point_in_tri)] = 0
-
-
-        # solution 1: smoother weighted average normal
-        arc_mass_per_face = torch.sum(arc_mass,dim=-1,keepdim=True)
-        
-        face_normals_reshape = mesh.faces_normals_packed().reshape(rm_shape[:-1]).expand(torch.broadcast_shapes(arc_mass_per_face.size(),rm_shape[:-1]))
-        # optional check for normals that are opposite the one at the collision point, and therefore don't contribute to overall normal
-        if drop_opposite_normals:
-            collision_faces_index = torch.argmax(torch.all(contact_is_above_line,dim=-1,keepdim=True).to(dtype=torch.uint8),dim=-2,keepdim=True)
-            collision_faces_size = list(collision_faces_index.shape)[:-1] + [3]
-            collision_faces_index = collision_faces_index.expand(collision_faces_size)
-            collision_faces = torch.gather(face_normals_reshape,-2, collision_faces_index)
-            dots = torch.linalg.vecdot(collision_faces, face_normals_reshape)
-            arc_mass_per_face[dots < 0] = 0
-            
-        normalContribution = face_normals_reshape * arc_mass_per_face
-        surface_normals_avg = torch.nn.functional.normalize(torch.sum(normalContribution,dim=-2), dim=-1)
-
-        # # solution 2: more dexnet like, SVD on intersections. Does weird stuff at corners
-        # # moment of inertia -> Cov -> SVD
-        # arc_com_total = torch.sum(arc_mass.unsqueeze(-1) * arc_com_3D,dim=(-3,-2)) / torch.sum(arc_mass,dim=(-1,-2)).unsqueeze(-1) 
-        # 
-        # moment_of_inertia_vec = torch.cat((moment_of_inertia_1.unsqueeze(-1),moment_of_inertia_2.unsqueeze(-1),moment_of_inertia_3.unsqueeze(-1)),dim=-1)
-        # moment_of_inertia_local = torch.diag_embed(moment_of_inertia_vec)
-        # moment_of_inertia_local[torch.logical_not(mid_point_in_tri)] = 0
-        # moment_of_inertia_local = moment_of_inertia_local * (radius_2D*radius_2D).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
-        # # transform to shared CoM 
-        # # https://en.m.wikipedia.org/wiki/Moment_of_inertia#Inertia_tensor_of_rotation
-        # arc_displacement = (arc_com_total.unsqueeze(-2).unsqueeze(-2) - arc_com_3D)
-        # moment_of_inertia_local_aligned = torch.matmul(torch.matmul(fac_rot, moment_of_inertia_local),  fac_rot_inverse)
-        # # outter product
-        # m_o_i_2 = torch.matmul(arc_displacement.unsqueeze(-1), arc_displacement.unsqueeze(-2))
-        # # inner product
-        # m_o_i_1 = torch.matmul(arc_displacement.unsqueeze(-2), arc_displacement.unsqueeze(-1)).squeeze(-1)
-        # m_o_i_1 = torch.diag_embed(m_o_i_1.expand(list(m_o_i_1.shape)[:-1]+[3]))
-        # moment_of_inertia_global = moment_of_inertia_local_aligned + m_o_i_1 - m_o_i_2
-        # moment_of_inertia_global[torch.logical_not(mid_point_in_tri)] = 0
-
-        # moment_of_inertia_total = torch.sum(moment_of_inertia_global,dim=(-4,-3))
-        # moment_of_inertia_total_diag = torch.diagonal(moment_of_inertia_total,dim1=-1,dim2=-2)
-        # moment_of_inertia_total_trace = torch.sum(moment_of_inertia_total_diag,keepdim=True,dim=-1)
-        # moment_of_inertia_total_trace_mat = torch.diag_embed(moment_of_inertia_total_trace.expand(list(moment_of_inertia_total_trace.shape)[:-1]+[3]))
-        # cov = moment_of_inertia_total_trace_mat/2-moment_of_inertia_total
-        # eig_return = torch.linalg.eigh(cov)
-        # surface_normals = torch.real(eig_return.eigenvectors[...,0])
-
-        # savemat('segments.mat',{'segments':segments_3D[linearized_segments_mask].numpy(force=True),'eigvec':torch.real(eig_return[1]).numpy(force=True),'eigval':torch.real(eig_return[0]).numpy(force=True)})
-        if torch.any(torch.linalg.vector_norm(surface_normals_avg,dim=-1)<1e-5):
-            raise Exception("Non-unit normal found, check contact on mesh")
-        #return surface_normals * -torch.sign(torch.sum(surface_normals * in_rays, dim=-1,keepdim=True))
-        return surface_normals_avg
-
-    # @staticmethod
-    # def avgSpherePointsNormal(self, mesh, idxs_face, masks, surface_point):
-    #     normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-    #     for maskInd in range(len(masks)):
-    #         normals[maskInd,:] = torch.mean(mesh.faces_normals_packed()[idxs_face.squeeze()[maskInd, masks[maskInd].squeeze()],:], dim=0)
-    #     normals = normals.reshape(surface_point.shape)
-    #     return normals
-
-    @staticmethod
-    def svdSpherePointsNormal(surface_point, sphereDirs, masks, in_rays):
-
-        normals = torch.zeros_like(surface_point).reshape((len(masks),3))
-        for maskInd in range(len(masks)):
-            (U, S, V) = torch.pca_lowrank(sphereDirs.squeeze()[masks[maskInd].squeeze(),:],center=True)
-            normals[maskInd,:] = V[:, -1]
-        normals = normals.reshape(surface_point.shape)
-        return normals * -torch.sign(torch.sum(normals * in_rays, dim=-1,keepdim=True))
-
-
-    @property
-    def feature_vec(self):
-        """Returns the feature vector for the grasp.
-
-        `v = [p1, p2, depth]` where `p1` and `p2` are the jaw locations in
-        image space.
-        """
-        p1, p2 = self.endpoints
-        return np.r_[p1, p2, self.depth]
 
 
 class GraspQualityFunction():    #ABC):
@@ -976,8 +86,8 @@ class GraspQualityFunction():    #ABC):
         # collects a dictionary of interesting internal state, then saves it
         dict_to_save = {}
         if self.Grasps is not None:
-            dict_to_save['axis3D'] = self.Grasps.axis3D.numpy(force=True)
-            dict_to_save['center3D'] = self.Grasps.center3D.numpy(force=True)
+            dict_to_save['axis3D'] = self.Grasps.world_axis.numpy(force=True)
+            dict_to_save['center3D'] = self.Grasps.world_center.numpy(force=True)
             dict_to_save['contact_points']= self.Grasps.contact_points.numpy(force=True)
             dict_to_save['contact_normals']= self.Grasps.contact_normals.numpy(force=True)
             dict_to_save['face_normals']= self.Grasps.face_normals.numpy(force=True)
@@ -1049,563 +159,202 @@ class ParallelJawQualityFunction(GraspQualityFunction):
         return (self.friction_cone_angle(action) <
                 self._max_friction_cone_angle)
 
-def compute_mesh_tri_areas(mesh):
-    """Compute the area of each mesh triangle, using mean as 4th point. Used in CoM/Volume for non-watertight"""
+
+class GQCNNQualityFunction(ParallelJawQualityFunction):
+    def __init__(self, weights_path, renderer):
+        self.model = KitModel(weight_file=weights_path, device=renderer.device)
+        self.model.eval()
+        self.renderer = renderer
     
-    verts_tri = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-    com_per_triangle = torch.mean(verts_tri, 1) 
-
-    verts = mesh.verts_packed()
-    verts.requires_grad_(True)
-    # compute all edge vectors
-    edges_tri = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, edge, xyz
-    area_per_triangle = torch.linalg.norm(torch.linalg.cross(edges_tri[:,0,:],edges_tri[:,1,:]),dim=-1,keepdim=True)/2
-
-    return area_per_triangle, com_per_triangle
-
     
-
-def compute_mesh_tetra_volumes(mesh):
-    """Compute the volume of each mesh tetra, using mean as 4th point. Used in CoM/Volume for watertight"""
-    #https://forums.cgsociety.org/t/how-to-calculate-center-of-mass-for-triangular-mesh/1309966
-    mesh_unwrapped = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-    # B, F, 3, 3
-    # assume Faces, verts, coords
-    totalCoords = torch.sum(mesh_unwrapped, 1) # used in both mean and CoM, so split out
-
-    meanVert = torch.sum(totalCoords,0) / (totalCoords.shape[0] * totalCoords.shape[1])
-
-    totalCoords = totalCoords + meanVert
-    com_per_triangle = totalCoords / 4
-
-    # add dims and expand "average vertex" to match mesh. Will be used to go from triangles to
-    # tetrahedrons
-    meanVert_expand = torch.reshape(meanVert, [1, 1, 3]).expand(mesh_unwrapped.shape[0],1,3)
-
-    mesh_tetra = torch.cat([mesh_unwrapped, meanVert_expand], 1)
-    mesh_tetra = torch.cat([mesh_tetra, torch.ones([mesh_tetra.shape[0],4,1],device=mesh_unwrapped.device,dtype=mesh_unwrapped.dtype)], -1)
-    vol_per_triangle = torch.reshape(torch.linalg.det(mesh_tetra),(mesh_tetra.shape[0],1))
-    # det([[x1,y1,z1,1],[x2,y2,z2,1],[x3,y3,z3,1],[x4,y4,z4,1]]) / 6 
-    # technically a scaled volume, since we dropped the division by 6
-    # does det on last 2 dims, considers at least first 1 to be batch dim
-    return vol_per_triangle, com_per_triangle
-
-def compute_mesh_bounding_volume(mesh):
-    bb = mesh.get_bounding_boxes()
-    ranges = torch.diff(bb,dim=-1).squeeze(-1)[0]
-    return torch.prod(ranges,dim=-1)
-
-def compute_mesh_volume(mesh, ignore_backface_check=False):
-    """Compute the volume for a mesh, assume uniform density."""
-    vol_per_triangle,_ = compute_mesh_tetra_volumes(mesh)
-    if ignore_backface_check:
-        vol_per_triangle = torch.abs(vol_per_triangle)
-    return torch.sum(vol_per_triangle)/6
-
-def compute_mesh_hull_volume(mesh):
-    verts = mesh.verts_packed()
-    verts_np = verts.numpy(force=True)
-    hull = ConvexHull(verts_np).simplices
-    # get unique from hull, update hull to use unique indices
-    indices_kept, hull_new = np.unique(hull.reshape(-1),return_inverse=True)
-    hull_new = np.reshape(hull_new, hull.shape)
-    faces = torch.tensor(hull_new, dtype=torch.long, device=mesh.device)
-    verts = verts[indices_kept,:]
-    mesh_hull = Meshes([verts],[faces])
-    # sub sample verts with unique indices
-    return compute_mesh_volume(mesh_hull,ignore_backface_check=True)
-    # construct mesh
-
-
-def compute_mesh_COM(mesh, is_watertight=True): 
-    """Compute the center of mass for a mesh, assume uniform density."""
-    if is_watertight:
-        vol_per_triangle, com_per_triangle = compute_mesh_tetra_volumes(mesh)
-        total_vol = torch.sum(vol_per_triangle)
-        if abs(total_vol) < 1e-10:
-            print('WARNING: "watertight" mesh has volume 0, treating as non-watertight')
-    
-    if not is_watertight or total_vol < 1e-10: 
-        vol_per_triangle, com_per_triangle = compute_mesh_tri_areas(mesh)
-        total_vol = torch.sum(vol_per_triangle)
-
-    com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / total_vol
-
-    return com
-
-class mesh_properties:
-    def __init__(self, mesh):
-        """Find properties of a mesh, including topology, watertightness, and handedness
-           topology is all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
-
+    def quality(self, state, actions):
+        d_im = self.renderer.mesh_to_depth_im(state, display=False)
+        poses, images = self.extract_tensors_batch(actions, d_im)
+        return self.model(poses, images)
         
-        self.compute_connectivity(mesh)
-        # initially set using a manifold check during connectivity. This also checks for self collision, but that is very expensive for large meshes
-        # self.is_watertight = self.is_watertight and self_collision_min(mesh.detach(), self, forceNormalDist=0) > 0
 
+    @staticmethod
+    def extract_tensors(grasp, d_im):
+        """
+        Use grasp information and depth image to get image and pose tensors in form of GQCNN input
+        Parameters
+        ----------
+        d_im: numpy.ndarray
+            Numpy array depth image of object being grasped
+        Returns
+        -------
+        torch.tensor: pose_tensor, torch.tensor: image_tensor
+            pose_tensor: 1 x 1 tensor of grasp pose
+            image_tensor: 1 x 1 x 32 x 32 tensor of depth image processed for grasp
+        """
 
-        if self.is_watertight:
-            volume = compute_mesh_volume(mesh, ignore_backface_check=False)
-            bounding_volume = compute_mesh_bounding_volume(mesh)
-            if abs(volume) < bounding_volume * 1e-8 or abs(volume) > bounding_volume:
-                self.is_watertight = False
-                self.is_inverted = False
-            else:
-                self.is_inverted = volume.item() < 0
+        # check type of input_dim
+        if isinstance(d_im, np.ndarray):
+            torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1).to(grasp.device)
         else:
-            self.is_inverted = False
+            torch_dim = d_im
+
+        # check if grasp is 2D
+        if (grasp.depth==None or grasp.im_center==None or grasp.im_angle==None):
+            GraspTorch.logger.error("Grasp is not in 2D, must convert with camera intrinsics before tensor extraction.")
+            return None, None
+
+        # construct pose tensor from grasp depth
+        pose_tensor = torch.zeros([1, 1])
+        pose_tensor = pose_tensor.to(torch_dim.device)
+        pose_tensor[0] = grasp.depth.float()
+
+        # process depth image wrt grasp (steps 1-3) 
         
-    def compute_connectivity(self, mesh):
-        # find mapping between vertices and all faces they're part of
-        faces = mesh.faces_packed()
-        inverseFaceMap = [[] for _ in range(mesh._V)]
-        for rowInd in range(faces.shape[0]):
-            for ind in range(3):
-                inverseFaceMap[faces[rowInd,ind]].append((rowInd, ind))
-            
-        # find mapping between edges and all faces they're part of
-        edges_per_face = mesh.faces_packed_to_edges_packed()
-        inverseFaceEdgeMap = [[] for _ in range(mesh.num_edges_per_mesh())]
-        for rowInd in range(edges_per_face.shape[0]):
-            for ind in range(3):
-                inverseFaceEdgeMap[edges_per_face[rowInd,ind]].append((rowInd,ind))
+        # 1 - resize image tensor
+        out_shape = torch.tensor([torch_dim.shape], dtype=torch.float32)
+        out_shape *= (1/3)		# using 1/3 based on gqcnn library - may need to change depending on input
+        out_shape = tuple(out_shape.type(torch.int)[0][1:].numpy())
 
-        # For all edges, mark which faces they come from AND what index they are in that face
-        connectivity_edge_ind = torch.full((mesh._F,mesh._F), -1, dtype=torch.int64, device=mesh.device)
-        for vert_idx in range(len(inverseFaceEdgeMap)):
-            for pair in itertools.combinations(inverseFaceEdgeMap[vert_idx],2):
-                if pair[0][0] != pair[1][0]:
-                    connectivity_edge_ind[pair[0][0],pair[1][0]] = pair[0][1]
-                    connectivity_edge_ind[pair[1][0],pair[0][0]] = pair[1][1]
-            
-        # For all verts, mark which non-edge faces they come from AND what index they are in that face
-        connectivity_vert_ind = torch.full((mesh._F,mesh._F), -1, dtype=torch.int64, device=mesh.device)
-        for vert_idx in range(len(inverseFaceMap)):
-            for pair in itertools.combinations(inverseFaceMap[vert_idx],2):
-                if pair[0][0] != pair[1][0] and connectivity_edge_ind[pair[0][0],pair[1][0]] == -1:
-                    connectivity_vert_ind[pair[0][0],pair[1][0]] = pair[0][1]
-                    connectivity_vert_ind[pair[1][0],pair[0][0]] = pair[1][1]
+        torch_transform = transforms.Resize(out_shape, antialias=False) 
+        torch_image_tensor = torch_transform(torch_dim)
+
+        # 2 - translate wrt to grasp angle and grasp center 
+        theta = -1 * math.degrees(grasp.im_angle[0])	# -1 because PyTorch transform goes clockwise and autolab_core goes counter-clockwise
+         
+        dim_cx = torch_dim.shape[2] // 2
+        dim_cy = torch_dim.shape[1] // 2
         
-        connectivity_edge_bool = connectivity_edge_ind > -1
-        connectivity_vert_bool = connectivity_vert_ind > -1
-
-        # use mask to get all unconnected triangles (symmetric, so only triu)
-        tri_u_ind = torch.triu_indices(mesh._F,mesh._F, device=mesh.device)
-        connectivity_bool = torch.logical_or(connectivity_edge_bool, torch.logical_or(connectivity_vert_bool,torch.eye(mesh._F,dtype=bool,device=mesh.device)))
-        unconnectivity_flat_mask = torch.logical_not(connectivity_bool[tri_u_ind[0],tri_u_ind[1]])
-        self.tri_unconnectivity = tri_u_ind[:,unconnectivity_flat_mask]
-
-        # convert to tensor of the form (face_index, unconnected_edge_index) and (face_index, unconnected_vert_index)
-        # verts are indexed opposite edges, so edge 0 does not include vert 0
-        edge_faces_indices = torch.nonzero(connectivity_edge_bool, as_tuple=True)
-        vert_indices_in_face = connectivity_edge_ind[edge_faces_indices]
-        vert_indices = faces[edge_faces_indices[0], vert_indices_in_face]
-        self.vert_unconnectivity = torch.cat((edge_faces_indices[1].unsqueeze(0), vert_indices.unsqueeze(0)),dim=0)
-
-        vert_faces_indices = torch.nonzero(connectivity_vert_bool, as_tuple=True)
-        edge_indices_in_face = connectivity_vert_ind[vert_faces_indices]
-        edge_indices = edges_per_face[vert_faces_indices[0], edge_indices_in_face]
-        self.edge_unconnectivity = torch.cat((vert_faces_indices[1].unsqueeze(0), edge_indices.unsqueeze(0)),dim=0)
-
-        self.is_watertight = all([len(edge_faces) % 2==0 for edge_faces in inverseFaceEdgeMap])
-            
-
-def self_collision(mesh, unconnectivity, forceNormalDist=True):
-    # function to compute the distance between all specified triangles pairs in a mesh.
-    # can return nan or 0 if triangles are in collision. Also returns barycentric coordinates
-    # that resulted in those distance
-    #
-    # unconnectivity is a mesh_unnconnectivity object, the includes lists of indices to compare, including
-    # triangle to triangle, triangle to edge, and triangle to vertex comparisons
-    #
-    # forceNormalDist is whether we want the euclidian distance between triangles (False) or the distance in the normal
-    #   direction of each triangle (true). Since distance along the normal depends on which triangle use use for the normal, 
-    #   this is not symmetric for triangle to triangle comparisons. Therefore, (nearly) twice as many distances will be returned 
-    #   in the (True) case. Triangle-edge and triangle-vertex are not affected and are never constrained to normal
-
-    # useful for debugging
-    # torch.autograd.set_detect_anomaly(True)
- 
-    # since forceNormalDist is not symmetric, we need to duplicate the list of pairs, with the order swapped
-    if forceNormalDist:
-        tri_unconnectivity = torch.cat((unconnectivity.tri_unconnectivity,torch.flip(unconnectivity.tri_unconnectivity,[0])),dim=1)
-    else:
-        tri_unconnectivity = unconnectivity.tri_unconnectivity
-    edge_unconnectivity = unconnectivity.edge_unconnectivity
-    vert_unconnectivity = unconnectivity.vert_unconnectivity
-
-    quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri = __assemble_quad_terms(mesh, tri_unconnectivity, edge_unconnectivity, vert_unconnectivity, forceNormalDist)
-    # build inequality constraints: solution falls in triangle (or along edge)
-
-    # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
-    bary_G_tri = torch.cat((-torch.eye(4,device=mesh.device),
-                        torch.tensor([[1,1,0,0]],device=mesh.device),
-                        torch.tensor([[0,0,1,1]],device=mesh.device)), dim=0)
-    bary_h_tri = torch.tensor([1/3,1/3,1/3,1/3,1/3,1/3],device=mesh.device)
-
-    bary_G_edg = torch.cat((-torch.eye(3,device=mesh.device),
-                        torch.tensor([[1,1,0]],device=mesh.device),
-                        torch.tensor([[0,0,1]],device=mesh.device)), dim=0)
-    # center for edge is at [0.5, 0], so slight tweak
-    bary_h_edg = torch.tensor([1/3,1/3,1/2,1/3,1/2],device=mesh.device)
-
-    bary_G_vtx = torch.cat((-torch.eye(2,device=mesh.device),
-                        torch.tensor([[1,1]],device=mesh.device)), dim=0)
-    bary_h_vtx = torch.tensor([1/3,1/3,1/3],device=mesh.device)
-
-    equality_A_edg =  torch.tensor([],device=mesh.device) 
-    equality_b_edg =  torch.tensor([],device=mesh.device) 
-
-    equality_A_vtx =  torch.tensor([],device=mesh.device) 
-    equality_b_vtx =  torch.tensor([],device=mesh.device) 
-
-    # solve qp with our custom wrapper. It returns distance, in addition to solution
-    # it also, in the forceNormalDist case, replaces distance with inf when solution does not exist
-    dist_all_tri, bary_coords_tri = __qp_bary_feasible(quadratic_term_tri, linear_term_tri, const_term_tri, equality_A_tri, equality_b_tri, bary_G_tri, bary_h_tri)
-
-    dist_all_edg, bary_coords_edg = __qp_bary_feasible(quadratic_term_edg, linear_term_edg, const_term_edg, equality_A_edg, equality_b_edg, bary_G_edg, bary_h_edg)
-    
-    dist_all_vtx, bary_coords_vtx = __qp_bary_feasible(quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_vtx, equality_b_vtx, bary_G_vtx, bary_h_vtx)
-
-    # for ease of use outside of this function, we go back to traditional bary-centric coordinates before returning
-    # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
-    # traiditional barycentric 1/3,1/3,1/3 is center and 0,0,0 is corner0
-
-    bary_coords_tri_corrected = bary_coords_tri + 1/3
-
-    # center for edge is at [0.5, 0], so slight tweak
-    # correct first two by 1/3, 3rd by 1/2, add zero column
-    bary_coords_edg_corrected = torch.cat((bary_coords_edg + torch.tensor([[1/3,1/3,1/2]],device=bary_coords_edg.device), torch.zeros_like(bary_coords_edg[:,0:1])),dim=1)
-
-    # correct first two by 1/3, add 2 zero columns
-    bary_coords_vtx_corrected =  torch.cat((bary_coords_vtx + 1/3, torch.zeros_like(bary_coords_vtx)),dim=1)
-
-    # cat all before returning
-    dist_all = torch.cat((dist_all_tri,dist_all_edg,dist_all_vtx),dim=0)
-    bary_coords_corrected = torch.cat((bary_coords_tri_corrected, bary_coords_edg_corrected, bary_coords_vtx_corrected),dim=0)
-
-    return dist_all, bary_coords_corrected
-
-def __assemble_quad_terms(mesh, tri_unconnectivity, edge_unconnectivity, vert_unconnectivity, forceNormalDist):   
-    verts = mesh.verts_packed()
-    verts.requires_grad_(True)
-    # compute all edge vectors
-    # NOTE minor repeated calcs with shared edges
-    
-    tris = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, corner, xyz
-
-    E1 = tris[:, 1] - tris[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
-    E2 = tris[:, 2] - tris[:, 0]  # vector of edge 2 on triangle (n_faces, 3)
-
-    edges = multi_gather_tris(verts, mesh.edges_packed()) # n_edges, end, xyz
-
-    E_edge = edges[:, 1] - edges[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
-
-    # reference vectors between comparisons, since origins are centered in our modified barycentric
-
-    # triangle center to triangle center, when no vertices or edges are shared
-    w_diff_vec_tri = torch.mean(tris[tri_unconnectivity[1]],dim=1) - torch.mean(tris[tri_unconnectivity[0]],dim=1)  # n_tri_unconnect, xyz
-
-    # triangle center to (non-neighbor) edge center, when vertex is shared
-    w_diff_vec_edg = torch.mean(edges[edge_unconnectivity[1]],dim=1) - torch.mean(tris[edge_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
-
-    # triangle center to (non-neighbor) vertex, when edge is shared
-    w_diff_vec_vtx = verts[vert_unconnectivity[1]] - torch.mean(tris[vert_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
-
-    # expand edge vector directions to full size (per face or edge they appear in) for linear and quadratic terms
-    TR1_E1_full_tri = E1[tri_unconnectivity[0]]
-    TR1_E2_full_tri = E2[tri_unconnectivity[0]]
-    TR2_E1_full_tri = E1[tri_unconnectivity[1]]
-    TR2_E2_full_tri = E2[tri_unconnectivity[1]]
-
-    TR1_E1_full_edg = E1[edge_unconnectivity[0]]
-    TR1_E2_full_edg = E2[edge_unconnectivity[0]]
-
-    TR2_E_full_edg = E_edge[edge_unconnectivity[1]]
-
-    TR1_E1_full_vtx = E1[vert_unconnectivity[0]]
-    TR1_E2_full_vtx = E2[vert_unconnectivity[0]]
-
-    # linear terms, 
-
-    #  concatenate all relevant edge vectors
-
-    # tri
-    triangle_vecs_tri = torch.cat(
-                    (-TR1_E1_full_tri.unsqueeze(1),
-                        -TR1_E2_full_tri.unsqueeze(1),
-                        TR2_E1_full_tri.unsqueeze(1),
-                        TR2_E2_full_tri.unsqueeze(1)),
-                        dim=1)
-    
-    # edge
-    triangle_vecs_edg = torch.cat(
-                    (-TR1_E1_full_edg.unsqueeze(1),
-                        -TR1_E2_full_edg.unsqueeze(1),
-                        TR2_E_full_edg.unsqueeze(1)),
-                        dim=1)
-    
-    # vert
-    triangle_vecs_vtx = torch.cat(
-                    (-TR1_E1_full_vtx.unsqueeze(1),
-                     -TR1_E2_full_vtx.unsqueeze(1)),
-                        dim=1)
-    
-    # compare triangle edge directions to vector between objects to compare
-    linear_term_tri = 2 * triangle_vecs_tri @ w_diff_vec_tri.unsqueeze(2)
-
-    linear_term_edg = 2 * triangle_vecs_edg @ w_diff_vec_edg.unsqueeze(2)
-
-    linear_term_vtx = 2 * triangle_vecs_vtx @ w_diff_vec_vtx.unsqueeze(2)
-
-
-    # const terms, not used in quadratic program, only to correct distance afterwards.
-    # only depend on distance between "centers"
-
-    const_term_tri = torch.linalg.vecdot(w_diff_vec_tri,w_diff_vec_tri)
-
-    const_term_edg = torch.linalg.vecdot(w_diff_vec_edg,w_diff_vec_edg)
-
-    const_term_vtx = torch.linalg.vecdot(w_diff_vec_vtx,w_diff_vec_vtx)
-
-
-    # quadratic terms
-
-    # edge - edge products
-
-    # within triangle terms, compute for each triangle then expand
-
-    # within "first" edges
-    E1_E1 = torch.linalg.vecdot(E1,E1)
-    TR1_TR1_E1_E1_full_tri = E1_E1[tri_unconnectivity[0]].unsqueeze(1)
-    TR2_TR2_E1_E1_full_tri = E1_E1[tri_unconnectivity[1]].unsqueeze(1)
-
-    TR1_TR1_E1_E1_full_edg = E1_E1[edge_unconnectivity[0]].unsqueeze(1)
-
-    TR1_TR1_E1_E1_full_vtx = E1_E1[vert_unconnectivity[0]].unsqueeze(1)
-
-    # within "second" edges
-    E2_E2 = torch.linalg.vecdot(E2,E2)
-    TR1_TR1_E2_E2_full_tri = E2_E2[tri_unconnectivity[0]].unsqueeze(1)
-    TR2_TR2_E2_E2_full_tri = E2_E2[tri_unconnectivity[1]].unsqueeze(1)
-
-    TR1_TR1_E2_E2_full_edg = E2_E2[edge_unconnectivity[0]].unsqueeze(1)
-
-    TR1_TR1_E2_E2_full_vtx = E2_E2[vert_unconnectivity[0]].unsqueeze(1)
-
-    # between "first" edges and "second edges"
-    E1_E2 = torch.linalg.vecdot(E1,E2)
-    TR1_TR1_E1_E2_full_tri = E1_E2[tri_unconnectivity[0]].unsqueeze(1)
-    TR2_TR2_E1_E2_full_tri = E1_E2[tri_unconnectivity[1]].unsqueeze(1)
-
-    TR1_TR1_E1_E2_full_edg = E1_E2[edge_unconnectivity[0]].unsqueeze(1)
-
-    TR1_TR1_E1_E2_full_vtx = E1_E2[vert_unconnectivity[0]].unsqueeze(1)
-
-    # single edge terms, can be 1st, 2nd, or even 3rd edge
-    E_E = torch.linalg.vecdot(E_edge,E_edge)
-    TR2_TR2_E_E_full_edg = E_E[edge_unconnectivity[1]].unsqueeze(1)
-
-    # between triangle terms, use expanded version, repeated calcs when forceNormalDist is true
-    # TODO, detect forceNormalDist and share computation
-    TR1_TR2_E1_E1_full_tri = -torch.linalg.vecdot(TR1_E1_full_tri,TR2_E1_full_tri).unsqueeze(1)
-    TR1_TR2_E1_E2_full_tri = -torch.linalg.vecdot(TR1_E1_full_tri,TR2_E2_full_tri).unsqueeze(1)
-    TR1_TR2_E2_E1_full_tri = -torch.linalg.vecdot(TR1_E2_full_tri,TR2_E1_full_tri).unsqueeze(1)
-    TR1_TR2_E2_E2_full_tri = -torch.linalg.vecdot(TR1_E2_full_tri,TR2_E2_full_tri).unsqueeze(1)
-
-    quadratic_term_tri = 2 * torch.cat((TR1_TR1_E1_E1_full_tri, TR1_TR1_E1_E2_full_tri, TR1_TR2_E1_E1_full_tri, TR1_TR2_E1_E2_full_tri,
-                    TR1_TR1_E1_E2_full_tri, TR1_TR1_E2_E2_full_tri, TR1_TR2_E2_E1_full_tri, TR1_TR2_E2_E2_full_tri,
-                    TR1_TR2_E1_E1_full_tri, TR1_TR2_E2_E1_full_tri, TR2_TR2_E1_E1_full_tri, TR2_TR2_E1_E2_full_tri,
-                    TR1_TR2_E1_E2_full_tri, TR1_TR2_E2_E2_full_tri, TR2_TR2_E1_E2_full_tri, TR2_TR2_E2_E2_full_tri),dim=1).reshape([-1,4,4])
-
-    # triangle-edge terms, use expanded version
-    TR1_TR2_E1_E_full_edg = -torch.linalg.vecdot(TR1_E1_full_edg,TR2_E_full_edg).unsqueeze(1)
-    TR1_TR2_E2_E_full_edg = -torch.linalg.vecdot(TR1_E2_full_edg,TR2_E_full_edg).unsqueeze(1)
-
-    quadratic_term_edg = 2 * torch.cat(
-            (TR1_TR1_E1_E1_full_edg, TR1_TR1_E1_E2_full_edg, TR1_TR2_E1_E_full_edg,
-                TR1_TR1_E1_E2_full_edg, TR1_TR1_E2_E2_full_edg, TR1_TR2_E2_E_full_edg, 
-                TR1_TR2_E1_E_full_edg, TR1_TR2_E2_E_full_edg, TR2_TR2_E_E_full_edg, ),dim=1).reshape([-1,3,3])
-    
-    # triangle-vertex terms, use expanded version. Note that vertex does not actually appear!
-    quadratic_term_vtx = 2 * torch.cat(
-            (TR1_TR1_E1_E1_full_vtx, TR1_TR1_E1_E2_full_vtx,
-                TR1_TR1_E1_E2_full_vtx, TR1_TR1_E2_E2_full_vtx, ),dim=1).reshape([-1,2,2])
-    
-        # build equality constraints, if needed
-    if forceNormalDist:
-        # need additional constraint that solution is in normal direction of 1st triangle
-        # encoded as an equality constraint in the optimization
-        normal_vecs_tri = mesh.faces_normals_packed()[tri_unconnectivity[0]]
-
-        TR_1_N_tri = mesh.faces_normals_packed()[tri_unconnectivity[0]]
-
-        # compute projection of edge vectors to containing triangle normal.
-        # perform only once per triangle and expand later
-        TR_1_E1_N = torch.linalg.vecdot( mesh.faces_normals_packed() , E1)
-        TR_1_E2_N = torch.linalg.vecdot( mesh.faces_normals_packed() , E2)
-
-        # compute projection of second triangle edge vectors onto first triangle normal
-        TR_2_E1_N_tri = torch.linalg.vecdot( TR_1_N_tri , TR2_E1_full_tri)
-        TR_2_E2_N_tri = torch.linalg.vecdot( TR_1_N_tri , TR2_E2_full_tri)
-
-        # use projection of edge onto normal to compute rejection of normal from vector
-        # perform only once per triangle, expand later
-        vec_reject_TR1_E1 = (E1 - TR_1_E1_N.unsqueeze(1) * mesh.faces_normals_packed())
-        vec_reject_TR1_E2 = (E2 - TR_1_E2_N.unsqueeze(1) * mesh.faces_normals_packed())
-
-        equality_A_tri = torch.cat(
-                      (vec_reject_TR1_E1[tri_unconnectivity[0]].unsqueeze(-1),
-                       vec_reject_TR1_E2[tri_unconnectivity[0]].unsqueeze(-1),
-                       ((TR_2_E1_N_tri.unsqueeze(1) * TR_1_N_tri) - TR2_E1_full_tri).unsqueeze(-1) ,
-                       ((TR_2_E2_N_tri.unsqueeze(1) * TR_1_N_tri) - TR2_E2_full_tri).unsqueeze(-1)),dim=-1)
+        translate = ((grasp.im_center[...,0] - dim_cx) / 3, (grasp.im_center[...,1]- dim_cy) / 3)
+
+        cx = torch_image_tensor.shape[2] // 2
+        cy = torch_image_tensor.shape[1] // 2
+
+        # keep as two separate transformations so translation is performed before rotation
+        translated_only = transforms.functional.affine(
+            torch_image_tensor,
+            0,		# angle of rotation in degrees clockwise, between -180 and 180 inclusive
+            translate,
+            scale=1,	# no scale
+            shear=0,	# no shear 
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            center=(cx, cy)	
+        )
+
+        torch_rotated = transforms.functional.affine(
+            translated_only,
+            theta,
+            translate=(0, 0),
+            scale=1,
+            shear=0,
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            center=(cx, cy)
+        )
+
+        # torch_rotated2 = transforms.functional.affine(
+        # 	translated_only,
+        # 	theta,
+        # 	translate=(0, 0),
+        # 	scale=1,
+        # 	shear=0, 
+        # 	interpolation=transforms.InterpolationMode.BILINEAR,
+        # 	center=(torch_image_tensor.shape[2] / 2, torch_image_tensor.shape[1] / 2)
+        # )
+
+        # # for debugging - rotation only, no translation
+        # rotated_only = transforms.functional.affine(
+        # 	torch_image_tensor,
+        # 	theta,
+        # 	translate=(0,0),
+        # 	scale=1,
+        # 	shear=0,
+        # 	interpolation=transforms.InterpolationMode.BILINEAR,
+        # 	center=(cx, cy)
+        # )
+
+        # 3 - crop image to size (32, 32)
+        torch_cropped = transforms.functional.crop(torch_rotated, cy-17, cx-17, 32, 32)
+        image_tensor = torch_cropped.unsqueeze(0)
+
+        return pose_tensor, image_tensor
+        # return pose_tensor, torch_image_tensor, translated_only, rotated_only, torch_rotated, image_tensor, torch_rotated2
+    @staticmethod
+    def extract_tensors_batch(grasp, d_ims):
+
+        # r = Renderer()
+
+        # check type of input_dim
+        if isinstance(d_ims, np.ndarray):
+            GraspTorch.error("extract_tensors_batch takes a tensor, not a numpy ndarray")
+            return None, None
         
-        # compute rejection of vector normal from the vector between triangles
-        equality_b_tri = w_diff_vec_tri - (torch.linalg.vecdot(w_diff_vec_tri,normal_vecs_tri).unsqueeze(1) * normal_vecs_tri)
+        # check if grasp is 2D
+        if (grasp.depth==None or grasp.im_center==None or grasp.im_angle==None):
+            GraspTorch.logger.error("Grasp is not in 2D, must convert with camera intrinsics before tensor extraction.")
+            return None, None
+
+        # dims.shape: [batch_size, 1, 480, 640] = [batch_size, channels, H, W]
+        batch_size = grasp.num_grasps()
+        if d_ims.dim() != 4:
+            d_ims = d_ims.repeat(batch_size, 1, 1, 1)
+        if d_ims.shape[0] != batch_size:
+            d_ims = d_ims[0].repeat(batch_size, 1, 1, 1)
+
+        # construct pose tensor from grasp depth
+        pose_tensor = grasp.depth.float()
+
+        # process depth image wrt grasp (steps 1-3) 
+        # 1 - resize image tensors
+        out_shape = torch.tensor([d_ims.squeeze(1).shape], dtype=torch.float32)
+        out_shape *= (1/3)		# using 1/3 based on gqcnn library - may need to change depending on input
+        out_shape = tuple(out_shape.type(torch.int)[0][1:].numpy())		# (160, 213)
+
+        torch_transform = transforms.Resize(out_shape, antialias=False) 
+        dims_resized = torch_transform(d_ims)		# shape: [batch_size, 1, 160, 213] = [batch_size, channels, H, W]
+
+        # 2 - translation wrt to grasp angle and grasp center
+        # 	translation matrix
+        dim_cx = d_ims.shape[3] // 2	# 320
+        dim_cy = d_ims.shape[2] // 2	# 240
+        dim_cx_tens = torch.tensor([dim_cx]).expand(batch_size).to(d_ims.device)
+        dim_cy_tens = torch.tensor([dim_cy]).expand(batch_size).to(d_ims.device)
+
+        u = (2 * ((dim_cx_tens - grasp.im_center[..., 0])/3) / (dims_resized.shape[3])).float()	# not in pixels, but normalized on (image size * 2)
+        v = (2 * ((dim_cy_tens - grasp.im_center[..., 1])/3) / (dims_resized.shape[2])).float()
+
+        translate = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]])
+        translate = translate.expand(batch_size, -1, -1).to(d_ims.device).float()
+        indices = torch.arange(batch_size)
+        translate[indices, 0, 2] = u
+        translate[indices, 1, 2] = v
+
+        #	rotation matrix
+        theta = grasp.im_angle.squeeze()	# no -1 for counter-clockwise, stay in radians
+        cos = torch.cos(theta).float()
+        sin = torch.sin(theta).float()
+
+        rotation = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]]).expand(batch_size, -1, -1).to(d_ims.device).float()
+        rotation[indices, 0, 0] = cos
+        rotation[indices, 1, 1] = cos
+        rotation[indices, 0, 1] = -1 * sin
+        rotation[indices, 1, 0] = sin
+
+        #	apply transformations
+        translate_mat = translate[:, :2, :]
+        rotation_mat = rotation[:, :2, :]
         
+        # 	translation only
+        trans_grid = torch.nn.functional.affine_grid(translate_mat, dims_resized.shape)
+        trans_only = torch.nn.functional.grid_sample(dims_resized, trans_grid)
 
+        # 	rotation only
+        rot_grid = torch.nn.functional.affine_grid(rotation_mat, dims_resized.shape)
+        rot_only = torch.nn.functional.grid_sample(dims_resized, rot_grid)
 
-        # Don't ever do normal constraint for neighbors, since they can pass through each others sides, not just faces
-        #
-        # normal_vecs_edg = mesh.faces_normals_packed()[edge_unconnectivity[0]]
-        # normal_vecs_vtx = mesh.faces_normals_packed()[vert_unconnectivity[0]]
-        # TR_1_N_edg = mesh.faces_normals_packed()[edge_unconnectivity[0]]
-        # TR_2_E_N_edg = torch.linalg.vecdot( TR_1_N_edg , TR2_E_full_edg)
-        #
-        # equality_A_edg = torch.cat(
-        #               (vec_reject_TR1_E1[edge_unconnectivity[0]].unsqueeze(-1),
-        #                vec_reject_TR1_E2[edge_unconnectivity[0]].unsqueeze(-1),
-        #                ((TR_2_E_N_edg.unsqueeze(1) * TR_1_N_edg) - TR2_E_full_edg).unsqueeze(-1)),dim=-1)
-        # equality_A_vtx = torch.cat(
-        #               (vec_reject_TR1_E1[vert_unconnectivity[0]].unsqueeze(-1),
-        #                vec_reject_TR1_E2[vert_unconnectivity[0]].unsqueeze(-1)),dim=-1)
-        #
-        # equality_b_edg = -(torch.linalg.vecdot(w_diff_vec_edg,normal_vecs_edg).unsqueeze(1) * normal_vecs_edg - w_diff_vec_edg)
-        # equality_b_vtx = -(torch.linalg.vecdot(w_diff_vec_vtx,normal_vecs_vtx).unsqueeze(1) * normal_vecs_vtx - w_diff_vec_vtx)
+        # 	translation then rotation (applied separately)
+        trans_then_rot = torch.nn.functional.grid_sample(trans_only, rot_grid)
 
-    else:
-        # no equality constraint needed, so empty tensor
-        equality_A_tri = torch.tensor([],device=mesh.device) 
-        equality_b_tri = torch.tensor([],device=mesh.device)
+        # 3 - crop images to 32x32 pixels
+        top = dims_resized.shape[2] // 2 - 17	# 63
+        left = dims_resized.shape[3] // 2 - 17	# 89
+        dims_transformed = trans_then_rot[:, :, top:top+32, left:left+32]	# [:, :, 63:95, 89:121]
 
-    
-    return quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri
-
-
-def __applyQuad(bary_coords, quadratic_term, linear_term, const_term):
-    # computes distance for a batch of quadratic programs and their solutions
-    # needed because QPFunction only returns the coordinates of the closest points on the triangles
-    bc1 = bary_coords.unsqueeze(1)
-    bc2 = bary_coords.unsqueeze(2)
-
-    # for numeric reasons, this can be negative when it should be 0
-    dist_raw = (torch.matmul(bc1, torch.matmul(quadratic_term, bc2))/2).squeeze(2).squeeze(1) + torch.linalg.vecdot(linear_term.squeeze(2), bary_coords) + const_term
-    # replace negative values with 0, indicating a collision has taken place
-    dist_relu = torch.nn.functional.relu(dist_raw)
-    return dist_relu
-    
-
-def __qp_bary_feasible(quadratic_term, linear_term, const_term, equality_A, equality_b, inequality_G, inequality_h):
-    # optimization is not possible if quadratic term is not semi-positive-definite (spd)
-    # this means the parabola must have single minimum (non flat and facing up)
-
-    # there is probably a better way to enforce this, but I force it to be SPD by repeadtedly adding a scaled identiy matrix.
-    # scaled identity matrix is equivalent to L2 regularization on the triangle coordinates. ie, the optimization
-    # is solving for a scaled objective that is distance + l2norm(coordinates). Intuitively, when there are 
-    # infinit solutions, like when two triangles are at least partially parallel, this will cause us to find
-    # the coordinates that are "smallest" along the parallel part. "Smallest" means closest to some origin. If
-    # useRefPointBias is True, this origin is at one of the triangle corners. If it is false, this origin
-    # is at the triangle center. 
-    #
-    # Solving for the identity matrix that will make our matrix spd seemed complicated, so for now
-    # we compute a lower bound, the size of the smallest (largest negative) eigenvalue, compared to a small
-    # positive epsilon (spd_target). We double the size of this target every time we fail to create an spd
-    # matrix, then try again, up to max_spd_iter
-    quadratic_term_diagonal = torch.diagonal(quadratic_term,dim1=-1,dim2=-2)
-    quadratic_term_orig = quadratic_term_diagonal.clone()
-    quadratic_term_reg = quadratic_term_diagonal.clone()
-    
-    quadratic_term_diagonal
-    spd_min_eig=1e-6
-    spd_target = spd_min_eig
-    max_spd_iter = 4
-    
-    while max_spd_iter > 0:
-        max_spd_iter-=1
-        quadratic_term_diagonal.copy_(quadratic_term_reg)
-        eigs = torch.real(torch.linalg.eigvals(quadratic_term.detach()))
-        not_spd = torch.any(eigs < spd_min_eig,dim=1)
-
-        # print(f'found {torch.where(not_spd)[0].shape[0]} non spd quadratic terms')
-        if not torch.any(not_spd):
-            break
-        spd_target = spd_target * 2
-        dist_regularizer = spd_target  - torch.min(eigs[not_spd],dim=1)[0]
-        quadratic_term_reg[not_spd] += dist_regularizer.unsqueeze(-1)
-        # regulizer_mat = (dist_regularizer.unsqueeze(1).unsqueeze(2) * torch.eye(quadratic_term.shape[-1], device = quadratic_term.device).unsqueeze(0))
-
-        # quadratic_term_reg[not_spd] = quadratic_term_reg[not_spd] + regulizer_mat
-
-    # solve all, including infeasible
-    qp = QPFunction(check_Q_spd=False)
-    __blockPrint()
-    bary_coords = qp(quadratic_term, linear_term.squeeze(2), # optimization
-                                                inequality_G, inequality_h, #inequality constraints
-                                                equality_A,equality_b) # equality constraints)
-    __enablePrint()
-    
-    # we can check that our inequality constraint was met (Gz <= h), which indicates bary coordinates fall outside triangle
-    invalid_bary = torch.any(torch.matmul(bary_coords, inequality_G.transpose(0,1)) > inequality_h.unsqueeze(0),dim=1)
-
-    
-
-    # if any invalid solutions are found, we need to repeat the computation without them
-    # pytorch fails to compute any derivatives if an invalid distance exists
-    if torch.any(invalid_bary):
-        valid_bary = torch.logical_not(invalid_bary)
-        
-        if equality_A.size(0) == 0:
-            equality_A_filt = equality_A
-            equality_b_filt = equality_b
-        else:
-            equality_A_filt = equality_A[valid_bary]
-            equality_b_filt = equality_b[valid_bary]
-        __blockPrint()
-        bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
-                                                inequality_G, inequality_h, #inequality constraints
-                                                equality_A_filt,equality_b_filt) # equality constraints)
-        __enablePrint()
-        bary_coords = float('Inf') * torch.ones_like(bary_coords)
-        bary_coords[valid_bary] = bary_coords_feasible
-        quadratic_term_diagonal.copy_(quadratic_term_orig)
-        dist_feasible = __applyQuad(bary_coords_feasible, quadratic_term[valid_bary], linear_term[valid_bary], const_term[valid_bary])
-        dist_all = float('Inf') * torch.ones_like(const_term)
-        dist_all[valid_bary] = dist_feasible
-    else:
-        quadratic_term_diagonal.copy_(quadratic_term_orig)
-        dist_all = __applyQuad(bary_coords, quadratic_term, linear_term, const_term)
-
-
-
-    return dist_all, bary_coords
-
-# Disable
-def __blockPrint():
-    sys.stdout = open(os.devnull, 'w')
-
-# Restore
-def __enablePrint():
-    sys.stdout = sys.__stdout__
-
-def self_collision_min(mesh, unconnectivity, forceNormalDist=1):
-    # wrapper on self_collision that returns the minimum valid distance
-    dists_raw, bary_coords_raw = self_collision(mesh=mesh, unconnectivity=unconnectivity, forceNormalDist=forceNormalDist)
-    invalid_bary = torch.logical_or(torch.all(bary_coords_raw < 0,dim=1),
-                                   torch.all(bary_coords_raw[:,[0,2]] + bary_coords_raw[:,[1,3]] > 1,dim=1))
-    dists_filtered = dists_raw
-    dists_filtered[invalid_bary] = float('Inf')
-    return torch.min(dists_filtered)
-
+        return pose_tensor, dims_transformed
 
 class minWeightQualityFunction(ParallelJawQualityFunction):
     """Computes the minimum external wrench required to disrupt a grasp"""
@@ -1995,7 +744,7 @@ class hullTorch(torch.autograd.Function):
 
     @staticmethod
     def hull_det(points, hull):
-        hull_points = multi_gather_tris(points, hull.contiguous()) # simplices, verts, dims
+        hull_points = p3d_ex.multi_gather_tris(points, hull.contiguous()) # simplices, verts, dims
         
         # # if splitting normal and reference point
         # hull_vecs = torch.nn.functional.pad(hull_points[...,1:,:] - hull_points[...,0:1,:],[0,0,0,1])
@@ -2111,87 +860,6 @@ class ComForceClosureParallelJawQualityFunction(ParallelJawQualityFunction):
         return quality
 
 
-def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
-    shape = list(shape)
-    back_pad = len(shape) - index.ndim
-    for _ in range(back_pad):
-        index = index.unsqueeze(-1)
-    expand_shape = shape
-    expand_shape[dim] = -1
-    return index.expand(*expand_shape)
-
-
-def multi_gather(values: torch.Tensor, index: torch.Tensor, dim=-2):
-    # take care of batch dimension of, and acts like a linear indexing in the target dimention
-    # we assume that the index's last dimension is the dimension to be indexed on
-    return values.gather(dim, multi_indexing(index, values.shape, dim))
-
-
-def multi_gather_tris(v: torch.Tensor, f: torch.Tensor, dim=-2) -> torch.Tensor:
-    # compute faces normals w.r.t the vertices (considering batch dimension)
-    if v.ndim == (f.ndim + 1):
-        f = f[None].expand(v.shape[0], *f.shape)
-    # assert verts.shape[0] == faces.shape[0]
-    shape = torch.tensor(v.shape)
-    remainder = shape.flip(0)[:(len(shape) - dim - 1) % len(shape)]
-    return multi_gather(v, f.view(*f.shape[:-2], -1), dim=dim).view(*f.shape, *remainder)  # B, F, 3, 3
-
-def moller_trumbore(ray_o, ray_d, tris , eps=1e-8):
-    """
-    The Moller Trumbore algorithm for fast ray triangle intersection
-    Naive batch implementation (m rays and n triangles at the same time)
-    O(n_rays * n_faces) memory usage, parallelized execution
-    Parameters
-    ----------
-    ray_o : torch.Tensor, (n_rays, 3)
-    ray_d : torch.Tensor, (n_rays, 3)
-    tris  : torch.Tensor, (n_faces, 3, 3)
-    """
-    E1 = tris[:, 1] - tris[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
-    E2 = tris[:, 2] - tris[:, 0]  # vector of edge 2 on triangle (n_faces, 3)
-
-    # batch cross product
-    N = torch.cross(E1, E2)  # normal to E1 and E2, automatically batched to (n_faces, 3)
-    # TODO, should this be a solve instead? need to batch u,v,t into one matrix?
-    invdet = 1. / -(torch.einsum('md,nd->mn', ray_d, N) + eps)  # inverse determinant (n_faces, 3)
-
-    A0 = ray_o[:, None] - tris[None, :, 0]  # (n_rays, 3) - (n_faces, 3) -> (n_rays, n_faces, 3) automatic broadcast
-    DA0 = torch.cross(A0, ray_d[:, None].expand(*A0.shape))  # (n_rays, n_faces, 3) x (n_rays, 3) -> (n_rays, n_faces, 3) no automatic broadcast
-
-    u = torch.einsum('mnd,nd->mn', DA0, E2) * invdet
-    v = -torch.einsum('mnd,nd->mn', DA0, E1) * invdet
-    t = torch.einsum('mnd,nd->mn', A0, N) * invdet  # t >= 0.0 means this is a ray
-
-    return u, v, t
-
-def moller_tumbore_solve(ray_o, ray_d, mesh):
-    tris = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
-    # verts = mesh.verts_packed()
-    # edges = multi_gather_tris(verts, mesh.edges_packed())
-    # edge_vectors = edges[..., 1,:] - edges[..., 0,:]
-    # edges_per_face = mesh.faces_packed_to_edges_packed()
-    # face_edges_1 = multi_gather_tris(edge_vectors, edges_per_face[...,1:2])
-    # face_edges_2 = -multi_gather_tris(edge_vectors, edges_per_face[...,2:3])
-    face_edges_1 = tris[:, 1:2] - tris[:, 0:1]
-    face_edges_2 = tris[:, 2:3] - tris[:, 0:1] 
-    face_edges = torch.cat((face_edges_1,face_edges_2),dim=-2).unsqueeze(0)
-
-    # shapes rays, faces, [1,3], 3
-    ray_o_expand = ray_o.unsqueeze(-2).unsqueeze(-2)
-    ray_d_expand = ray_d.unsqueeze(-2).unsqueeze(-2)
-    shared_vert = tris[:,0:1].unsqueeze(0)
-
-    ray_o_expand,ray_d_expand,face_edges,shared_vert = torch.broadcast_tensors(ray_o_expand,ray_d_expand,face_edges,shared_vert)
-    A = torch.cat((-ray_d_expand[...,0:1,:],face_edges),dim=-2)
-    b = ray_o_expand[...,0:1,:] - shared_vert[...,0:1,:]
-    # tuv,info = torch.linalg.solve_ex(A,b.squeeze(-2).unsqueeze(-1),left=True)
-    # tuv = tuv.squeeze(-1)
-    tvu,info = torch.linalg.solve_ex(A,b,left=False)
-    t, v, u = torch.split(tvu, 1, dim=-1)
-    # reorder to match cramer implementation
-    #((t >= 0.0) * (t < self.width) * (u >= 0.0) * (v >= 0.0) * ((u + v) <= 1.0)).bool()
-    return u.squeeze(-1).squeeze(-1), v.squeeze(-1).squeeze(-1), t.squeeze(-1).squeeze(-1)
-
 # Our code
 def pytorch_setup():
         # set PyTorch device, use cuda if available
@@ -2277,7 +945,7 @@ def test_wine():
 
     center3D = torch.tensor([[0.0, -0.00, -0.034]], device=device,requires_grad=True)
     axis3D   = torch.tensor([[1.0,0.0,0.0]], device=device,requires_grad=True)
-    graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+    graspObj = GraspTorch(world_center=center3D, world_axis=axis3D, width=0.05,
                         friction_coef=config_dict["friction_coef"], 
                         torque_scaling=config_dict["torque_scaling"],camera_intr=camera)
     graspObj = graspObj.apply_to_mesh(mesh,is_watertight=False)
@@ -2298,7 +966,7 @@ def test_wine():
     for i in range(20):
         optimizer.zero_grad()
         center3D=torch.cat((torch.zeros_like(center3D[:,0:1]),(center3Dyz)),dim=-1)
-        graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+        graspObj = GraspTorch(world_center=center3D, world_axis=axis3D, width=0.05,
                         friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
         noised_grasps = graspObj.generateNoisyGrasps(25)
         noised_grasps = noised_grasps.apply_to_mesh(mesh, ignore_backface_check=True)
@@ -2335,20 +1003,20 @@ def test_quality():
         faces=[faces.to(device)],
         textures=textures
     )
-    unconnectivity = mesh_properties(mesh)
+    unconnectivity = mp(mesh)
     # with record_function("distfunction"):
         # print(self_collision(mesh, unconnectivity,forceNormalDist=False))
     with record_function("distfunction_n"):
-        print(self_collision(mesh, unconnectivity,forceNormalDist=False))
+        print(unconnectivity.self_collision(mesh,forceNormalDist=False))
     config_dict = {
         "torque_scaling":1000,
         "soft_fingers":1,
         "friction_coef": 0.8, # TODO use 0.8 in practice
         "antipodality_pctile": 1.0 
     }
-    print("mesh vol:", compute_mesh_volume(mesh).numpy(force=True))
-    print("mesh bb vol:", compute_mesh_bounding_volume(mesh).numpy(force=True))
-    print("mesh hull vol:", compute_mesh_hull_volume(mesh).numpy(force=True))
+    print("mesh vol:", mp.compute_mesh_volume(mesh).numpy(force=True))
+    print("mesh bb vol:", mp.compute_mesh_bounding_volume(mesh).numpy(force=True))
+    print("mesh hull vol:", mp.compute_mesh_hull_volume(mesh).numpy(force=True))
     # Test intersection finding
     test_grasps_compute = []
     test_grasps_set = []
@@ -2360,7 +1028,7 @@ def test_quality():
         axis3D = torch.tensor([dicts[-1]['pytorch_w_axis']],device=device,requires_grad=True)
         axis3D.retain_grad()        
 
-        test_grasps_compute.append(GraspTorch(center3D, axis3D=axis3D, width=0.05,
+        test_grasps_compute.append(GraspTorch(world_center=center3D, world_axis=axis3D, width=0.05,
                                                friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]))
         test_grasps_compute[-1] = test_grasps_compute[-1].apply_to_mesh(mesh)
         print("contact points:", i)
@@ -2369,7 +1037,7 @@ def test_quality():
         print("contact normals:", i)
         print(test_grasps_compute[-1].contact_normals.squeeze().numpy(force=True))
         print(-torch.nn.functional.normalize(torch.tensor(dicts[-1]['normals_1'],device=device).transpose(0,1).double(),dim=-1).numpy(force=True)) # .json has inward normal
-        test_grasps_set.append(GraspTorch(center3D, axis3D=axis3D, width=0.05,
+        test_grasps_set.append(GraspTorch(world_center=center3D, world_axis=axis3D, width=0.05,
                                           friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]))
         test_grasps_set[-1].contact_points = torch.tensor(dicts[-1]['contact_points'],device=device).unsqueeze(1).double()
         test_grasps_set[-1].contact_normals = -torch.nn.functional.normalize(torch.tensor(dicts[-1]['normals_1'],device=device).transpose(0,1).unsqueeze(1).double(),dim=-1)
@@ -2446,7 +1114,7 @@ def test_quality():
     axis3D = torch.tensor([dicts[2]['pytorch_w_axis']],device=device,requires_grad=True)
     axis3D.retain_grad() 
     center3D.retain_grad()
-    graspObj = GraspTorch(center3D, axis3D=axis3D, width=0.05,
+    graspObj = GraspTorch(world_center=center3D, world_axis=axis3D, width=0.05,
                            friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]).apply_to_mesh(mesh)
     print('before', axis3D.grad)
     qual_tensor = com_qual_func.quality(mesh, graspObj)
@@ -2512,19 +1180,23 @@ def test_quality():
     depth = torch.tensor([[0.5824159979820251]],device=device)
     width = torch.tensor([[0.05]],device=device)
 
-    grasp1 = GraspTorch(center2d, angle, depth, width, renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
+    grasp1 = GraspTorch(im_center=center2d, im_angle=angle, depth=depth, width=width, camera_intr=renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
         
 
     center3D = torch.tensor([[ 0.027602000162005424, 0.017583999782800674, -9.273400064557791e-05]], device=device)
     axis3D   = torch.tensor([[-0.9384999871253967, 0.2660999894142151, -0.22010000050067902]], device=device)
 
-    grasp2 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
+    grasp2 = GraspTorch(world_center=center3D, world_axis=axis3D, width=width, camera_intr=renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
     grasp2.make2D(updateCamera=False)
+    
+    gq_qual = GQCNNQualityFunction(renderer=p3d_ex.Renderer(device=device),weights_path='adv/adv-grasp/weights.npy')
+    gqcnn_qual = gq_qual.quality(state=mesh, actions=grasp2[0])
+    print(f'gqcnn qualit {gqcnn_qual}')
 
     center3D = torch.tensor([[-0.03714486211538315, -0.029467197135090828, 0.01168159581720829]], device=device)
     axis3D   = torch.tensor([[-0.974246621131897, -0.19650164246559143, -0.11059238761663437]], device=device)
 
-    grasp3 = GraspTorch(center3D, axis3D=axis3D, width=width, camera_intr=renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
+    grasp3 = GraspTorch(world_center=center3D, world_axis=axis3D, width=width, camera_intr=renderer.rasterizer.cameras,friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"]) 
     # Call ComForceClosureParallelJawQualityFunction init with parameters from gqcnn (from gqcnn/cfg/examples/replication/dex-net_2.1.yaml 
 
     # with record_function("FastAntipodalityFunction"):
@@ -2647,8 +1319,8 @@ def test_dist():
         faces=[faces.to(device)],
         textures=textures
     )
-    unconnectivity = mesh_properties(mesh)
-    distances,barys = self_collision(mesh, unconnectivity,forceNormalDist=False)
+    unconnectivity = mp(mesh)
+    distances,barys = unconnectivity.self_collision(mesh ,forceNormalDist=False)
     print(distances)
 
 if __name__ == "__main__":

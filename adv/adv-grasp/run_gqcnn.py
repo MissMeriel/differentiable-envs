@@ -2,13 +2,19 @@ import os
 import json
 import logging
 import numpy as np
+import torch
 from pytorch3d.io import save_obj
 from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
 from enum import Enum
 
-from render import *
+
+from pytorch3d_ext import Renderer
 from gqcnn_pytorch import KitModel
-from select_grasp import *
+import matplotlib as plt
+from grasp import GraspTorch
+import select_grasp as sg
+import quality_fork as quality
+import math
 
 import imageio
 
@@ -156,14 +162,14 @@ class Attack:
 
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
-		pose, image = grasp.extract_tensors_batch(dim)
+		pose, image = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
 		out = self.run(pose, image)
 		cur_pred = out[:,0:1].to(adv_mesh.device)
 		eps_check = False
 
 
-		dist_loss = grasp.eval_self_collision_dist(adv_mesh_clone)
-		oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
+		dist_loss = sg.eval_self_collision_dist(adv_mesh_clone)
+		oracle_pred = sg.oracle_eval(adv_mesh_clone, renderer=self.renderer)
 
 		# initialize to 0, so we can optionally add to it
 		adv_loss = torch.zeros([len(adv_mesh),grasp.num_grasps()],device=adv_mesh.device)
@@ -569,7 +575,7 @@ class Attack:
 		# TODO: Implement for batch of grasps in attack
 
 		# different mesh volumes for considering change
-		vol_mesh, vol_bounding, vol_hull = get_volumes(mesh)
+		vol_mesh, vol_bounding, vol_hull = sg.get_volumes(mesh)
 		mesh_file = dir + f"it-{iteration}.obj"
 		grasp_file = dir + f"it-{iteration}-grasp.obj"
 		quality_files = (dir + f"it-{iteration}-cf.obj", dir + f"it-{iteration}-mw.obj")
@@ -658,7 +664,7 @@ def test_run():
 		device = torch.device("cpu")
 
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
-	grasp = Grasp(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929, device=device)
+	grasp = GraspTorch(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929, device=device)
 
 	# load input tensors from gqcnn library for prediction
 	pose0 = torch.from_numpy(np.load("data/pose_tensor1_raw.npy")).float().to(device)
@@ -719,7 +725,7 @@ def test_attack():
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
 
 	# FIXED GRASP TO ATTACK
-	grasp = Grasp.read("grasp-batch.json")[0]
+	grasp = GraspTorch.read("grasp-batch.json")[0]
 	print("oracle quality:", grasp.quality.item())
 
 	# SET UP ATTACK
@@ -750,7 +756,7 @@ def test_run2():
 	depth_im = r.mesh_to_depth_im(mesh, display=False)
 
 	# run model on batch of grasps
-	grasp = Grasp.read("grasp-batch.json")
+	grasp = GraspTorch.read("grasp-batch.json")
 	grasp.trans_world_to_im(camera=r.camera)
 	poses, images = grasp.extract_tensors_batch(depth_im)
 	out = model.run(poses, images)
@@ -775,7 +781,7 @@ if __name__ == "__main__":
 
 	r = Renderer()
 	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
-	g = Grasp.read("grasp-batch.json")
+	g = GraspTorch.read("grasp-batch.json")
 	grasps = [g[0], g[1], g[3], g[4], g[5], g[6]]
 
 	# d = "exp-results/random-fuzz/"
