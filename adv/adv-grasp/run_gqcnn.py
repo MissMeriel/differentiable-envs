@@ -153,20 +153,6 @@ class Attack:
 		if  isinstance(method, AttackMethod):
 			method = [method]
 		method = set(method)
-		
-		# scale = 0, so distance loss is disabled for now
-		def loss_mixer(adv_loss, collision_loss):
-			# local function for merging distance and adverserial loss
-			dist_loss_scale = 0
-			scale_sat = 99
-			collision_loss_scaled = collision_loss / dist_loss_scale
-			loss_float = collision_loss_scaled.item()
-			if math.isfinite(loss_float) and loss_float > 0:
-				scaling = (abs(adv_loss.item()) * scale_sat) / loss_float
-				collision_loss_sat = torch.minimum(collision_loss_scaled, collision_loss_scaled * scaling)
-			else:
-				collision_loss_sat = collision_loss_scaled
-			return collision_loss_sat + adv_loss
 
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
@@ -249,18 +235,7 @@ class Attack:
 		self.track_qual["minweight quality"].append(minweight_pred.item())
 		#self.track_qual["index"].append(index)
 
-		return loss_dict, eps_check, dist_loss, adv_loss
-
-		# ignore regularization losses for now
-		# # WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
-		# edge_loss = mesh_edge_loss(adv_mesh) * self.loss_weights["edge"]
-		# normal_loss = mesh_normal_consistency(adv_mesh) * self.loss_weights["normal"]
-		# smooth_loss = mesh_laplacian_smoothing(adv_mesh) * self.loss_weights["smooth"]
-		# weighted_loss = loss + edge_loss + normal_loss + smooth_loss
-		# self.losses["prediction"].append(loss.item())
-		# self.losses["edge"].append(edge_loss.item())
-		# self.losses["normal"].append(normal_loss.item())
-		# self.losses["smoothing"].append(smooth_loss.item())
+		return loss_dict, eps_check
 
 	def perturb(self, mesh, param, grasp, method, index):
 		"""
@@ -282,7 +257,7 @@ class Attack:
   
 		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
 		adv_mesh = mesh.offset_verts(param)
-		loss, eps_check,  dist_loss, adv_loss= self.calc_loss(adv_mesh, grasp, method, index)
+		loss, eps_check = self.calc_loss(adv_mesh, grasp, method, index)
 
 		return loss, adv_mesh, eps_check 
 
@@ -419,7 +394,7 @@ class Attack:
 		if not use_fixed_step:
 			optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
-		adv_mesh = mesh.clone()
+		perturbed_by_param = mesh.clone()
 
 		# initialize stack of known feasible meshes, for reverting during optimization
 		param_safe=[param.detach().clone()]
@@ -466,7 +441,7 @@ class Attack:
 				self.loss_mag.append(torch.zeros((1,len(method)), device=mesh.device))
 				self.update_scale.append(torch.zeros((1,len(method)), device=mesh.device))
 				self.optim_status.append(np.array([[i, len(param_safe), attempts, resets]]))
-				loss_dict, adv_mesh, eps_check = self.perturb(mesh, param, grasp, method, i)
+				loss_dict, perturbed_by_param, eps_check = self.perturb(mesh, param, grasp, method, i)
 				for ind, method_type in enumerate(method):
 					self.loss_mag[-1][0,ind] = loss_dict[method_type]
 					
@@ -531,16 +506,7 @@ class Attack:
 						param = param.detach()
 						param.requires_grad_(requires_grad=True)
 						param_updated = True
-						# if torch.all(torch.isfinite(param.grad).flatten()).item() and loss_mag[ind].item() != loss_last:
-						# 	# success, so we need to add current mesh to list in case of future reversion
-						# 	param_back = param.detach().clone()
-						# 	if not use_fixed_step:
-						# 		optimizer.step()
-						# 	else: 
-						# 		param = (param - lr * torch.nn.functional.normalize(param.grad)).detach()
-						# 		param.requires_grad_(requires_grad=True)
-						# else:
-						# 	fail=True
+
 					except Exception as e:
 						print(method_type)
 						print(e)
@@ -578,13 +544,13 @@ class Attack:
 
 			if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
 				# snapshot
-				mesh2 = adv_mesh.clone()
+				mesh2 = perturbed_by_param.clone()
 				self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, method=method)
 
 			if eps_check:
 				# model prediction and oracle evaluation are sufficiently different, break loop
 				if i % self.steps_per_plot != 0:
-					mesh2 = adv_mesh.clone()
+					mesh2 = perturbed_by_param.clone()
 					self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, method=method)
 				break
 
