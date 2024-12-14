@@ -459,6 +459,9 @@ class Attack:
 				fail = False
 				param_updated = False
 				self.param_grad_list = []
+				if len(self.loss_mag) > 0:
+					# drop gradient information for last iteration, can release graph
+					self.loss_mag[-1] = self.loss_mag[-1].detach()
 				self.grad_mag.append(torch.zeros((1,len(method)), device=mesh.device))
 				self.loss_mag.append(torch.zeros((1,len(method)), device=mesh.device))
 				self.update_scale.append(torch.zeros((1,len(method)), device=mesh.device))
@@ -474,7 +477,7 @@ class Attack:
 							if param.grad is not None:
 								if torch.all(torch.isfinite(param.grad).flatten()).item():
 									self.param_grad_list.append(param.grad.detach().clone())
-									self.grad_mag[-1][0,ind] = torch.linalg.vector_norm(param.grad.flatten())
+									self.grad_mag[-1][0,ind] = torch.linalg.vector_norm(param.grad.flatten().detach())
 									param.grad.zero_()
 								else:
 									print('found inf grad value')
@@ -503,7 +506,7 @@ class Attack:
 						param = param.detach()
 						
 						if self_collision_index is not None:
-							self.update_scale[-1][0,self_collision_index] = torch.minimum(self.loss_mag[-1][0,self_collision_index] / collision_loss_scale, 
+							self.update_scale[-1][0,self_collision_index] = torch.minimum(self.loss_mag[-1][0,self_collision_index].detach() / collision_loss_scale, 
 														  torch.ones_like(self.loss_mag[-1][0,self_collision_index])*collision_loss_sat)
 							# 
 							# 
