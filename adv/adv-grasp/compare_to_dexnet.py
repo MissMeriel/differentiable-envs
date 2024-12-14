@@ -6,6 +6,8 @@ import pytorch3d.io
 from tqdm import tqdm
 import render as re
 import numpy as np
+from run_gqcnn import *
+from select_grasp import *
 
 class dexnet_db:
     def __init__(self,path):
@@ -51,6 +53,10 @@ if __name__ == "__main__":
     mw = qf.minWeightQualityFunction(config_dict,min_quality=1)
     rcf = qf.RobustCannyFerrariQualityFunction(config_dict,min_quality=1)
     rmw = qf.RobustMinWeightQualityFunction(config_dict,min_quality=1)
+    r = re.Renderer(device=device)
+    adv_grasp_dir = 'adv/adv-grasp/'
+    model = KitModel(os.path.join(adv_grasp_dir,"weights.npy"),device=device)
+    model.eval()
     datasets = db.data_['datasets']
     print(datasets.keys())
 
@@ -70,7 +76,7 @@ if __name__ == "__main__":
                         tqdm.write(f'failed to compute connectivity on {object}, saving for debug')
                         tqdm.write(str(e))
                         pytorch3d.io.save_obj(f'debug_mesh/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
-                        f.write(f'{object}, 0, 2, {0}, 0, {0}, 0, {0}, {0}, {0}, {0}\n')
+                        f.write(f'{object}, 0, 2, {0}, 0, {0}, 0, {0}, {0}, 0, {0}, {0}\n')
 
                         break
 
@@ -83,17 +89,30 @@ if __name__ == "__main__":
                             graspObj = qf.GraspTorch(center3D, axis3D=axis3D, width=max_width,
                                                     friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
                             graspObj = graspObj.apply_to_mesh(mesh, is_watertight=mesh_props.is_watertight, is_inverted=mesh_props.is_inverted, use_dexnet_normal=False)
+                            
+                            graspObj.make2D(camera_intr=r.camera)
+                            grasp_h = Grasp(depth=graspObj.depth.float(),im_center=graspObj.center.float(),
+                                    im_angle=graspObj.angle.float(),im_axis=graspObj.axis.float(), 
+                                    world_center=graspObj.center3D.float(), world_axis=graspObj.axis3D.float(),
+                                    oracle_method='pytorch',device=device)
+                            
+                            # adv_mesh_clone = mesh.clone()
+                            dim = r.mesh_to_depth_im(mesh, display=False)
+                            pose, image = grasp_h.extract_tensors_batch(dim)
+                            out = model(pose, image)
+                            gqcnn_val = out[:,0:1].to(mesh.device)
+                            
                             cf_val = cf(mesh, graspObj)
                             rcf_val = rcf(mesh, graspObj)
                             mw_val = mw(mesh,graspObj)
                             rmw_val = rmw(mesh,graspObj)
 
-                            tqdm.write(f'cf: db: {cf_db:.4f} ours: {cf_val.item():.4f} rcf: db: {rcf_db:.4f}, ours: {rcf_val.item():.4f} mw: {mw_val.item():.4f} rmw: {rmw_val.item():.4f}')
-                            f.write(f'{object}, {grasp}, 0, {cf_db:.8f}, {cf_val.item():.8f}, {rcf_db:.8f}, {rcf_val.item():.8f}, {mw_val.item():.8f}, {rmw_val.item():.8f}, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
+                            tqdm.write(f'cf: db: {cf_db:.4f} ours: {cf_val.item():.4f} rcf: db: {rcf_db:.4f}, ours: {rcf_val.item():.4f} mw: {mw_val.item():.4f} rmw: {rmw_val.item():.4f} gqcnn {gqcnn_val.item():.4f}')
+                            f.write(f'{object}, {grasp}, 0, {cf_db:.8f}, {cf_val.item():.8f}, {rcf_db:.8f}, {rcf_val.item():.8f}, {mw_val.item():.8f}, {rmw_val.item():.8f}, {gqcnn_val.item():.8f}, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
                         except Exception as e:
                             tqdm.write(str(e))
                             tqdm.write(f'failed to compute quality on {object} grasp {grasp}, saving for debug')
                             pytorch3d.io.save_obj(f'debug_mesh/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
                             graspObj.write_obj(f'debug_mesh/{object}_{grasp}.obj', include_coordinate=True, include_line_o_action=True)
-                            f.write(f'{object}, {grasp}, 1, {cf_db:.8f}, 0, {rcf_db:.8f}, 0, 0, 0, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
+                            f.write(f'{object}, {grasp}, 1, {cf_db:.8f}, 0, {rcf_db:.8f}, 0, 0, 0, 0, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
 

@@ -977,7 +977,7 @@ class Grasp:
 
 		return pose_tensor, dims_transformed
 
-	def oracle_eval(self, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual',write_path=None):
+	def oracle_eval(self, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual',write_path=None, other_dict={}):
 		"""
 		Get a final oracle evalution of a mesh object according to oracle_method
 
@@ -1014,7 +1014,7 @@ class Grasp:
 			if not renderer:
 				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 			else:
-				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode, write_path=write_path)
+				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode, write_path=write_path, other_dict=other_dict)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
 		"""
@@ -1052,7 +1052,7 @@ class Grasp:
 
 		return self.quality
 
-	def write_grasp_pytorch(self, obj, renderer, path, quality_path=None):
+	def write_grasp_pytorch(self, obj, renderer, path, quality_path=None, other_dict={}):
 		"""
 			Save a colored mesh of the grasp points for the current object using pytorch version of dexnet library
 		"""
@@ -1096,13 +1096,12 @@ class Grasp:
 				com_qual_func.write_obj(quality_path[1])
 
 
-	def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual',write_path=None):
+	def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual',write_path=None, other_dict={}):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
-
 		if mode == 'minweight':
 			if robust:
 				qual_class = RobustMinWeightQualityFunction
@@ -1177,7 +1176,7 @@ class Grasp:
 			self.quality.requires_grad_(False)
 
 		if write_path is not None:
-			com_qual_func.savemat(write_path)
+			com_qual_func.savemat(write_path, other_items=other_dict)
 
 		return self.quality
 
@@ -1200,7 +1199,10 @@ class Grasp:
 		else:
 			# only handle minimum distance if we don't need full
 			min_dist = self_collision_min(obj, self.mesh_properties)
-
+		
+		# # DEBUG TODO REMOVE
+		# self.last_all_dist = all_dist.numpy(force=True)
+		# self.last_coords = coords.numpy(force=True)
 		# store a reference distance if it doesn't exist, should be first time we reach here per grasp
 		if not hasattr(self,'reference_dist'):
 			if use_energy:
@@ -1214,22 +1216,26 @@ class Grasp:
 		else:
 			if use_all_in_min:
 				# allows for us to have a distance threshold, above which we ignore in gradient
-				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
+				relevant_dist = all_dist[torch.logical_and(torch.isfinite(all_dist), all_dist < 4*self.reference_dist)]
+#				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
 				# use reference, if valid in barier. Use min/10 if we're closer than reference 
 				if min_dist < self.reference_dist/10:
 					print('inside outer boundary region')
-					dist_loss = -torch.sum(torch.log(clamp_dist - min_dist/10 ))
+					# dist_loss = -torch.sum(torch.log(relevant_dist - min_dist/10 ))
+					# dist_loss = torch.sum(1/(relevant_dist - min_dist/10 ))
+					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - min_dist/10 )))
 				else:
-					dist_loss = -torch.sum(torch.log(clamp_dist - self.reference_dist/10))
+					# dist_loss = -torch.sum(1/(relevant_dist - self.reference_dist/10 ))
+					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - self.reference_dist/10)))
 			
 			else:
 				# if we only care about closest pair to collision, then no sum needed
 				clamp_dist = torch.clamp(min_dist, max=2*self.reference_dist)
 				if min_dist < self.reference_dist/10:
 					print('inside outer boundary region')
-					dist_loss = -torch.sum(torch.log(clamp_dist - min_dist/10 ))
+					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - min_dist/10 )))
 				else:
-					dist_loss = -torch.sum(torch.log(clamp_dist - self.reference_dist/10))
+					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - self.reference_dist/10)))
 		dist_loss.requires_grad_(True)
 
 		return dist_loss

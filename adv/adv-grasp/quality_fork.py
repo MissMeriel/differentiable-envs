@@ -1636,10 +1636,14 @@ class minWeightQualityFunction(ParallelJawQualityFunction):
         if self.Grasps.applied_to_object is False :
             # no intersection found, just return 0 quality
             return torch.zeros_like(actions.axis3D[...,0])
-        with record_function("minHull"):
-            closest,equation = self.find_min_weight(self.G)
+        
+        closest = torch.zeros(self.Grasps.contact_mask.shape, device=state.device, dtype=torch.float64)
+        closest_eq = torch.zeros(list(self.Grasps.contact_mask.shape)+[7], device=state.device, dtype=torch.float64)
+        if torch.any(self.Grasps.contact_mask):
+            with record_function("minweight"):
+                closest[self.Grasps.contact_mask], closest_eq[self.Grasps.contact_mask] = self.find_min_weight(self.G)
         self.quality_cache = closest
-        self.equation_cache = equation
+        self.equation_cache = closest_eq
         return closest / self.min_quality
     
     @staticmethod
@@ -1685,10 +1689,10 @@ class minWeightQualityFunction(ParallelJawQualityFunction):
         # test feasibility?
 
         # find minimum value
-        min_out = torch.min(alpha_weights[...,:-1],dim=-1,keepdim=True)
+        min_out = torch.min(alpha_weights[...,:-1],dim=-1)
         min_alpha = min_out.values
         indices = min_out.indices
-        equations_unnorm = torch.nn.functional.pad(torch.gather(input=G_unwrapped,index=indices.unsqueeze(-1).expand([-1,-1,6]),dim=-2).squeeze(-2),[0,1],value=-1)
+        equations_unnorm = torch.nn.functional.pad(torch.gather(input=G_unwrapped,index=indices.unsqueeze(-1).unsqueeze(-1).expand([-1,-1,6]),dim=-2).squeeze(-2),[0,1],value=-1)
         equations = equations_unnorm / torch.linalg.vector_norm(equations_unnorm[...,:-1],dim=-1).unsqueeze(-1)
         return min_alpha, equations
 
@@ -2042,12 +2046,16 @@ class qHullTorch(torch.autograd.Function):
     def forward(_, miniG):
         # both fingers hit a backface, so convex hull will throw an error
         if torch.all(miniG == 0):
-            return torch.tensor([range(6)],dtype=torch.long)
+            return (torch.tensor([range(6)],dtype=torch.long,device=miniG.device),
+                    torch.zeros((1,7),dtype=torch.long,device=miniG.device))
         # I don't remember why I was afraid of this, hasn't happened in memory
         if torch.any(torch.isnan(miniG)):
             breakpoint()
         miniGnumpy = miniG.numpy(force=True)
-        hull = ConvexHull(miniGnumpy,qhull_options='QJ') # ,qhull_options='QJ'
+        try:
+            hull = ConvexHull(miniGnumpy) # ,qhull_options='QJ'
+        except: 
+            hull = ConvexHull(miniGnumpy,qhull_options='QJ') # ,qhull_options='QJ' 'Qs' # search all initial
         return ( torch.tensor(hull.simplices,dtype=torch.long,device=miniG.device),
                 torch.tensor(hull.equations,dtype=miniG.dtype,device=miniG.device) )
     @staticmethod
