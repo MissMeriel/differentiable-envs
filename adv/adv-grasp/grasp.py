@@ -119,7 +119,7 @@ class GraspTorch(object):
         if contact_points is not None:
             self.contact_points = contact_points.double()
         elif c0 is not None and c1 is not None:
-            self.contact_points = torch.cat((c0.unsqueeze(-2), c0.unsqueeze(-2)),dim=-2)
+            self.contact_points = torch.cat((c0.unsqueeze(-2), c1.unsqueeze(-2)),dim=-2)
             
         if contact_normals is not None:
             self.contact_normals = contact_normals.double()
