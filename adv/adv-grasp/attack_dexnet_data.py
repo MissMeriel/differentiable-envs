@@ -140,7 +140,7 @@ if __name__ == "__main__":
                         tqdm.write(str(e))
                         tqdm.write(f'failed to compute quality on {object} grasp {graspObj}, saving for debug')
                         pytorch3d.io.save_obj(f'{exp_root_dir}/debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
-                        log = open(f'debug_mesh_attack/{object}_{graspObj}.txt', 'a')
+                        log = open(f'debug_mesh_attack/{object}_{graspObj}_grasp.txt', 'a')
                         log.write(str(e))
                         log.close()
                         graspObj.write_obj(f'debug_mesh_attack/{object}_{graspObj}.obj', include_coordinate=True, include_line_o_action=True)
