@@ -48,13 +48,17 @@ class GraspQualityFunction():    #ABC):
         """Evaluates grasp quality for a set of actions given a state."""
         return self.quality(state, actions, params)
     
-    def apply_grasp(self,state, actions, is_watertight=True, is_inverted=False):
+    def apply_grasp(self,state, actions:GraspTorch, is_watertight=True, is_inverted=False):
         if actions.applied_to_object is False :
             with record_function("solveForIntersection"):
                 actions = actions.apply_to_mesh(state, is_watertight=is_watertight, is_inverted=is_inverted)
         self.Mesh = state
         self.Grasps = actions
-        self.G = actions.grasp_matrix
+        if torch.any(actions.contact_mask):
+            self.G = actions.grasp_matrix
+            return True
+        else:
+            return False
 
     def write_obj(self, path):
         if self.Grasps is not None and hasattr(self, 'quality_cache') and hasattr(self, 'equation_cache'):
@@ -174,7 +178,7 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         
 
     @staticmethod
-    def extract_tensors(grasp, d_im):
+    def extract_tensors(grasp, d_im, scale=1):
         """
         Use grasp information and depth image to get image and pose tensors in form of GQCNN input
         Parameters
@@ -245,7 +249,15 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
             interpolation=transforms.InterpolationMode.BILINEAR,
             center=(cx, cy)
         )
-
+        torch_scaled = transforms.functional.affine(
+            torch_rotated,
+            0,
+            translate=(0, 0),
+            scale=scale,
+            shear=0,
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            center=(cx, cy)
+        )
         # torch_rotated2 = transforms.functional.affine(
         # 	translated_only,
         # 	theta,
@@ -268,7 +280,7 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         # )
 
         # 3 - crop image to size (32, 32)
-        torch_cropped = transforms.functional.crop(torch_rotated, cy-17, cx-17, 32, 32)
+        torch_cropped = transforms.functional.crop(torch_scaled, cy-17, cx-17, 32, 32)
         image_tensor = torch_cropped.unsqueeze(0)
 
         return pose_tensor, image_tensor
@@ -381,10 +393,9 @@ class minWeightQualityFunction(ParallelJawQualityFunction):
         :obj:`numpy.ndarray`
             Array of the quality for each grasp.
         """
-        self.apply_grasp(state,actions,is_watertight,is_inverted)
-        if self.Grasps.applied_to_object is False :
+        if not self.apply_grasp(state,actions,is_watertight,is_inverted):
             # no intersection found, just return 0 quality
-            return torch.zeros_like(actions.axis3D[...,0])
+            return torch.zeros_like(actions.world_axis[...,0])
         
         closest = torch.zeros(self.Grasps.contact_mask.shape, device=state.device, dtype=torch.float64)
         closest_eq = torch.zeros(list(self.Grasps.contact_mask.shape)+[7], device=state.device, dtype=torch.float64)
@@ -486,10 +497,10 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         :obj:`numpy.ndarray`
             Array of the quality for each grasp.
         """
-        self.apply_grasp(state,actions,is_watertight,is_inverted)
-        if self.Grasps.applied_to_object is False :
+        
+        if not self.apply_grasp(state,actions,is_watertight,is_inverted):
             # no intersection found, just return 0 quality
-            return torch.zeros_like(actions.axis3D[...,0])
+            return torch.zeros_like(actions.world_axis[...,0])
         closest = torch.zeros(self.Grasps.contact_mask.shape, device=state.device, dtype=torch.float64)
         closest_eq = torch.zeros(list(self.Grasps.contact_mask.shape)+[7], device=state.device, dtype=torch.float64)
         with record_function("minHull"):
@@ -559,19 +570,19 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
                 miniG = G_unwrapped[:,batch_idx,:]
                 [simplices,equations] = qHullTorch.apply(miniG)
                 areas = torch.abs(torch.linalg.det(miniG[simplices,:]))
-                finite_size = areas > 1e-8
-                simplices = simplices[finite_size]
-                dist_from_origin = equations[finite_size,-1]
+                finite_size = areas > 1e-10
+                #simplices_finite = simplices[finite_size]
+                dist_from_origin = equations[...,-1]#equations[finite_size,-1]
                 is_above_origin = dist_from_origin<0
                 
                 if torch.all(is_above_origin) and torch.numel(is_above_origin) > 0:
                     is_feasible[batch_idx] = 1
                     # if all negative, closest point is max (min of abs)
-                    min_dex = torch.argmax(dist_from_origin)
-                    
-                    facet = miniG[simplices[(min_dex),:],:].unsqueeze(0)
+                    min_dist, min_dex = torch.max(dist_from_origin,0)
+                    facet = torch.nn.functional.pad(miniG[torch.unique(simplices[min_dist == equations[:,-1]].flatten())],[0,1],value=1)
+                    #facet = miniG[simplices_finite[(min_dex),:],:].unsqueeze(0)
                     facets_feasible_local.append(facet)
-                    closest_eq[batch_idx] = torch.tensor(equations[min_dex],device=G_unwrapped.device)
+                    closest_eq[batch_idx] = equations[min_dex]
                 else:
                     facet = miniG[simplices[torch.logical_not(is_above_origin),:],:]
                     facets_infeasible_local.append(facet)
@@ -579,9 +590,17 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         
                 
         if len(facets_feasible_local) > 0:
-            facets = torch.cat(facets_feasible_local,dim=0)   
-            closest_feasible = CannyFerrariQualityFunction.compute_hyperplane_above(facets)
+            # facets = torch.cat(facets_feasible_local,dim=0)   
+            # closest_feasible = CannyFerrariQualityFunction.compute_hyperplane_above(facets)
+            # closest[is_feasible] = closest_feasible
+            
+            #facets = torch.nested.nested_tensor(facets_feasible_local,requires_grad=True, layout=torch.jagged).to_padded_tensor(padding=0)
+            facets = torch.nn.utils.rnn.pad_sequence(facets_feasible_local,batch_first=True)
+            closest_feasible = torch.linalg.svd(facets).Vh[...,-1,:]
+            closest_feasible = torch.abs(closest_feasible[:,-1])
+
             closest[is_feasible] = closest_feasible
+
         allow_neg_fc = 0
         # TODO re-introduce, consider if we want to still drop zero size facets
         if allow_neg_fc and len(facets_infeasible_local) > 0:
@@ -804,7 +823,10 @@ class qHullTorch(torch.autograd.Function):
         try:
             hull = ConvexHull(miniGnumpy) # ,qhull_options='QJ'
         except: 
-            hull = ConvexHull(miniGnumpy,qhull_options='QJ') # ,qhull_options='QJ' 'Qs' # search all initial
+            try:
+                hull = ConvexHull(miniGnumpy,qhull_options='Qs') # ,qhull_options='QJ' 'Qs' # search all initial
+            except:
+                hull = ConvexHull(miniGnumpy,qhull_options='QJ') # ,qhull_options='QJ' 'Qs' # search all initial
         return ( torch.tensor(hull.simplices,dtype=torch.long,device=miniG.device),
                 torch.tensor(hull.equations,dtype=miniG.dtype,device=miniG.device) )
     @staticmethod

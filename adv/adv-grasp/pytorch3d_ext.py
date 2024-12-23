@@ -1011,15 +1011,14 @@ class mesh_properties:
     def __enablePrint():
         sys.stdout = sys.__stdout__
 
-    def self_collision_min(mesh, unconnectivity, forceNormalDist=1):
+    def self_collision_min(self, mesh, forceNormalDist=1):
         # wrapper on self_collision that returns the minimum valid distance
-        dists_raw, bary_coords_raw = unconnectivity.self_collision(mesh=mesh, forceNormalDist=forceNormalDist)
+        dists_raw, bary_coords_raw = self.self_collision(mesh=mesh, forceNormalDist=forceNormalDist)
         invalid_bary = torch.logical_or(torch.all(bary_coords_raw < 0,dim=1),
                                     torch.all(bary_coords_raw[:,[0,2]] + bary_coords_raw[:,[1,3]] > 1,dim=1))
         dists_filtered = dists_raw
         dists_filtered[invalid_bary] = float('Inf')
         return torch.min(dists_filtered)
-
 
 
 def multi_indexing(index: torch.Tensor, shape: torch.Size, dim=-2):
@@ -1038,7 +1037,7 @@ def multi_gather(values: torch.Tensor, index: torch.Tensor, dim=-2):
     return values.gather(dim, multi_indexing(index, values.shape, dim))
 
 
-def multi_gather_tris(v: torch.Tensor, f: torch.Tensor, dim=-2) -> torch.Tensor:
+def multi_gather_tris(v: torch.Tensor, f: torch.Tensor, dim:int=-2) -> torch.Tensor:
     # compute faces normals w.r.t the vertices (considering batch dimension)
     if v.ndim == (f.ndim + 1):
         f = f[None].expand(v.shape[0], *f.shape)

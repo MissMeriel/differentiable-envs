@@ -475,7 +475,11 @@ class GraspTorch(object):
             if hasattr(self, 'contact_mask'):
                 contact_mask = torch.zeros_like(self.contact_mask)
                 contact_inds = torch.nonzero(self.contact_mask.flatten()).squeeze(-1)
-                contact_mask[contact_inds[key]] = 1
+                if len(contact_mask.shape) == 0:
+                    # indexing will fail, but scalar can just direct assign
+                    contact_mask = self.contact_mask
+                else:
+                    contact_mask[contact_inds[key]] = 1
                 sliced.contact_mask = contact_mask
 
             sliced.applied_to_object = self.applied_to_object
@@ -490,6 +494,8 @@ class GraspTorch(object):
     def make2D(self, updateCamera=False,camera_intr=None):
         if camera_intr==None:
             camera_intr = self.camera_intr
+        else:
+            self.camera_intr = camera_intr
         if camera_intr==None:
             # TODO error
             return None
@@ -863,7 +869,11 @@ class GraspTorch(object):
             contact_points = ray_o + ray_d * min_out.values
             faces_index = min_out.indices
             grasps_in_contact = torch.all(torch.all(torch.logical_not(torch.isinf(min_out.values)),dim=-1),dim=0)
-            contact_points = contact_points[:,grasps_in_contact]
+            if len(contact_points.shape) == 2:
+                if not grasps_in_contact:
+                    contact_points = torch.zeros((0,3),device=contact_points.device)
+            else:
+                contact_points = contact_points[:,grasps_in_contact]
         else:
             grasps_in_contact = torch.ones(contact_points[...,-1,-1].shape,device=contact_points.device, dtype=torch.bool)
         
@@ -895,12 +905,20 @@ class GraspTorch(object):
                 normsEstimated = -normsEstimated
 
             if is_watertight:
-                contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d[:,grasps_in_contact], dim=-1) < 0 ,dim=0)# dot product of normal and finger should be opposite, less than 0
+                if len(contact_points.shape) == 2:
+                    contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d, dim=-1) < 0 ,dim=0)
+                else:
+                    contact_is_outside = torch.all(torch.sum(normsEstimated * ray_d[:,grasps_in_contact], dim=-1) < 0 ,dim=0)# dot product of normal and finger should be opposite, less than 0
                 contact_is_outside_full = torch.zeros_like(grasps_in_contact)
                 contact_is_outside_full[grasps_in_contact] = contact_is_outside
                 grasps_in_contact = torch.logical_and(grasps_in_contact,  contact_is_outside_full)
-                contact_points = contact_points[:,contact_is_outside]
-                normsEstimated = normsEstimated[:,contact_is_outside]
+                if len(contact_points.shape) == 2:
+                    if not contact_is_outside:
+                        contact_points = torch.zeros((0,3),device=contact_points.device)
+                        normsEstimated = torch.zeros((0,3),device=contact_points.device)
+                else:
+                    contact_points = contact_points[:,contact_is_outside]
+                    normsEstimated = normsEstimated[:,contact_is_outside]
                 if torch.numel(normsEstimated) > 0 and torch.any( torch.linalg.vector_norm(normsEstimated) < 0.95):
                     print('found bad normal')
 

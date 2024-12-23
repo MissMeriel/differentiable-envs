@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import pytorch3d.structures
 import torch
 
 import numpy as np
@@ -849,17 +850,17 @@ def oracle_eval(grasp, obj_file, oracle_method=None, robust=True, renderer=None,
 	float: quality from ferarri canny evaluation
 
 	"""
-	if oracle_method == "dexnet" or (grasp.oracle_method == "dexnet"):
+	if oracle_method == "dexnet" or (hasattr(grasp, 'oracle_method') and (grasp.oracle_method == "dexnet")):
 		if isinstance(robust, bool):
-			return grasp.oracle_eval_dexnet(obj_file, robust=robust)
+			return oracle_eval_dexnet(obj_file, robust=robust)
 		else:
-			return grasp.oracle_eval_dexnet(obj_file, robust=grasp.oracle_robust)
+			return oracle_eval_dexnet(obj_file, robust=grasp.oracle_robust)
 	
 	else:
 		if not renderer:
 			GraspTorch.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 		else:
-			return grasp.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode, write_path=write_path, other_dict=other_dict)
+			return oracle_eval_pytorch(grasp, obj_file, renderer, grad=grad, robust=robust, mode=mode, write_path=write_path, other_dict=other_dict)
 
 def oracle_eval_dexnet(self, obj_file, robust=True):
 	"""
@@ -897,11 +898,11 @@ def oracle_eval_dexnet(self, obj_file, robust=True):
 
 	return self.quality
 
-def write_grasp_pytorch(self, obj, renderer, path, quality_path=None, other_dict={}):
+def write_grasp_pytorch(grasp, obj, renderer, path, quality_path=None, other_dict={}):
 	"""
 		Save a colored mesh of the grasp points for the current object using pytorch version of dexnet library
 	"""
-	if (self.world_center == None or self.world_axis == None):
+	if (grasp.world_center == None or grasp.world_axis == None):
 		GraspTorch.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
 		return None
 
@@ -912,36 +913,36 @@ def write_grasp_pytorch(self, obj, renderer, path, quality_path=None, other_dict
 		"antipodality_pctile": 1.0 
 	}
 
-	if isinstance(obj, pytorch3d.Meshes): mesh = obj
+	if isinstance(obj, pytorch3d.structures.Meshes): mesh = obj
 	else: mesh, _ = renderer.render_object(obj, display=False)
 
-	if self.num_grasps() == 1:
-		self.quality = torch.zeros_like(self.depth)
+	if grasp.num_grasps() == 1:
+		grasp.quality = torch.zeros_like(grasp.depth)
 		# for i, g in enumerate(self):
-		g = self[0]
-		if g.c0 is not None and g.c1 is not None: contact_points = torch.stack((g.c0, g.c1), 0)
+		g = grasp[0]
+		if g.contact_points is not None: contact_points = g.contact_points
 		else: contact_points = None
 		
-		width = torch.tensor([[0.05]], device=self.device)
-		grasp_torch = GraspTorch(center=g.world_center, world_axis=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-		if not hasattr(self, 'mesh_properties'):
-			self.mesh_properties = mesh_properties(obj)
-		grasp_torch = grasp_torch.apply_to_mesh(mesh,is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted)
+		width = torch.tensor([[0.05]], device=mesh.device)
+		# grasp_torch = GraspTorch(world_center=g.world_center, world_axis=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+		if not hasattr(grasp, 'mesh_properties'):
+			grasp.mesh_properties = mesh_properties(obj)
+		# grasp_torch = grasp_torch.apply_to_mesh(mesh,is_watertight=grasp.mesh_properties.is_watertight, is_inverted=grasp.mesh_properties.is_inverted)
 
-		grasp_torch.write_obj(path, include_coordinate=True, include_line_o_action=True)
+		g.write_obj(path, include_coordinate=True, include_line_o_action=True)
 
 		if quality_path is not None:
 
 			com_qual_func = CannyFerrariQualityFunction(config_dict)
-			com_qual_func.quality(mesh, grasp_torch)
+			com_qual_func.quality(mesh, grasp)
 			com_qual_func.write_obj(quality_path[0])
 
 			com_qual_func = minWeightQualityFunction(config_dict)
-			com_qual_func.quality(mesh, grasp_torch)
+			com_qual_func.quality(mesh, grasp)
 			com_qual_func.write_obj(quality_path[1])
 
 
-def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual',write_path=None, other_dict={}):
+def oracle_eval_pytorch(grasp, obj, renderer, grad=True, robust=True, mode='actual',write_path=None, other_dict={}):
 	"""
 	Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
@@ -960,7 +961,7 @@ def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actua
 
 
 
-	if (self.world_center == None or self.world_axis == None):
+	if (grasp.world_center == None or grasp.world_axis == None):
 		GraspTorch.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
 		return None
 
@@ -971,116 +972,103 @@ def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actua
 		"antipodality_pctile": 1.0 
 	}
 
-	if isinstance(obj, pytorch3d.Meshes): mesh = obj
+	if isinstance(obj, pytorch3d.structures.Meshes): mesh = obj
 	else: mesh, _ = renderer.render_object(obj, display=False)
 
 	# store a graph of mesh connections if it doesn't exist, 
 	# should be first time we reach here per grasp
-	if not hasattr(self, 'mesh_properties'):
-		self.mesh_properties = mesh_properties(mesh)
+	if not hasattr(grasp, 'mesh_properties'):
+		grasp.mesh_properties = mesh_properties(mesh)
 
-	if self.num_grasps() > 1:
-		self.quality = torch.zeros_like(self.world_axis[...,0:1])
-		for i, g in enumerate(self):
-			if g.c0 is not None and g.c1 is not None: contact_points = torch.stack((g.c0, g.c1), 0)
-			else: contact_points = None
-			
-			width = torch.tensor([[0.05]], device=self.device)
-			grasp_torch = GraspTorch(center=g.world_center, world_axis=g.world_axis, width=width, 
-							camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, 
-							friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+	if grasp.num_grasps() > 1:
+		grasp.quality = torch.zeros_like(grasp.world_axis[...,0:1])
+		for i, g in enumerate(grasp):
 			
 			try:
 				com_qual_func = qual_class(config_dict)
-				quality = com_qual_func.quality(mesh, grasp_torch,
-									is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().item()
+				quality = com_qual_func.quality(mesh, g,
+									is_watertight=grasp.mesh_properties.is_watertight, is_inverted=grasp.mesh_properties.is_inverted).float().item()
 
 			except QhullError:
 				quality =  0.0
 
-			self.quality[i] = quality
+			g.quality[i] = quality
 
 	else:
 
-		if self.c0 is not None and self.c1 is not None: contact_points = torch.stack((self.c0, self.c1), 0)
-		else: contact_points = None
-		
-		width = torch.tensor([[0.05]], device=self.device)
-		grasp_torch = GraspTorch(center=self.world_center, world_axis=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-		
 		try:
 			com_qual_func = qual_class(config_dict)
-			self.quality = com_qual_func.quality(mesh, grasp_torch, 
-									is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().to(self.world_center.device)
+			grasp.quality = com_qual_func.quality(mesh, grasp, 
+									is_watertight=grasp.mesh_properties.is_watertight, is_inverted=grasp.mesh_properties.is_inverted).float().to(grasp.world_center.device)
 		except QhullError:
-			self.quality = torch.tensor([0.0]).to(self.device)
+			grasp.quality = torch.tensor([0.0]).to(grasp.device)
 
 	if grad:
-		self.quality.requires_grad_(True)
+		grasp.quality.requires_grad_(True)
 	else:
-		self.quality.requires_grad_(False)
+		grasp.quality.requires_grad_(False)
 
 	if write_path is not None:
 		com_qual_func.savemat(write_path, other_items=other_dict)
 
-	return self.quality
+	return grasp.quality
 
-def eval_self_collision_dist(self, obj):
+def eval_self_collision_dist(grasp, obj):
 	# computes a self collision loss, either comparing minimum distance directly OR computing the distance
 	# energy, https://www.cs.cmu.edu/~kmcrane/Projects/RepulsiveShells/index.html
 	
 	# store a graph of mesh connections if it doesn't exist, 
 	# should be first time we reach here per grasp
-	if not hasattr(self, 'mesh_properties'):
-		self.mesh_properties = mesh_properties(obj)
+	if not hasattr(grasp, 'mesh_properties'):
+		grasp.mesh_properties = mesh_properties(obj)
 
 	# configuration. TODO, test and maybe expose
 	use_energy = False
 	use_all_in_min = True
 	# only process full vector if needed
 	if use_energy or use_all_in_min:
-		all_dist, coords = self.mesh_properties.self_collision(obj)
+		all_dist, coords = grasp.mesh_properties.self_collision(obj)
 		min_dist = torch.min(all_dist)
 	else:
 		# only handle minimum distance if we don't need full
-		min_dist = self.mesh_properties.self_collision_min(obj)
+		min_dist = grasp.mesh_properties.self_collision_min(obj)
 	
 	# # DEBUG TODO REMOVE
 	# self.last_all_dist = all_dist.numpy(force=True)
 	# self.last_coords = coords.numpy(force=True)
 	# store a reference distance if it doesn't exist, should be first time we reach here per grasp
-	if not hasattr(self,'reference_dist'):
+	if not hasattr(grasp,'reference_dist'):
 		if use_energy:
-			self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach()
+			grasp.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach().item()
 		else: 	
-			self.reference_dist = min_dist.item()
+			grasp.reference_dist = min_dist.item()
 
 	if use_energy:
 		# repulsive shell formula
-		dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+		dist_loss = torch.square(grasp.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
 	else:
 		if use_all_in_min:
 			# allows for us to have a distance threshold, above which we ignore in gradient
-			relevant_dist = all_dist[torch.logical_and(torch.isfinite(all_dist), all_dist < 4*self.reference_dist)]
+			relevant_dist = all_dist[torch.logical_and(torch.isfinite(all_dist), all_dist < 4*grasp.reference_dist)]
 #				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
 			# use reference, if valid in barier. Use min/10 if we're closer than reference 
-			if min_dist < self.reference_dist/10:
+			if min_dist < grasp.reference_dist/10:
 				print('inside outer boundary region')
 				# dist_loss = -torch.sum(torch.log(relevant_dist - min_dist/10 ))
 				# dist_loss = torch.sum(1/(relevant_dist - min_dist/10 ))
 				dist_loss = torch.sum(torch.square(torch.log(relevant_dist - min_dist/10 )))
 			else:
 				# dist_loss = -torch.sum(1/(relevant_dist - self.reference_dist/10 ))
-				dist_loss = torch.sum(torch.square(torch.log(relevant_dist - self.reference_dist/10)))
+				dist_loss = torch.sum(torch.square(torch.log(relevant_dist - grasp.reference_dist/10)))
 		
 		else:
 			# if we only care about closest pair to collision, then no sum needed
-			clamp_dist = torch.clamp(min_dist, max=2*self.reference_dist)
-			if min_dist < self.reference_dist/10:
+			clamp_dist = torch.clamp(min_dist, max=4*grasp.reference_dist)
+			if min_dist < grasp.reference_dist/10:
 				print('inside outer boundary region')
 				dist_loss = torch.sum(torch.square(torch.log(clamp_dist - min_dist/10 )))
 			else:
-				dist_loss = torch.sum(torch.square(torch.log(clamp_dist - self.reference_dist/10)))
+				dist_loss = torch.sum(torch.square(torch.log(clamp_dist - grasp.reference_dist/10)))
 	dist_loss.requires_grad_(True)
 
 	return dist_loss
@@ -1337,9 +1325,9 @@ def test_save_and_load_grasps():
 	pose2, image2 = GQCNNQualityFunction.extract_tensors(g4, d_im)
 	pose3, image3 = GQCNNQualityFunction.extract_tensors(g5, d_im)
 
-	pred1 = run1.run(pose1, image1)[0][0].item()	# gqcnn predictions
-	pred2 = run1.run(pose2, image2)[0][0].item()
-	pred3 = run1.run(pose3, image3)[0][0].item()
+	pred1 = run1.run(pose1, image1)[0][1].item()	# gqcnn predictions
+	pred2 = run1.run(pose2, image2)[0][1].item()
+	pred3 = run1.run(pose3, image3)[0][1].item()
 	print("\nModel predictions the same on fixed and read grasps?", pred1 == pred2 == pred3)
 	assert pred1 == pred2 == pred3
 
@@ -1353,7 +1341,7 @@ def test_save_and_load_grasps():
 	
 def test_trans_world_to_im():
 	if torch.cuda.is_available():
-		device = torch.device(f"cuda:0")
+		device = torch.device(f"cuda:1")
 		torch.cuda.set_device(device)
 	else:
 		print("cuda not available")
@@ -1370,12 +1358,15 @@ def test_trans_world_to_im():
 	grasp = GraspTorch.read("grasp-dataset2/grasp-batch.json",device=device)
 	grasp = grasp[0]
 	grasp.make2D(camera_intr=r.camera)
-
+	
 	pose, image = quality.GQCNNQualityFunction.extract_tensors(grasp=grasp,d_im=dim)
+	grasp.write_obj('test_cam.obj',include_coordinate=True, include_line_o_action=True)
+	
 
+	GraspTorch.logger.info("Drawing...")
 	draw_grasp_im = r.draw_grasp(dim, grasp.contact_points[0,:].float(), grasp.contact_points[1,:].float(), "draw_grasp", display=False)
 	display_images.append(draw_grasp_im)
-	display_titles.append("draw_grasp")
+	display_titles.append(f"draw_grasp {grasp.world_center.numpy(force=True)}, {grasp.depth.item()}, {r.camera.get_camera_center().numpy(force=True)}")
 
 	# r.grasp_sphere((grasp.c0, grasp.c1), mesh, "test_draw_grasp.obj", display=True)
 	mesh = r.grasp_sphere((grasp.contact_points[0,:].float(), grasp.contact_points[1,:].float()), mesh, display=False)
@@ -1384,12 +1375,13 @@ def test_trans_world_to_im():
 
 
 	# model evaluation
+	GraspTorch.logger.info("Evaluating model...")
 	model = KitModel("weights.npy",device=device)
 	model.eval()
 	run1 = Attack(model=model)
 	pose, image = quality.GQCNNQualityFunction.extract_tensors(grasp=grasp,d_im=dim)
 
-	model_out = run1.run(pose, image)[0][0].item()
+	model_out = run1.run(pose, image)[0][1].item()
 	# r.display(image, title="processed dim\npred: "+str(model_out))
 	display_images.append(image)
 	display_titles.append("processed depth image\npred: " + str(model_out))
@@ -1476,7 +1468,7 @@ def test_batching():
 	model = KitModel("weights.npy",device=device)
 	model.eval()
 	run1 = Attack(model=model)
-	pred0, pred1 = run1.run(pose0, image0)[0][0].item(), run1.run(poses, images)[0][0].item()
+	pred0, pred1 = run1.run(pose0, image0)[0][1].item(), run1.run(poses, images)[0][1].item()
 	GraspTorch.logger.debug("extract_tensors: %f", pred0)
 	GraspTorch.logger.debug("extract_tensors_batch: %f", pred1)
 	GraspTorch.logger.debug("prediction diff: %f", pred1 - pred0)
