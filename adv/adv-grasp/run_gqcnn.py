@@ -622,7 +622,7 @@ class Attack:
 		grasp_file = dir + f"it-{iteration}-grasp.obj"
 		quality_files = (dir + f"it-{iteration}-cf.obj", dir + f"it-{iteration}-mw.obj")
 		mat_file = dir + f"it-{iteration}-grasp.mat"
-
+		grasp = grasp.apply_to_mesh(mesh)
 		# store other numpy tensors in the grasp
 		other_dict = {}
 		if hasattr(self, 'param_grad_list') and len(self.param_grad_list) > 0 and len(self.grad_mag) > 0:			
