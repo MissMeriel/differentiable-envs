@@ -32,7 +32,7 @@ def config_as_torch(configuration, device='cpu'):
 
 if __name__ == "__main__":
     db = dexnet_db('/mnt/array/Home/Data/HPSTA/dexnet_database/dexnet_2.0_training_database/dexnet_2_database.hdf5')
-    gpu_id = 1
+    gpu_id = 0
 
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{gpu_id}")
@@ -43,7 +43,12 @@ if __name__ == "__main__":
 
     r = re.Renderer(device=device)
 
-
+    config_dict = {
+        "torque_scaling":1000,
+        "soft_fingers":1,
+        "friction_coef": 0.8, # TODO use 0.8 in practice
+        "antipodality_pctile": 1.0 
+    }
     cf = qf.CannyFerrariQualityFunction(config_dict,min_quality=1)
     mw = qf.minWeightQualityFunction(config_dict,min_quality=1)
     rcf = qf.RobustCannyFerrariQualityFunction(config_dict,min_quality=1)
@@ -55,7 +60,7 @@ if __name__ == "__main__":
     datasets = db.data_['datasets']
     print(datasets.keys())
 
-    with open('quality_compare_test_zoom3.csv', 'w') as f:
+    with open('quality_compare_test_normalize_cf_after_return.csv', 'w') as f:
         for dataset in datasets:
             
             for object in tqdm(db.data_['datasets'][dataset]['objects'],desc=f'from {dataset}',leave=False):
