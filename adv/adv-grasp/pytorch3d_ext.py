@@ -1,11 +1,12 @@
 import logging
 import math
 import torch
+import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import trimesh
 import itertools
-
+from torch.profiler import profile, record_function, ProfilerActivity
 
 from PIL import Image
 # used by block print
@@ -15,6 +16,7 @@ from qpth.qp import QPFunction
 from pytorch3d.utils import ico_sphere
 from pytorch3d.io import load_obj, save_obj
 from pytorch3d.transforms import Translate
+from pytorch3d.ops import mesh_face_areas_normals
 from pytorch3d.structures import Meshes, join_meshes_as_scene
 from scipy.spatial import ConvexHull
 from pytorch3d.renderer import (
@@ -101,10 +103,19 @@ class Renderer:
                 )
             )	
 
-    def pre_process_object(self, verts, faces_idx):
+    def pre_process_object(self, verts, faces_idx, faces_to_remove=None):
         if isinstance(verts, np.ndarray):
             verts = torch.from_numpy(verts).float().to(self.device)
             faces_idx = torch.from_numpy(faces_idx).to(self.device)
+
+        if faces_to_remove is not None:
+            faces_mask = torch.logical_not(torch.sum(torch.nn.functional.one_hot(faces_to_remove, faces_idx.shape[0]),dim=0))
+            mesh_tri = trimesh.Trimesh(faces=faces_idx.numpy(force=True),
+                    vertices=verts.numpy(force=True),process=False, validate=False)
+            mesh_tri.update_faces(faces_mask.numpy(force=True))
+            mesh_tri.remove_unreferenced_vertices()
+            faces_idx = torch.tensor(mesh_tri.faces, device=self.device)
+            verts = torch.tensor(mesh_tri.vertices, device=self.device, dtype=verts.dtype)
 
         unique_vals, inverse_indices = torch.unique(verts, sorted=False, return_inverse=True, return_counts=False, dim=0)
         if (len(unique_vals) != len(verts)):
@@ -113,7 +124,6 @@ class Renderer:
             faces_idx = new_faces_flat.reshape(faces_idx.shape)
             verts = unique_vals
 
-        
         uniques = torch.unique(torch.sort(faces_idx,dim=-1).values,dim=0)
         if uniques.shape[0] != faces_idx.shape[0]:
             # need to strip duplicate faces, which is easiest in trimesh
@@ -460,11 +470,25 @@ class Renderer:
             return torch.mean(torch.sub(verts2, verts1))
 
 
-class mesh_properties:
-    def __init__(self, mesh):
+class mesh_properties(nn.Module):
+    def __init__(self, mesh, forceNormalDist=True) -> None:
         """Find properties of a mesh, including topology, watertightness, and handedness
            topology is all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
-
+        # on initilization creates lists of indices to compare, including
+        # triangle to triangle, triangle to edge, and triangle to vertex comparisons
+        #
+        # forceNormalDist is whether we want the euclidian distance between triangles (False) or the distance in the normal
+        #   direction of each triangle (true). Since distance along the normal depends on which triangle use use for the normal, 
+        #   this is not symmetric for triangle to triangle comparisons. Therefore, (nearly) twice as many distances will be returned 
+        #   in the (True) case. Triangle-edge and triangle-vertex are not affected and are never constrained to normal
+        #
+        # used as a function object (implemented in forward) will compute distance to self collision
+        #
+        # for minor speedup when running repeatedly on the same mesh, you can compile it with torch.jit.script(mesh_properties(mesh))
+        super().__init__()
+        """Find properties of a mesh, including topology, watertightness, and handedness
+           topology is all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
+        self.forceNormalDist = nn.Parameter(torch.tensor(forceNormalDist),requires_grad=False)
         
         self.compute_connectivity(mesh)
         # initially set using a manifold check during connectivity. This also checks for self collision, but that is very expensive for large meshes
@@ -520,21 +544,40 @@ class mesh_properties:
         tri_u_ind = torch.triu_indices(mesh._F,mesh._F, device=mesh.device)
         connectivity_bool = torch.logical_or(connectivity_edge_bool, torch.logical_or(connectivity_vert_bool,torch.eye(mesh._F,dtype=bool,device=mesh.device)))
         unconnectivity_flat_mask = torch.logical_not(connectivity_bool[tri_u_ind[0],tri_u_ind[1]])
-        self.tri_unconnectivity = tri_u_ind[:,unconnectivity_flat_mask]
+        tri_unconnectivity = tri_u_ind[:,unconnectivity_flat_mask]
+        if self.forceNormalDist:
+            tri_unconnectivity = torch.cat((tri_unconnectivity,torch.flip(tri_unconnectivity,[0])),dim=1)
+
+        self.tri_unconnectivity = torch.nn.Parameter(tri_unconnectivity,requires_grad=False)
 
         # convert to tensor of the form (face_index, unconnected_edge_index) and (face_index, unconnected_vert_index)
         # verts are indexed opposite edges, so edge 0 does not include vert 0
         edge_faces_indices = torch.nonzero(connectivity_edge_bool, as_tuple=True)
         vert_indices_in_face = connectivity_edge_ind[edge_faces_indices]
         vert_indices = faces[edge_faces_indices[0], vert_indices_in_face]
-        self.vert_unconnectivity = torch.cat((edge_faces_indices[1].unsqueeze(0), vert_indices.unsqueeze(0)),dim=0)
+        self.vert_unconnectivity = torch.nn.Parameter(torch.cat((edge_faces_indices[1].unsqueeze(0), vert_indices.unsqueeze(0)),dim=0),requires_grad=False)
 
         vert_faces_indices = torch.nonzero(connectivity_vert_bool, as_tuple=True)
         edge_indices_in_face = connectivity_vert_ind[vert_faces_indices]
         edge_indices = edges_per_face[vert_faces_indices[0], edge_indices_in_face]
-        self.edge_unconnectivity = torch.cat((vert_faces_indices[1].unsqueeze(0), edge_indices.unsqueeze(0)),dim=0)
+        self.edge_unconnectivity = torch.nn.Parameter(torch.cat((vert_faces_indices[1].unsqueeze(0), edge_indices.unsqueeze(0)),dim=0),requires_grad=False)
 
         self.is_watertight = all([len(edge_faces) % 2==0 for edge_faces in inverseFaceEdgeMap])
+
+        self.faces = torch.nn.Parameter(faces,requires_grad=False)
+        self.edges = torch.nn.Parameter(mesh.edges_packed(),requires_grad=False)
+        self.face_indices = torch.nn.Parameter(multi_indexing(faces.view(*faces.shape[:-2], -1), mesh.verts_packed().shape, -2),requires_grad=False)
+        self.face_size = tuple(self.faces.shape + (3,))
+
+        self.edge_indices = torch.nn.Parameter(multi_indexing(self.edges.view(*self.edges.shape[:-2], -1), mesh.verts_packed().shape, -2),requires_grad=False)
+        self.edge_size = tuple(self.edges.shape + (3,))
+
+
+    def _gather_faces(self, verts):
+        return verts.gather(-2, self.face_indices).reshape(self.face_size)
+
+    def _gather_edges(self, verts):
+        return verts.gather(-2, self.edge_indices).reshape(self.edge_size)
             
     @staticmethod
     def compute_mesh_tri_areas(mesh):
@@ -576,6 +619,13 @@ class mesh_properties:
         # technically a scaled volume, since we dropped the division by 6
         # does det on last 2 dims, considers at least first 1 to be batch dim
         return vol_per_triangle, com_per_triangle
+
+    @staticmethod
+    def get_volumes(mesh):
+        vol_bounding = mesh_properties.compute_mesh_bounding_volume(mesh)
+        vol_mesh = mesh_properties.compute_mesh_volume(mesh)
+        vol_hull = mesh_properties.compute_mesh_hull_volume(mesh)
+        return (vol_mesh, vol_bounding, vol_hull)
 
     @staticmethod
     def compute_mesh_bounding_volume(mesh):
@@ -622,63 +672,73 @@ class mesh_properties:
         com = torch.sum(com_per_triangle * vol_per_triangle,dim=0) / total_vol
 
         return com
+    
+    @staticmethod
+    def self_collision(mesh_properties, mesh):
+        # helper function for running self collision on a pytorch3d mesh object, pulling the verts out for you
+        verts = mesh.verts_packed()
+        verts.requires_grad_(True)
 
-    def self_collision(self, mesh, forceNormalDist=True):
+        return mesh_properties.forward(verts)
+
+    def get_colliding_faces(self, dist, bary, min_dist = 1e-8):
+        invalid_bary = torch.logical_or(torch.all(bary < 0,dim=1),
+                            torch.all(bary[:,[0,2]] + bary[:,[1,3]] > 1,dim=1))
+        dists_filtered = dist
+        dists_filtered[invalid_bary] = float('Inf')
+        dist_interest = dist < min_dist
+        dist_interest_tri = dist_interest[:self.tri_unconnectivity.shape[1]]
+        dist_interest_edge_vert = dist_interest[self.tri_unconnectivity.shape[1]:]
+        faces_coliding_face = self.tri_unconnectivity[:,dist_interest_tri]
+        faces_coliding_edge_vert = torch.cat((self.edge_unconnectivity[0,:],self.vert_unconnectivity[0,:]))[dist_interest_edge_vert]
+        faces_coliding = torch.cat((faces_coliding_face.flatten(),faces_coliding_edge_vert))
+        return torch.unique(faces_coliding)
+
+
+    def forward(self, input):
         # function to compute the distance between all specified triangles pairs in a mesh.
         # can return nan or 0 if triangles are in collision. Also returns barycentric coordinates
         # that resulted in those distance
         #
-        # unconnectivity is a mesh_unnconnectivity object, the includes lists of indices to compare, including
-        # triangle to triangle, triangle to edge, and triangle to vertex comparisons
-        #
-        # forceNormalDist is whether we want the euclidian distance between triangles (False) or the distance in the normal
-        #   direction of each triangle (true). Since distance along the normal depends on which triangle use use for the normal, 
-        #   this is not symmetric for triangle to triangle comparisons. Therefore, (nearly) twice as many distances will be returned 
-        #   in the (True) case. Triangle-edge and triangle-vertex are not affected and are never constrained to normal
+
 
         # useful for debugging
         # torch.autograd.set_detect_anomaly(True)
     
         # since forceNormalDist is not symmetric, we need to duplicate the list of pairs, with the order swapped
-        if forceNormalDist:
-            tri_unconnectivity = torch.cat((self.tri_unconnectivity,torch.flip(self.tri_unconnectivity,[0])),dim=1)
-        else:
-            tri_unconnectivity = self.tri_unconnectivity
-        edge_unconnectivity = self.edge_unconnectivity
-        vert_unconnectivity = self.vert_unconnectivity
 
-        quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri = self.__assemble_quad_terms(mesh, tri_unconnectivity, edge_unconnectivity, vert_unconnectivity, forceNormalDist)
+        quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri = self._assemble_quad_terms(input)
         # build inequality constraints: solution falls in triangle (or along edge)
 
         # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
-        bary_G_tri = torch.cat((-torch.eye(4,device=mesh.device),
-                            torch.tensor([[1,1,0,0]],device=mesh.device),
-                            torch.tensor([[0,0,1,1]],device=mesh.device)), dim=0)
-        bary_h_tri = torch.tensor([1/3,1/3,1/3,1/3,1/3,1/3],device=mesh.device)
+        bary_G_tri = torch.cat((-torch.eye(4,device=input.device),
+                            torch.tensor([[1,1,0,0]],device=input.device),
+                            torch.tensor([[0,0,1,1]],device=input.device)), dim=0)
+        bary_h_tri = torch.tensor([1/3,1/3,1/3,1/3,1/3,1/3],device=input.device)
 
-        bary_G_edg = torch.cat((-torch.eye(3,device=mesh.device),
-                            torch.tensor([[1,1,0]],device=mesh.device),
-                            torch.tensor([[0,0,1]],device=mesh.device)), dim=0)
+        bary_G_edg = torch.cat((-torch.eye(3,device=input.device),
+                            torch.tensor([[1,1,0]],device=input.device),
+                            torch.tensor([[0,0,1]],device=input.device)), dim=0)
         # center for edge is at [0.5, 0], so slight tweak
-        bary_h_edg = torch.tensor([1/3,1/3,1/2,1/3,1/2],device=mesh.device)
+        bary_h_edg = torch.tensor([1/3,1/3,1/2,1/3,1/2],device=input.device)
 
-        bary_G_vtx = torch.cat((-torch.eye(2,device=mesh.device),
-                            torch.tensor([[1,1]],device=mesh.device)), dim=0)
-        bary_h_vtx = torch.tensor([1/3,1/3,1/3],device=mesh.device)
+        bary_G_vtx = torch.cat((-torch.eye(2,device=input.device),
+                            torch.tensor([[1,1]],device=input.device)), dim=0)
+        bary_h_vtx = torch.tensor([1/3,1/3,1/3],device=input.device)
 
-        equality_A_edg =  torch.tensor([],device=mesh.device) 
-        equality_b_edg =  torch.tensor([],device=mesh.device) 
+        equality_A_edg =  torch.zeros((0),device=input.device) 
+        equality_b_edg =  torch.zeros((0),device=input.device) 
 
-        equality_A_vtx =  torch.tensor([],device=mesh.device) 
-        equality_b_vtx =  torch.tensor([],device=mesh.device) 
+        equality_A_vtx =  torch.zeros((0),device=input.device) 
+        equality_b_vtx =  torch.zeros((0),device=input.device) 
 
         # solve qp with our custom wrapper. It returns distance, in addition to solution
         # it also, in the forceNormalDist case, replaces distance with inf when solution does not exist
-        dist_all_tri, bary_coords_tri = mesh_properties.__qp_bary_feasible(quadratic_term_tri, linear_term_tri, const_term_tri, equality_A_tri, equality_b_tri, bary_G_tri, bary_h_tri)
+        dist_all_tri, bary_coords_tri = self._qp_bary_feasible(quadratic_term_tri, linear_term_tri, const_term_tri, equality_A_tri, equality_b_tri, bary_G_tri, bary_h_tri)
 
-        dist_all_edg, bary_coords_edg = mesh_properties.__qp_bary_feasible(quadratic_term_edg, linear_term_edg, const_term_edg, equality_A_edg, equality_b_edg, bary_G_edg, bary_h_edg)
+        dist_all_edg, bary_coords_edg = self._qp_bary_feasible(quadratic_term_edg, linear_term_edg, const_term_edg, equality_A_edg, equality_b_edg, bary_G_edg, bary_h_edg)
         
-        dist_all_vtx, bary_coords_vtx = mesh_properties.__qp_bary_feasible(quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_vtx, equality_b_vtx, bary_G_vtx, bary_h_vtx)
+        dist_all_vtx, bary_coords_vtx = self._qp_bary_feasible(quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_vtx, equality_b_vtx, bary_G_vtx, bary_h_vtx)
 
         # for ease of use outside of this function, we go back to traditional bary-centric coordinates before returning
         # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
@@ -699,46 +759,45 @@ class mesh_properties:
 
         return dist_all, bary_coords_corrected
 
-    @staticmethod
-    def __assemble_quad_terms(mesh, tri_unconnectivity, edge_unconnectivity, vert_unconnectivity, forceNormalDist):   
-        verts = mesh.verts_packed()
-        verts.requires_grad_(True)
+    @torch.jit.export
+    def _assemble_quad_terms(self, verts):   
+
         # compute all edge vectors
         # NOTE minor repeated calcs with shared edges
         
-        tris = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, corner, xyz
+        tris = self._gather_faces(verts) # n_faces, corner, xyz
 
         E1 = tris[:, 1] - tris[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
         E2 = tris[:, 2] - tris[:, 0]  # vector of edge 2 on triangle (n_faces, 3)
 
-        edges = multi_gather_tris(verts, mesh.edges_packed()) # n_edges, end, xyz
+        edges = self._gather_edges(verts) # n_edges, end, xyz
 
         E_edge = edges[:, 1] - edges[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
 
         # reference vectors between comparisons, since origins are centered in our modified barycentric
 
         # triangle center to triangle center, when no vertices or edges are shared
-        w_diff_vec_tri = torch.mean(tris[tri_unconnectivity[1]],dim=1) - torch.mean(tris[tri_unconnectivity[0]],dim=1)  # n_tri_unconnect, xyz
+        w_diff_vec_tri = torch.mean(tris[self.tri_unconnectivity[1]],dim=1) - torch.mean(tris[self.tri_unconnectivity[0]],dim=1)  # n_tri_unconnect, xyz
 
         # triangle center to (non-neighbor) edge center, when vertex is shared
-        w_diff_vec_edg = torch.mean(edges[edge_unconnectivity[1]],dim=1) - torch.mean(tris[edge_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
+        w_diff_vec_edg = torch.mean(edges[self.edge_unconnectivity[1]],dim=1) - torch.mean(tris[self.edge_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
 
         # triangle center to (non-neighbor) vertex, when edge is shared
-        w_diff_vec_vtx = verts[vert_unconnectivity[1]] - torch.mean(tris[vert_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
+        w_diff_vec_vtx = verts[self.vert_unconnectivity[1]] - torch.mean(tris[self.vert_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
 
         # expand edge vector directions to full size (per face or edge they appear in) for linear and quadratic terms
-        TR1_E1_full_tri = E1[tri_unconnectivity[0]]
-        TR1_E2_full_tri = E2[tri_unconnectivity[0]]
-        TR2_E1_full_tri = E1[tri_unconnectivity[1]]
-        TR2_E2_full_tri = E2[tri_unconnectivity[1]]
+        TR1_E1_full_tri = E1[self.tri_unconnectivity[0]]
+        TR1_E2_full_tri = E2[self.tri_unconnectivity[0]]
+        TR2_E1_full_tri = E1[self.tri_unconnectivity[1]]
+        TR2_E2_full_tri = E2[self.tri_unconnectivity[1]]
 
-        TR1_E1_full_edg = E1[edge_unconnectivity[0]]
-        TR1_E2_full_edg = E2[edge_unconnectivity[0]]
+        TR1_E1_full_edg = E1[self.edge_unconnectivity[0]]
+        TR1_E2_full_edg = E2[self.edge_unconnectivity[0]]
 
-        TR2_E_full_edg = E_edge[edge_unconnectivity[1]]
+        TR2_E_full_edg = E_edge[self.edge_unconnectivity[1]]
 
-        TR1_E1_full_vtx = E1[vert_unconnectivity[0]]
-        TR1_E2_full_vtx = E2[vert_unconnectivity[0]]
+        TR1_E1_full_vtx = E1[self.vert_unconnectivity[0]]
+        TR1_E2_full_vtx = E2[self.vert_unconnectivity[0]]
 
         # linear terms, 
 
@@ -791,34 +850,34 @@ class mesh_properties:
 
         # within "first" edges
         E1_E1 = torch.linalg.vecdot(E1,E1)
-        TR1_TR1_E1_E1_full_tri = E1_E1[tri_unconnectivity[0]].unsqueeze(1)
-        TR2_TR2_E1_E1_full_tri = E1_E1[tri_unconnectivity[1]].unsqueeze(1)
+        TR1_TR1_E1_E1_full_tri = E1_E1[self.tri_unconnectivity[0]].unsqueeze(1)
+        TR2_TR2_E1_E1_full_tri = E1_E1[self.tri_unconnectivity[1]].unsqueeze(1)
 
-        TR1_TR1_E1_E1_full_edg = E1_E1[edge_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E1_full_edg = E1_E1[self.edge_unconnectivity[0]].unsqueeze(1)
 
-        TR1_TR1_E1_E1_full_vtx = E1_E1[vert_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E1_full_vtx = E1_E1[self.vert_unconnectivity[0]].unsqueeze(1)
 
         # within "second" edges
         E2_E2 = torch.linalg.vecdot(E2,E2)
-        TR1_TR1_E2_E2_full_tri = E2_E2[tri_unconnectivity[0]].unsqueeze(1)
-        TR2_TR2_E2_E2_full_tri = E2_E2[tri_unconnectivity[1]].unsqueeze(1)
+        TR1_TR1_E2_E2_full_tri = E2_E2[self.tri_unconnectivity[0]].unsqueeze(1)
+        TR2_TR2_E2_E2_full_tri = E2_E2[self.tri_unconnectivity[1]].unsqueeze(1)
 
-        TR1_TR1_E2_E2_full_edg = E2_E2[edge_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E2_E2_full_edg = E2_E2[self.edge_unconnectivity[0]].unsqueeze(1)
 
-        TR1_TR1_E2_E2_full_vtx = E2_E2[vert_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E2_E2_full_vtx = E2_E2[self.vert_unconnectivity[0]].unsqueeze(1)
 
         # between "first" edges and "second edges"
         E1_E2 = torch.linalg.vecdot(E1,E2)
-        TR1_TR1_E1_E2_full_tri = E1_E2[tri_unconnectivity[0]].unsqueeze(1)
-        TR2_TR2_E1_E2_full_tri = E1_E2[tri_unconnectivity[1]].unsqueeze(1)
+        TR1_TR1_E1_E2_full_tri = E1_E2[self.tri_unconnectivity[0]].unsqueeze(1)
+        TR2_TR2_E1_E2_full_tri = E1_E2[self.tri_unconnectivity[1]].unsqueeze(1)
 
-        TR1_TR1_E1_E2_full_edg = E1_E2[edge_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E2_full_edg = E1_E2[self.edge_unconnectivity[0]].unsqueeze(1)
 
-        TR1_TR1_E1_E2_full_vtx = E1_E2[vert_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E2_full_vtx = E1_E2[self.vert_unconnectivity[0]].unsqueeze(1)
 
         # single edge terms, can be 1st, 2nd, or even 3rd edge
         E_E = torch.linalg.vecdot(E_edge,E_edge)
-        TR2_TR2_E_E_full_edg = E_E[edge_unconnectivity[1]].unsqueeze(1)
+        TR2_TR2_E_E_full_edg = E_E[self.edge_unconnectivity[1]].unsqueeze(1)
 
         # between triangle terms, use expanded version, repeated calcs when forceNormalDist is true
         # TODO, detect forceNormalDist and share computation
@@ -847,17 +906,18 @@ class mesh_properties:
                     TR1_TR1_E1_E2_full_vtx, TR1_TR1_E2_E2_full_vtx, ),dim=1).reshape([-1,2,2])
         
             # build equality constraints, if needed
-        if forceNormalDist:
+        if self.forceNormalDist:
             # need additional constraint that solution is in normal direction of 1st triangle
             # encoded as an equality constraint in the optimization
-            normal_vecs_tri = mesh.faces_normals_packed()[tri_unconnectivity[0]]
+            normals = self._normal_wrapper(verts, self.faces)[1]
+            normal_vecs_tri = normals[self.tri_unconnectivity[0]]
 
-            TR_1_N_tri = mesh.faces_normals_packed()[tri_unconnectivity[0]]
+            TR_1_N_tri = normals[self.tri_unconnectivity[0]]
 
             # compute projection of edge vectors to containing triangle normal.
             # perform only once per triangle and expand later
-            TR_1_E1_N = torch.linalg.vecdot( mesh.faces_normals_packed() , E1)
-            TR_1_E2_N = torch.linalg.vecdot( mesh.faces_normals_packed() , E2)
+            TR_1_E1_N = torch.linalg.vecdot( normals , E1)
+            TR_1_E2_N = torch.linalg.vecdot( normals , E2)
 
             # compute projection of second triangle edge vectors onto first triangle normal
             TR_2_E1_N_tri = torch.linalg.vecdot( TR_1_N_tri , TR2_E1_full_tri)
@@ -865,12 +925,12 @@ class mesh_properties:
 
             # use projection of edge onto normal to compute rejection of normal from vector
             # perform only once per triangle, expand later
-            vec_reject_TR1_E1 = (E1 - TR_1_E1_N.unsqueeze(1) * mesh.faces_normals_packed())
-            vec_reject_TR1_E2 = (E2 - TR_1_E2_N.unsqueeze(1) * mesh.faces_normals_packed())
+            vec_reject_TR1_E1 = (E1 - TR_1_E1_N.unsqueeze(1) * normals)
+            vec_reject_TR1_E2 = (E2 - TR_1_E2_N.unsqueeze(1) * normals)
 
             equality_A_tri = torch.cat(
-                        (vec_reject_TR1_E1[tri_unconnectivity[0]].unsqueeze(-1),
-                        vec_reject_TR1_E2[tri_unconnectivity[0]].unsqueeze(-1),
+                        (vec_reject_TR1_E1[self.tri_unconnectivity[0]].unsqueeze(-1),
+                        vec_reject_TR1_E2[self.tri_unconnectivity[0]].unsqueeze(-1),
                         ((TR_2_E1_N_tri.unsqueeze(1) * TR_1_N_tri) - TR2_E1_full_tri).unsqueeze(-1) ,
                         ((TR_2_E2_N_tri.unsqueeze(1) * TR_1_N_tri) - TR2_E2_full_tri).unsqueeze(-1)),dim=-1)
             
@@ -899,14 +959,18 @@ class mesh_properties:
 
         else:
             # no equality constraint needed, so empty tensor
-            equality_A_tri = torch.tensor([],device=mesh.device) 
-            equality_b_tri = torch.tensor([],device=mesh.device)
+            equality_A_tri = torch.zeros((0),device=verts.device) 
+            equality_b_tri = torch.zeros((0),device=verts.device)
 
         
         return quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri
 
+    @torch.jit.ignore
+    def _normal_wrapper(self, verts, faces):
+        return mesh_face_areas_normals(verts, faces)
 
-    def __applyQuad(bary_coords, quadratic_term, linear_term, const_term):
+    @staticmethod
+    def _applyQuad(bary_coords, quadratic_term, linear_term, const_term):
         # computes distance for a batch of quadratic programs and their solutions
         # needed because QPFunction only returns the coordinates of the closest points on the triangles
         bc1 = bary_coords.unsqueeze(1)
@@ -918,8 +982,8 @@ class mesh_properties:
         dist_relu = torch.nn.functional.relu(dist_raw)
         return dist_relu
         
-    @staticmethod
-    def __qp_bary_feasible(quadratic_term, linear_term, const_term, equality_A, equality_b, inequality_G, inequality_h):
+    @torch.jit.ignore
+    def _qp_bary_feasible(self, quadratic_term, linear_term, const_term, equality_A, equality_b, inequality_G, inequality_h):
         # optimization is not possible if quadratic term is not semi-positive-definite (spd)
         # this means the parabola must have single minimum (non flat and facing up)
 
@@ -935,89 +999,113 @@ class mesh_properties:
         # we compute a lower bound, the size of the smallest (largest negative) eigenvalue, compared to a small
         # positive epsilon (spd_target). We double the size of this target every time we fail to create an spd
         # matrix, then try again, up to max_spd_iter
-        quadratic_term_diagonal = torch.diagonal(quadratic_term,dim1=-1,dim2=-2)
-        quadratic_term_orig = quadratic_term_diagonal.clone()
-        quadratic_term_reg = quadratic_term_diagonal.clone()
-        
-        quadratic_term_diagonal
-        spd_min_eig=1e-6
-        spd_target = spd_min_eig
-        max_spd_iter = 4
-        
-        while max_spd_iter > 0:
-            max_spd_iter-=1
-            quadratic_term_diagonal.copy_(quadratic_term_reg)
-            eigs = torch.real(torch.linalg.eigvals(quadratic_term.detach()))
-            not_spd = torch.any(eigs < spd_min_eig,dim=1)
+        with record_function("find spd"):
+            quadratic_term_diagonal = torch.diagonal(quadratic_term,dim1=-1,dim2=-2)
+            quadratic_term_orig = quadratic_term_diagonal.clone()
+            quadratic_term_reg = quadratic_term_diagonal.clone()
+            
+            quadratic_term_diagonal
+            spd_min_eig=1e-6
+            spd_target = spd_min_eig
+            max_spd_iter = 4
+            
+            while max_spd_iter > 0:
+                max_spd_iter-=1
+                quadratic_term_diagonal.copy_(quadratic_term_reg)
+                # eigs = torch.real(torch.linalg.eigvals(quadratic_term.detach()))
+                # not_spd = torch.any(eigs < spd_min_eig,dim=1)
 
-            # print(f'found {torch.where(not_spd)[0].shape[0]} non spd quadratic terms')
-            if not torch.any(not_spd):
-                break
-            spd_target = spd_target * 2
-            dist_regularizer = spd_target  - torch.min(eigs[not_spd],dim=1)[0]
-            quadratic_term_reg[not_spd] += dist_regularizer.unsqueeze(-1)
-            # regulizer_mat = (dist_regularizer.unsqueeze(1).unsqueeze(2) * torch.eye(quadratic_term.shape[-1], device = quadratic_term.device).unsqueeze(0))
+                chol,info = torch.linalg.cholesky_ex(quadratic_term.detach())
+                # not true, I made this up
+                # not_spd = torch.logical_or(info>0,torch.min(torch.diagonal(chol,dim1=-1,dim2=-2),dim=-1).values < 0.01)
+                _,singular_values,_ = torch.linalg.svd(quadratic_term.detach())
+                not_spd = torch.logical_or(info>0,  singular_values[:,-1] < spd_min_eig)
 
-            # quadratic_term_reg[not_spd] = quadratic_term_reg[not_spd] + regulizer_mat
+                # print(f'found {torch.where(not_spd)[0].shape[0]} non spd quadratic terms of {quadratic_term.shape[0]}')
+                if not torch.any(not_spd):
+                    break
+                spd_target = spd_target * 2
+                
+                correction = 0 # if using singular vectors, we don't know which one is negative, so no extra correction available
+                # correction = -torch.min(eigs[not_spd],dim=1)[0]
+                dist_regularizer = spd_target + correction
+                quadratic_term_reg[not_spd] += dist_regularizer #.unsqueeze(-1)
+                # regulizer_mat = (dist_regularizer.unsqueeze(1).unsqueeze(2) * torch.eye(quadratic_term.shape[-1], device = quadratic_term.device).unsqueeze(0))
 
+                # quadratic_term_reg[not_spd] = quadratic_term_reg[not_spd] + regulizer_mat
+            # print(f'found spd in {3-max_spd_iter} iterations')
+        with record_function("initial qp"):
         # solve all, including infeasible
-        qp = QPFunction(check_Q_spd=False)
-        mesh_properties.__blockPrint()
-        bary_coords = qp(quadratic_term, linear_term.squeeze(2), # optimization
-                                                    inequality_G, inequality_h, #inequality constraints
-                                                    equality_A,equality_b) # equality constraints)
-        mesh_properties.__enablePrint()
-        
-        # we can check that our inequality constraint was met (Gz <= h), which indicates bary coordinates fall outside triangle
-        invalid_bary = torch.any(torch.matmul(bary_coords, inequality_G.transpose(0,1)) > inequality_h.unsqueeze(0),dim=1)
+            qp = QPFunction(check_Q_spd=False)
+            mesh_properties._blockPrint()
+            bary_coords = qp(quadratic_term, linear_term.squeeze(2), # optimization
+                                                        inequality_G, inequality_h, #inequality constraints
+                                                        equality_A,equality_b) # equality constraints)
+            mesh_properties._enablePrint()
+            
+            # we can check that our inequality constraint was met (Gz <= h), which indicates bary coordinates fall outside triangle
+            valid_bary = torch.all(torch.matmul(bary_coords, inequality_G.transpose(0,1)) <= inequality_h.unsqueeze(0),dim=1)
 
         
 
         # if any invalid solutions are found, we need to repeat the computation without them
         # pytorch fails to compute any derivatives if an invalid distance exists
-        if torch.any(invalid_bary):
-            valid_bary = torch.logical_not(invalid_bary)
-            
-            if equality_A.size(0) == 0:
-                equality_A_filt = equality_A
-                equality_b_filt = equality_b
-            else:
-                equality_A_filt = equality_A[valid_bary]
-                equality_b_filt = equality_b[valid_bary]
-            mesh_properties.__blockPrint()
-            bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
-                                                    inequality_G, inequality_h, #inequality constraints
-                                                    equality_A_filt,equality_b_filt) # equality constraints)
-            mesh_properties.__enablePrint()
-            bary_coords = float('Inf') * torch.ones_like(bary_coords)
-            bary_coords[valid_bary] = bary_coords_feasible
-            quadratic_term_diagonal.copy_(quadratic_term_orig)
-            dist_feasible = mesh_properties.__applyQuad(bary_coords_feasible, quadratic_term[valid_bary], linear_term[valid_bary], const_term[valid_bary])
-            dist_all = float('Inf') * torch.ones_like(const_term)
-            dist_all[valid_bary] = dist_feasible
+        if not torch.all(valid_bary):
+            with record_function("secondary qp"):
+                
+                if equality_A.size(0) == 0:
+                    equality_A_filt = equality_A
+                    equality_b_filt = equality_b
+                else:
+                    equality_A_filt = equality_A[valid_bary]
+                    equality_b_filt = equality_b[valid_bary]
+                mesh_properties._blockPrint()
+                bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
+                                                        inequality_G, inequality_h, #inequality constraints
+                                                        equality_A_filt,equality_b_filt) # equality constraints)
+                mesh_properties._enablePrint()
+                bary_coords = float('Inf') * torch.ones_like(bary_coords)
+                bary_coords[valid_bary] = bary_coords_feasible
+                quadratic_term_diagonal.copy_(quadratic_term_orig)
+                dist_feasible = mesh_properties._applyQuad(bary_coords_feasible, quadratic_term[valid_bary], linear_term[valid_bary], const_term[valid_bary])
+                dist_all = float('Inf') * torch.ones_like(const_term)
+                dist_all[valid_bary] = dist_feasible
         else:
-            quadratic_term_diagonal.copy_(quadratic_term_orig)
-            dist_all = mesh_properties.__applyQuad(bary_coords, quadratic_term, linear_term, const_term)
+            with record_function("apply solution"):
+                quadratic_term_diagonal.copy_(quadratic_term_orig)
+                dist_all = mesh_properties._applyQuad(bary_coords, quadratic_term, linear_term, const_term)
 
 
 
         return dist_all, bary_coords
 
     # Disable
-    def __blockPrint():
+    @staticmethod
+    def _blockPrint():
         sys.stdout = open(os.devnull, 'w')
 
     # Restore
-    def __enablePrint():
+    @staticmethod
+    def _enablePrint():
         sys.stdout = sys.__stdout__
 
-    def self_collision_min(self, mesh, forceNormalDist=1):
-        # wrapper on self_collision that returns the minimum valid distance
-        dists_raw, bary_coords_raw = self.self_collision(mesh=mesh, forceNormalDist=forceNormalDist)
-        invalid_bary = torch.logical_or(torch.all(bary_coords_raw < 0,dim=1),
-                                    torch.all(bary_coords_raw[:,[0,2]] + bary_coords_raw[:,[1,3]] > 1,dim=1))
-        dists_filtered = dists_raw
+    @staticmethod
+    def check_bary_validity(bary_coords):
+        invalid_bary = torch.logical_not(torch.logical_and(torch.all(bary_coords >= 0,dim=1),
+                            torch.all(bary_coords[:,[0,2]] + bary_coords[:,[1,3]] <= 1,dim=1)))
+        return invalid_bary
+
+    @staticmethod
+    def make_invalid_dist_inf(dist, bary_coords):
+        invalid_bary = mesh_properties.check_bary_validity(bary_coords=bary_coords)
+        dists_filtered = dist
         dists_filtered[invalid_bary] = float('Inf')
+        return dists_filtered
+
+    @staticmethod
+    def self_collision_min(dists_raw, bary_coords_raw):
+        # wrapper on self_collision that returns the minimum valid distance
+        dists_filtered = mesh_properties.make_invalid_dist_inf(dist=dists_raw, bary_coords=bary_coords_raw)
         return torch.min(dists_filtered)
 
 
@@ -1036,7 +1124,7 @@ def multi_gather(values: torch.Tensor, index: torch.Tensor, dim=-2):
     # we assume that the index's last dimension is the dimension to be indexed on
     return values.gather(dim, multi_indexing(index, values.shape, dim))
 
-
+@torch.jit.ignore
 def multi_gather_tris(v: torch.Tensor, f: torch.Tensor, dim:int=-2) -> torch.Tensor:
     # compute faces normals w.r.t the vertices (considering batch dimension)
     if v.ndim == (f.ndim + 1):
