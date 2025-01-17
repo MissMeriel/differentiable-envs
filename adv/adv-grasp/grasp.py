@@ -291,7 +291,7 @@ class GraspTorch(object):
         
         if self.quality is not None:
             p_str += "\n\tquality: " + str(self.quality)
-        if self.prediction is not None:
+        if hasattr(self,'prediction') and self.prediction is not None:
             p_str += "\n\tmodel prediction: " + str(self.prediction)
         if self.im_center is not None:
             p_str +=  "\n\timage center: " + str(self.im_center)
@@ -393,11 +393,17 @@ class GraspTorch(object):
                 world_center = self.world_center.reshape((-1,3))[key]
                 axis3D = self.world_axis.reshape((-1,3))[key]
                 if hasattr(self, 'contact_points'):
-                    contact_points = self.contact_points.reshape((-1,2,3))[key,:]
+                    if torch.numel(self.contact_points) == 0:
+                        contact_points = self.contact_points
+                    else:
+                        contact_points = self.contact_points.reshape((-1,2,3))[key,:]
                 else:
                     contact_points = None
                 if hasattr(self, 'contact_normals'):
-                    contact_normals = self.contact_normals.reshape((-1,2,3))[key,:]
+                    if torch.numel(self.contact_normals) == 0:
+                        contact_normals = self.contact_normals
+                    else:
+                        contact_normals = self.contact_normals.reshape((-1,2,3))[key,:]
                 else:
                     contact_normals = None       
                 if hasattr(self,'im_center'):
