@@ -559,12 +559,14 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
     def find_min_dist_to_hull(G):       
         original_shape = G.shape
         G_unwrapped = G.view((original_shape[0]*original_shape[1], -1, 6))
-        is_feasible = torch.zeros((G_unwrapped.shape[1]),dtype=torch.bool,device=G.device)
-        closest = torch.zeros(is_feasible.shape, dtype=G.dtype, device=G.device)
-        closest_eq = torch.zeros(list(is_feasible.shape)+[7], dtype=G.dtype, device=G.device)
+        is_feasible_minimal = torch.zeros((G_unwrapped.shape[1]),dtype=torch.bool,device=G.device)
+        is_feasible_multi = torch.zeros((G_unwrapped.shape[1]),dtype=torch.bool,device=G.device)
+        closest = torch.zeros(is_feasible_minimal.shape, dtype=G.dtype, device=G.device)
+        closest_eq = torch.zeros(list(is_feasible_minimal.shape)+[7], dtype=G.dtype, device=G.device)
         facets_infeasible_local = []
         count_facets_per_grasp = []
-        facets_feasible_local = []
+        facets_feasible_multi_local = []
+        facets_feasible_minimal_local = []
         with record_function("ConvexHull-Loop"):
             for batch_idx in range(G_unwrapped.shape[1]):
                 miniG = G_unwrapped[:,batch_idx,:]
@@ -576,12 +578,16 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
                 is_above_origin = dist_from_origin<0
                 
                 if torch.all(is_above_origin) and torch.numel(is_above_origin) > 0:
-                    is_feasible[batch_idx] = 1
+
                     # if all negative, closest point is max (min of abs)
                     min_dist, min_dex = torch.max(dist_from_origin,0)
                     facet = torch.nn.functional.pad(miniG[torch.unique(simplices[min_dist == equations[:,-1]].flatten())],[0,1],value=1)
-                    #facet = miniG[simplices_finite[(min_dex),:],:].unsqueeze(0)
-                    facets_feasible_local.append(facet)
+                    if facet.shape[-2] > 6:
+                        is_feasible_multi[batch_idx] = 1
+                        facets_feasible_multi_local.append(facet)
+                    else:
+                        is_feasible_minimal[batch_idx] = 1
+                        facets_feasible_minimal_local.append(facet)
                     closest_eq[batch_idx] = equations[min_dex]
                 else:
                     facet = miniG[simplices[torch.logical_not(is_above_origin),:],:]
@@ -589,17 +595,22 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
                     count_facets_per_grasp.append(facet.shape[0])
         
                 
-        if len(facets_feasible_local) > 0:
+        if len(facets_feasible_multi_local) > 0:
             # facets = torch.cat(facets_feasible_local,dim=0)   
             # closest_feasible = CannyFerrariQualityFunction.compute_hyperplane_above(facets)
             # closest[is_feasible] = closest_feasible
             
             #facets = torch.nested.nested_tensor(facets_feasible_local,requires_grad=True, layout=torch.jagged).to_padded_tensor(padding=0)
-            facets = torch.nn.utils.rnn.pad_sequence(facets_feasible_local,batch_first=True)
-            closest_feasible = torch.linalg.svd(facets).Vh[...,-1,:]
+            facets = torch.nn.utils.rnn.pad_sequence(facets_feasible_multi_local,batch_first=True)
+            closest_feasible = hullTorch.computePlaneLeastSquare(facets)
             closest_feasible = torch.abs(closest_feasible[:,-1])
+            closest[is_feasible_multi] = closest_feasible
 
-            closest[is_feasible] = closest_feasible
+        if len(facets_feasible_minimal_local) > 0:
+            facets = torch.nn.utils.rnn.pad_sequence(facets_feasible_minimal_local,batch_first=True)
+            closest_feasible = hullTorch.computePlaneCross(facets)
+            closest_feasible = torch.abs(closest_feasible[:,-1])
+            closest[is_feasible_minimal] = closest_feasible
 
         allow_neg_fc = 0
         # TODO re-introduce, consider if we want to still drop zero size facets
@@ -623,7 +634,7 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
             closest_infeasible = 0
         
         
-        closest[torch.logical_not(is_feasible)] = closest_infeasible
+        closest[torch.logical_not(torch.logical_or(is_feasible_multi,is_feasible_minimal))] = closest_infeasible
         return closest, closest_eq
 
 class RobustCannyFerrariQualityFunction(CannyFerrariQualityFunction):
@@ -790,23 +801,27 @@ class hullTorch(torch.autograd.Function):
         return distances
 
     @staticmethod
-    def computePlanes(points,hull):
+    def computePlaneCross(points):
         # generalized cross product to create planes
-        # https://mathoverflow.net/questions/109949/how-to-efficiently-compute-the-generalized-cross-product
+        # https://madoshakalaka.github.io/2019/03/02/generalized-cross-product-for-high-dimensions.html
 
-        # alternative: put points in cross product, but inefficient if plane compared repeatedly 
-        # compare all simplices, as points to all points
-        # 
-
-        det_A, A_matrices = hullTorch.hull_det(points, hull)
-        b = torch.zeros_like(A_matrices[...,0:1])
-        b[...,-1,-1] = torch.sign(det_A)
-        
-        planes = torch.linalg.solve(A_matrices,b,left=True).squeeze(-1)
+        points_reshape = points.unsqueeze(-3).expand(list(points.shape[:-2])+[7,6,7])
+        identity_shape = list(points_reshape.shape)[:-3]+[7,1,7]
+        identity = torch.eye(7,device=points.device,dtype=points.dtype).reshape([1,7,1,7]).expand(identity_shape)
+        points_with_eye = torch.cat((points_reshape,identity),dim=-2)
+        planes = torch.linalg.det(points_with_eye)
+        planes = planes / torch.linalg.vector_norm(planes[...,:-1],dim=-1,keepdim=True)
+        # planes[...,-1] = torch.mean(torch.linalg.vecdot(points[...,:-1],planes[...,:-1]),dim=-1)
 
         return planes
 
+    @staticmethod
+    def computePlaneLeastSquare(points):
+        planes = torch.linalg.svd(points).Vh[...,-1,:]
+        planes = planes / torch.linalg.vector_norm(planes[...,:-1],dim=-1,keepdim=True)
+        # planes[...,-1] = torch.mean(torch.linalg.vecdot(points[...,:-1],planes[...,:-1]),dim=-1)
 
+        return planes
 
 
 class qHullTorch(torch.autograd.Function):
@@ -1025,11 +1040,11 @@ def test_quality():
         faces=[faces.to(device)],
         textures=textures
     )
-    unconnectivity = mp(mesh)
+    unconnectivity = mp(mesh,forceNormalDist=False)
     # with record_function("distfunction"):
         # print(self_collision(mesh, unconnectivity,forceNormalDist=False))
     with record_function("distfunction_n"):
-        print(unconnectivity.self_collision(mesh,forceNormalDist=False))
+        print(mp.self_collision(unconnectivity,mesh))
     config_dict = {
         "torque_scaling":1000,
         "soft_fingers":1,
@@ -1327,7 +1342,7 @@ def test_quality():
 
 def test_dist():
     if torch.cuda.is_available():
-        device = torch.device("cuda:1")
+        device = torch.device("cuda:0")
         torch.cuda.set_device(device)
 
     with record_function("load_obj"):
@@ -1341,20 +1356,39 @@ def test_dist():
         faces=[faces.to(device)],
         textures=textures
     )
-    unconnectivity = mp(mesh)
-    distances,barys = unconnectivity.self_collision(mesh ,forceNormalDist=False)
+    with record_function("test_compilation"):
+        unconnectivity = torch.jit.script(mp(mesh,forceNormalDist=False))
+    verts = mesh.verts_packed()
+    verts.requires_grad_(True)
+    distances,barys = unconnectivity( verts )
     print(distances)
+    distances,barys = unconnectivity( verts )
+    print(distances)
+
+    with record_function("test_compiled"):
+        for i in range(20):
+            distances,barys = unconnectivity( verts )
+            print(distances)
+
+    with record_function("test_construction"):
+        unconnectivity = mp(mesh,forceNormalDist=False)
+    verts = mesh.verts_packed()
+    verts.requires_grad_(True)
+    with record_function("test_regular"):
+        for i in range(20):
+            distances,barys = unconnectivity( verts )
+            print(distances)
 
 if __name__ == "__main__":
     #minHull.apply(torch.tensor(dict['G']).transpose(0,1).reshape((20,1,1,6)))
     np.set_printoptions(edgeitems=30, linewidth=100)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, with_stack=False) as prof:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False, with_stack=False) as prof:
         with record_function("test_quality"):
             #model(inputs)
             with torch.enable_grad():        
                 # test_stein()
-                test_quality()
-                test_wine()
+                # test_quality()
+                # test_wine()
                 test_dist()
                 
     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
