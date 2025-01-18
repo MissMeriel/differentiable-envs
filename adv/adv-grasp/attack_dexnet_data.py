@@ -1,3 +1,7 @@
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
 import h5py
 import quality_fork as qf
 import torch
@@ -9,7 +13,7 @@ import numpy as np
 import random
 from run_gqcnn import *
 from select_grasp import *
-import gc
+import traceback
 
 class dexnet_db:
     def __init__(self,path):
@@ -34,7 +38,7 @@ def config_as_torch(configuration, device='cpu'):
 
 if __name__ == "__main__":
     db = dexnet_db('/mnt/array/Home/Data/HPSTA/dexnet_database/dexnet_2.0_training_database/dexnet_2_database.hdf5')
-    gpu_id = 0
+    gpu_id = 1
 
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{gpu_id}")
@@ -45,6 +49,13 @@ if __name__ == "__main__":
 
     r = re.Renderer(device=device)
 
+    objects_skip_file = 'bad_objs.txt'
+    if objects_skip_file is not None:
+        with open(objects_skip_file) as file:
+            objects_skip = set([line.rstrip() for line in file])
+    else:
+        objects_skip = set([])
+
     config_dict = {
         "torque_scaling":1000,
         "soft_fingers":1,
@@ -53,23 +64,25 @@ if __name__ == "__main__":
     }
     mom=0
     lr0 = 1e-4
+    n_consider = 25
+    n_attack = 3
     cf = qf.CannyFerrariQualityFunction(config_dict,min_quality=1)
     rcf = qf.RobustCannyFerrariQualityFunction(config_dict,min_quality=1)
     datasets = db.data_['datasets']
     print(datasets.keys())
     adv_grasp_dir = 'adv/adv-grasp/'
-    exp_root_dir = 'dexnet-loop-lower-collision-saturate-higher-lr/'
+    exp_root_dir = 'exp-10-plots-fix-scaling-allow-cf0-january-paper'
 
     model = KitModel(os.path.join(adv_grasp_dir,"weights.npy"),device=device)
     model.eval()
-    run1 = Attack(num_plots=20, steps_per_plot=25, model=model, renderer=r, oracle_method="pytorch")
+    run1 = Attack(num_plots=10, steps_per_plot=25, model=model, renderer=r, oracle_method="pytorch")
 
-    os.mkdir(f'{exp_root_dir}')
-    os.mkdir(f'{exp_root_dir}/debug_mesh_attack')
+    if not os.path.isdir(f'{exp_root_dir}'):
+        os.mkdir(f'{exp_root_dir}')
+        os.mkdir(f'{exp_root_dir}/debug_mesh_attack')
 
     for dataset in datasets:
-        object_list = list(db.data_['datasets'][dataset]['objects'])
-        # object_list = ['bc910044930d827950a69e53f7a35c05']
+        object_list = list(set(db.data_['datasets'][dataset]['objects']).difference(objects_skip))
         random.shuffle(object_list)
         for object in tqdm(object_list,desc=f'from {dataset}',leave=False):
             inner = db.data_['datasets'][dataset]['objects'][object]
@@ -81,67 +94,125 @@ if __name__ == "__main__":
                     # gc.collect()
                     mesh = r.pre_process_object(verts,faces)
                     mesh_props = re.mesh_properties(mesh)
-                    minDist = mesh_props.self_collision_min(mesh,forceNormalDist=0).item()
+                    dist, bary = mesh_props.self_collision(mesh_props, mesh)
+                    minDist = re.mesh_properties.self_collision_min(dist, bary).item()
                 except Exception as e:
                     tqdm.write(f'failed to compute connectivity on {object}, saving for debug faces: {faces.shape} verts: {verts.shape}')
                     tqdm.write(str(e))
                     #
                     log = open(f'{exp_root_dir}/debug_mesh_attack/{object}_crash.txt', 'a')
                     log.write(str(e))
+                    log.write(traceback.format_exc())
                     log.close()
                     #pytorch3d.io.save_obj(f'debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
-
-                    break
-                try:
-                    graspObj = random.choice(list(db.data_['datasets'][dataset]['objects'][object]['grasps'][name]))
-                except Exception as e:
-                    tqdm.write(f'failed to random choice on {object}, saving for debug faces: {faces.shape} verts: {verts.shape}')
-                    tqdm.write(str(e))
-                    #
-                    log = open(f'{exp_root_dir}/debug_mesh_attack/{object}_empty.txt', 'a')
-                    log.write(str(e))
-                    log.close()
                     break
                 #grasp_name = 'grasp_21'
-                if minDist < 1e-9:
+                if minDist < 5e-9 or not math.isfinite(minDist):
+                    pytorch3d.io.save_obj(f'{exp_root_dir}/debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
+                    bad_faces = mesh_props.get_colliding_faces(dist, bary, min_dist = 1e-8)
+                    mesh = r.pre_process_object(mesh.verts_packed(), mesh.faces_packed(), faces_to_remove=bad_faces)
+                    pytorch3d.io.save_obj(f'{exp_root_dir}/debug_mesh_attack/{object}_stripped.obj', mesh.verts_packed(),mesh.faces_packed())
                     open(f'{exp_root_dir}/debug_mesh_attack/{object}_collision.txt', 'a').close()
+                    tqdm.write(f'{object} is in collision, skipping')
+                    bad_faces = None
+                    break
                 else:
-                    try:
-                        # gc.collect()
-                        cf_db = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][graspObj]['metrics'].attrs['ferrari_canny'] 
-                        rcf_db = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][graspObj]['metrics'].attrs['robust_ferrari_canny'] 
-                        config = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][graspObj].attrs['configuration']
-                        center3D, axis3D, max_width = config_as_torch(config, device=device)
-                        graspObj = qf.GraspTorch(center3D, world_axis=axis3D, width=max_width,
-                                                friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
-                        graspObj.make2D(camera_intr=r.camera)
-                        # grasp_h = GraspTorch(depth=graspObj.depth.float(),im_center=graspObj.im_center.float(),
-                        #                 im_angle=graspObj.im_angle.float(),im_axis=graspObj.im_axis.float(), 
-                        #                 world_center=graspObj.world_center.float(), world_axis=graspObj.world_axis.float(),
-                        #                 oracle_method='pytorch')
-                        graspObj = graspObj.apply_to_mesh(mesh, is_watertight=mesh_props.is_watertight, 
-                                                          is_inverted=mesh_props.is_inverted, use_dexnet_normal=False)
-                        # cf_val = cf(mesh, graspObj)
-                        # rcf_val = rcf(mesh, graspObj)
-                        
-                        run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-mw-DOWN-coll-up/{graspObj}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.MW_DOWN,AttackMethod.SELF_COLLISION_UP])
-                        run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-mw-UP-coll-up/{graspObj}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.MW_UP,AttackMethod.SELF_COLLISION_UP])
-                                
-                        run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-GQCNN-DIFF-coll-up/{graspObj}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_CF_DIFF,AttackMethod.SELF_COLLISION_UP])
-                        run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN-coll-up/{graspObj}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_UP])
-                        run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-GQCNN-UP-coll-up/{graspObj}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_UP])
-
-                        # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT)
-                        # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_DOWN)
-                        # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_UP)
-                        # tqdm.write(f'cf: db: {cf_db:.4f} ours: {cf_val.item():.4f} rcf: db: {rcf_db:.4f}, ours: {rcf_val.item():.4f}')
-                        # f.write(f'{object}, {grasp_name}, 0, {cf_db:.8f}, {cf_val.item():.8f}, {rcf_db:.8f}, {rcf_val.item():.8f}, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
-                    except Exception as e:
+                    # check that grasps exist at all
+                    grasp_list = list(db.data_['datasets'][dataset]['objects'][object]['grasps'][name])
+                    if len(grasp_list) == 0:
+                        tqdm.write(f'{object} has no grasps but mesh has: {faces.shape} verts: {verts.shape}')
                         tqdm.write(str(e))
-                        tqdm.write(f'failed to compute quality on {object} grasp {graspObj}, saving for debug')
-                        pytorch3d.io.save_obj(f'{exp_root_dir}/debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
-                        log = open(f'debug_mesh_attack/{object}_{graspObj}_grasp.txt', 'a')
+                        log = open(f'{exp_root_dir}/debug_mesh_attack/{object}_empty.txt', 'a')
                         log.write(str(e))
                         log.close()
-                        graspObj.write_obj(f'debug_mesh_attack/{object}_{graspObj}.obj', include_coordinate=True, include_line_o_action=True)
+                        break
+                    
+                    random.shuffle(grasp_list)
+                    grasp_list = grasp_list[:n_consider]
+                    stats = np.zeros((len(grasp_list),4))
+                    # find N grasps with interesting properties
+                    
+                        # try:
+                        # gc.collect()
+                        
+                    try:
+                        for index_grasp, grasp_name in tqdm(enumerate(grasp_list), desc=f'Considering grasps to attack in {object}', leave=False):
+                            cf_db = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][grasp_name]['metrics'].attrs['ferrari_canny'] 
+                            rcf_db = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][grasp_name]['metrics'].attrs['robust_ferrari_canny'] 
+                            config = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][grasp_name].attrs['configuration']
+                            center3D, axis3D, max_width = config_as_torch(config, device=device)
+                            graspObj = qf.GraspTorch(center3D, world_axis=axis3D, width=max_width,
+                                                    friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+                            graspObj.make2D(camera_intr=r.camera)
+
+                            graspObj = graspObj.apply_to_mesh(mesh, is_watertight=mesh_props.is_watertight, 
+                                                            is_inverted=mesh_props.is_inverted, use_dexnet_normal=False)
+                            dim = r.mesh_to_depth_im(mesh, display=False)
+                            pose, image = qf.GQCNNQualityFunction.extract_tensors(grasp=graspObj, d_im=dim,scale=1.0)
+                            out = model(pose, image)
+                            if graspObj.count_misses == 0:
+                                gqcnn_val = out[:,1:2].item()
+                                cf_val = cf(mesh, graspObj).item()
+                                rcf_val = rcf(mesh, graspObj).item()
+                                stats[index_grasp,:] = (gqcnn_val, cf_val, rcf_val, 1)
+                            tqdm.write(f'{index_grasp} {stats[index_grasp,:]}')
+                    except Exception as e:
+                        tqdm.write(f'failed to compute quality on {object} grasp {grasp_name}, saving for debug')
+                        log = open(f'{exp_root_dir}/debug_mesh_attack/{object}_{grasp_name}_grasp.txt', 'a')
+                        log.write(str(e))
+                        log.write(traceback.format_exc())
+                        log.close()
+                        break
+                    
+                       
+                    # sort them
+                    indices_interesting = np.argsort(stats[:,0])[::-1][:n_attack]
+                    stats_sort = stats[indices_interesting,:]
+                    indices_interesting = indices_interesting[np.logical_and(stats_sort[:,1]>0,stats_sort[:,2]>0,stats_sort[:,3]>0)] # must be in collision AND rcf be non-zero. rcf derivative undefined if 0
+
+                    minDist, dist, bary, mesh_props = None, None, None, None
+                    try:
+                        for grasp_ind in tqdm(indices_interesting, desc=f'attacking grasps in {object} with gqcnn of {stats_sort[:,0]}',leave=False):
+                            grasp_name = grasp_list[grasp_ind]
+
+                            config = db.data_['datasets'][dataset]['objects'][object]['grasps'][name][grasp_name].attrs['configuration']
+                            center3D, axis3D, max_width = config_as_torch(config, device=device)
+                            graspObj = qf.GraspTorch(center3D, world_axis=axis3D, width=max_width,
+                                                    friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+                            graspObj.make2D(camera_intr=r.camera)
+                            # loop
+                            #run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-mw-DOWN-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.MW_DOWN,AttackMethod.SELF_COLLISION_UP])
+                            
+                            #run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-mw-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.MW_UP,AttackMethod.SELF_COLLISION_UP])
+                                    
+                            #run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-GQCNN-DIFF-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_CF_DIFF,AttackMethod.SELF_COLLISION_UP])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_UP])
+                            if attack_failed:
+                                raise Exception("Attack Failed")
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-GQCNN-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_UP])
+
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-GQCNN-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.GQCNN_UP])
+
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-DOWN-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_UP])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_UP])
+
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_UP])
+                            torch.cuda.synchronize()
+                                # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT)
+                                # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_DOWN)
+                                # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_UP)
+                                # tqdm.write(f'cf: db: {cf_db:.4f} ours: {cf_val.item():.4f} rcf: db: {rcf_db:.4f}, ours: {rcf_val.item():.4f}')
+                                # f.write(f'{object}, {grasp_name}, 0, {cf_db:.8f}, {cf_val.item():.8f}, {rcf_db:.8f}, {rcf_val.item():.8f}, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
+
+                    except Exception as e:
+                        tqdm.write(str(e))
+                        tqdm.write(f'failed to compute quality on {object} grasp {grasp_name}, saving for debug')
+                        pytorch3d.io.save_obj(f'{exp_root_dir}/debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
+                        log = open(f'{exp_root_dir}/debug_mesh_attack/{object}_{grasp_name}_grasp.txt', 'a')
+                        log.write(str(e))
+                        log.write(traceback.format_exc())
+                        log.close()
+                        graspObj.write_obj(f'{exp_root_dir}/debug_mesh_attack/{object}_{grasp_name}.obj', include_coordinate=True, include_line_o_action=True)
 
