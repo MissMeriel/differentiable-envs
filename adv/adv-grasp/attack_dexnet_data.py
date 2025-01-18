@@ -187,8 +187,8 @@ if __name__ == "__main__":
                                     
                             #run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-GQCNN-DIFF-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_CF_DIFF,AttackMethod.SELF_COLLISION_UP])
                             _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_UP])
-                            if attack_failed:
-                                raise Exception("Attack Failed")
+                            if attack_failed is not None:
+                                raise Exception(attack_failed)
                             _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-GQCNN-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_UP])
 
                             _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN])
