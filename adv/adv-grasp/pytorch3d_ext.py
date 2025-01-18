@@ -1053,23 +1053,26 @@ class mesh_properties(nn.Module):
         if not torch.all(valid_bary):
             with record_function("secondary qp"):
                 
+                
                 if equality_A.size(0) == 0:
                     equality_A_filt = equality_A
                     equality_b_filt = equality_b
                 else:
                     equality_A_filt = equality_A[valid_bary]
                     equality_b_filt = equality_b[valid_bary]
-                mesh_properties._blockPrint()
-                bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
-                                                        inequality_G, inequality_h, #inequality constraints
-                                                        equality_A_filt,equality_b_filt) # equality constraints)
-                mesh_properties._enablePrint()
                 bary_coords = float('Inf') * torch.ones_like(bary_coords)
-                bary_coords[valid_bary] = bary_coords_feasible
-                quadratic_term_diagonal.copy_(quadratic_term_orig)
-                dist_feasible = mesh_properties._applyQuad(bary_coords_feasible, quadratic_term[valid_bary], linear_term[valid_bary], const_term[valid_bary])
                 dist_all = float('Inf') * torch.ones_like(const_term)
-                dist_all[valid_bary] = dist_feasible
+                if torch.any(valid_bary):
+                    mesh_properties._blockPrint()
+                    bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
+                                                            inequality_G, inequality_h, #inequality constraints
+                                                            equality_A_filt,equality_b_filt) # equality constraints)
+                    mesh_properties._enablePrint()
+
+                    bary_coords[valid_bary] = bary_coords_feasible
+                    quadratic_term_diagonal.copy_(quadratic_term_orig)
+                    dist_feasible = mesh_properties._applyQuad(bary_coords_feasible, quadratic_term[valid_bary], linear_term[valid_bary], const_term[valid_bary])
+                    dist_all[valid_bary] = dist_feasible
         else:
             with record_function("apply solution"):
                 quadratic_term_diagonal.copy_(quadratic_term_orig)
