@@ -38,7 +38,7 @@ def config_as_torch(configuration, device='cpu'):
 
 if __name__ == "__main__":
     db = dexnet_db('/mnt/array/Home/Data/HPSTA/dexnet_database/dexnet_2.0_training_database/dexnet_2_database.hdf5')
-    gpu_id = 1
+    gpu_id = 0
 
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{gpu_id}")
@@ -64,14 +64,15 @@ if __name__ == "__main__":
     }
     mom=0
     lr0 = 1e-4
-    n_consider = 25
+    n_consider = 35
     n_attack = 3
     cf = qf.CannyFerrariQualityFunction(config_dict,min_quality=1)
     rcf = qf.RobustCannyFerrariQualityFunction(config_dict,min_quality=1)
     datasets = db.data_['datasets']
     print(datasets.keys())
     adv_grasp_dir = 'adv/adv-grasp/'
-    exp_root_dir = 'exp-10-plots-fix-scaling-allow-cf0-january-paper'
+    exp_root_dir = 'exp-10-plots-fix-qp-feasible-january-paper'
+    #exp_root_dir = 'throwaway-debug'
 
     model = KitModel(os.path.join(adv_grasp_dir,"weights.npy"),device=device)
     model.eval()
@@ -106,7 +107,6 @@ if __name__ == "__main__":
                     log.close()
                     #pytorch3d.io.save_obj(f'debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
                     break
-                #grasp_name = 'grasp_21'
                 if minDist < 5e-9 or not math.isfinite(minDist):
                     pytorch3d.io.save_obj(f'{exp_root_dir}/debug_mesh_attack/{object}.obj', mesh.verts_packed(),mesh.faces_packed())
                     bad_faces = mesh_props.get_colliding_faces(dist, bary, min_dist = 1e-8)
