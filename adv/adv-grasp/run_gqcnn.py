@@ -8,6 +8,7 @@ from tqdm import tqdm
 from pytorch3d.io import save_obj
 from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
 from enum import Enum
+from scipy.spatial.qhull import QhullError
 
 
 from pytorch3d_ext import Renderer, mesh_properties
@@ -517,12 +518,12 @@ class Attack:
 								self.param_grad_list.append(torch.zeros_like(param))
 
 						except Exception as e:
-							tqdm.write(method_type)
-							tqdm.write(e)
+							tqdm.write(str(method_type))
+							tqdm.write(str(e))
 							fail=True or fail
 							break
 					else:
-						tqdm.write(method_type)
+						tqdm.write(str(method_type))
 						tqdm.write('loss mag not finite')
 						fail=True or fail
 						break
@@ -564,8 +565,8 @@ class Attack:
 						param_updated = True
 
 					except Exception as e:
-						tqdm.write(method_type)
-						tqdm.write(e)
+						tqdm.write(str(method_type))
+						tqdm.write(str(e))
 						fail=True
 						pass
 					else:
@@ -999,27 +1000,27 @@ def test_run():
 
 	# instantiate Attack class and run prediction
 	run1 = Attack(model=model)
-	tqdm.write(run1.run(pose0, image0)[0][1].item())
-	tqdm.write(run1.run(pose1, image1)[0][1].item())
-	tqdm.write(run1.run(pose2, image2)[0][1].item())	# original barclamp object
-	tqdm.write(run1.run(pose3, image3)[0][1].item())	# new barclamp object
+	print(run1.run(pose0, image0)[0][1].item())
+	print(run1.run(pose1, image1)[0][1].item())
+	print(run1.run(pose2, image2)[0][1].item())	# original barclamp object
+	print(run1.run(pose3, image3)[0][1].item())	# new barclamp object
 
 	# test model with varying batch sizes
 	pose4 = torch.cat([pose1, pose2, pose3], 0)
 	image4 = torch.cat([image1, image2, image3], 0)
-	tqdm.write("\n")
-	tqdm.write(pose4.shape, image4.shape)
-	tqdm.write(run1.run(pose4, image4))
+	print("\n")
+	print(pose4.shape, image4.shape)
+	print(run1.run(pose4, image4))
 
 	pose5 = torch.cat([pose1, pose2, pose2, pose3, pose1, pose3, pose3, pose1, pose2])
 	image5 = torch.cat([image1, image2, image2, image3, image1, image3, image3, image1, image2])
-	tqdm.write(pose5.shape, image5.shape)
-	tqdm.write(run1.run(pose5, image5))
+	print(pose5.shape, image5.shape)
+	print(run1.run(pose5, image5))
 
 	pose6 = torch.cat([pose4, pose5], dim=0)
 	image6 = torch.cat([image4, image5], dim=0)
-	tqdm.write(pose6.shape, image6.shape)
-	tqdm.write(run1.run(pose6, image6))
+	print(pose6.shape, image6.shape)
+	print(run1.run(pose6, image6))
 	
 	Attack.logger.info("Finished test_run.")
 
@@ -1035,7 +1036,7 @@ def test_attack():
 
 	# FIXED GRASP TO ATTACK
 	grasp = GraspTorch.read("grasp-batch.json")[0]
-	tqdm.write("oracle quality:", grasp.quality.item())
+	print("oracle quality:", grasp.quality.item())
 
 	# SET UP ATTACK
 	model = KitModel("weights.npy")
@@ -1045,7 +1046,7 @@ def test_attack():
 	# RUN INITIAL MODEL PREDICTION
 	pose, image = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
 	pred = run1.run(pose, image)
-	tqdm.write("initial model prediction:", pred[1].item())
+	print("initial model prediction:", pred[1].item())
 
 	Attack.logger.info("ATTACK")
 	adv_mesh, final_pic = run1.attack(mesh, grasp, "test-attack", lr=1e-5, momentum=0.0)
