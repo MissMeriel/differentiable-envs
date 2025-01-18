@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import torch
 import pytorch3d
+from tqdm import tqdm
 from pytorch3d.io import save_obj
 from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
 from enum import Enum
@@ -213,7 +214,7 @@ class Attack:
 		elif AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD in method:
 			other_methods = method - {AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD}
 			if len(other_methods) > 0:
-				print(f'NO_ORACLE_GRAD may have unknown effects alongside {AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD.name}')
+				tqdm.write(f'NO_ORACLE_GRAD may have unknown effects alongside {AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD.name}')
 			oracle_pred = oracle_pred.detach()
 			abs_diff = torch.abs(torch.sub(cur_pred, oracle_pred))
 			adv_loss = torch.sub(1.0, abs_diff)
@@ -477,10 +478,10 @@ class Attack:
 		self.loss_mag = []
 		self.update_scale = []
 		self.optim_status = []
-		attack_failed = False
-		for i in range(1, self.num_steps):
+		attack_failed = None
+		for i in tqdm(range(1, self.num_steps),desc='attack outer iterations',leave=False):
 			attempts = 0 # used to decide whether to revert to previous mesh in param_safe
-			if attack_failed:
+			if attack_failed is not None:
 				break
 			if not use_fixed_step:
 				optimizer.zero_grad()
@@ -508,21 +509,21 @@ class Attack:
 									self.param_grad_list.append(param.grad.detach().clone())
 									param.grad.zero_()
 								else:
-									print(f'found inf grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
+									tqdm.write(f'found inf grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
 									fail = True or fail
 									break
 							else:
-								print(f'found None grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
+								tqdm.write(f'found None grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
 								self.param_grad_list.append(torch.zeros_like(param))
 
 						except Exception as e:
-							print(method_type)
-							print(e)
+							tqdm.write(method_type)
+							tqdm.write(e)
 							fail=True or fail
 							break
 					else:
-						print(method_type)
-						print('loss mag not finite')
+						tqdm.write(method_type)
+						tqdm.write('loss mag not finite')
 						fail=True or fail
 						break
 				# check that both loss AND its derivative are finite, otherwise triggering backoff
@@ -557,14 +558,14 @@ class Attack:
 							for method_index in range(len(method)):
 								param -= lr * torch.nn.functional.normalize(self.param_grad_list[method_index].detach().flatten(),dim=0).reshape(param.shape) * self.update_scale[-1][0,method_index].detach() 
 							
-						print(f'i_loop {i} o_steps {len(param_safe)} methods: {[m.name for m in method]} loss: {self.loss_mag[-1].numpy(force=True)} update scale: {(self.update_scale[-1]).numpy(force=True)}')
+						tqdm.write(f'i_loop {i} o_steps {len(param_safe)} methods: {[m.name for m in method]} loss: {self.loss_mag[-1].numpy(force=True)} update scale: {(self.update_scale[-1]).numpy(force=True)}')
 						param = param.detach()
 						param.requires_grad_(requires_grad=True)
 						param_updated = True
 
 					except Exception as e:
-						print(method_type)
-						print(e)
+						tqdm.write(method_type)
+						tqdm.write(e)
 						fail=True
 						pass
 					else:
@@ -578,24 +579,24 @@ class Attack:
 							break
 						
 
-				print(f'reducing param diff by {backoff}, try {attempts} reset counter {resets}')
+				tqdm.write(f'reducing param diff by {backoff}, try {attempts} reset counter {resets}')
 				if attempts > 3 or not param_updated or not torch.all(torch.isfinite(param).flatten()).item():
 					if resets > 3:
-						print(f'ending after reset {resets} times in a row, unlikely to recover')
+						tqdm.write(f'ending after reset {resets} times in a row, unlikely to recover')
 						if i <= 3:
-							attack_failed = True
+							attack_failed = f'{i} ending after reset {resets} times in a row, unlikely to recover'
 						break
 					if param_updated or resets < 1:
 						resets += 1
 					attempts = 0
 					for _ in range(math.floor(resets)):
 						param = param_safe.pop(-1)
-					print(f'resetting with {len(param_safe)+1}')
+					tqdm.write(f'resetting with {len(param_safe)+1}')
 				attempts += 1
 				# apply backoff ratio
 				if len(param_safe) == 0:
-					print('attempting to backoff, but param empty')
-					attack_failed = True
+					tqdm.write('attempting to backoff, but param empty')
+					attack_failed = f'{i} attempting to backoff, but param empty'
 					break
 				param = ((param + (param_safe[-1]*(backoff-1)))/backoff).detach()
 				param.requires_grad_(requires_grad=True)
@@ -698,7 +699,7 @@ class Attack:
 			self.renders_list += [imageio.imread(fname)]
 		else:
 			self.renders_list = [imageio.imread(fname)]
-		print(f"save: {fname}")
+		tqdm.write(f"save: {fname}")
 
 		if save_mesh:
 			imageio.mimsave(dir + f"it.gif", self.renders_list,fps=1,loop=10000)
@@ -765,7 +766,7 @@ class Attack:
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
 
-		print("oracle_eval_dexnet robust:", robust)
+		tqdm.write("oracle_eval_dexnet robust:", robust)
 
 		# check if object file is already saved in shared directory and copy there if not
 		if not os.path.isfile(obj_file):
@@ -786,7 +787,7 @@ class Attack:
 		calc_axes = self.world_axis / torch.norm(self.world_axis, dim=-1, keepdim=True)
 		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
 		save_nparr(calc_axes.detach().cpu().numpy(), "temp_axis.npy")
-		# print("\nobj_name:", type(obj_name), obj_name, "\n\n")
+		# tqdm.write("\nobj_name:", type(obj_name), obj_name, "\n\n")
 		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
 
 		# update quality info
@@ -872,7 +873,7 @@ class Attack:
 
 		if grasp.num_grasps() > 1:
 			grasp.quality = torch.zeros_like(grasp.world_axis[...,0:1])
-			for i, g in enumerate(grasp):
+			for i, g in tqdm(enumerate(grasp),desc='grasps'):
 				
 				try:
 					com_qual_func = qual_class(config_dict)
@@ -938,7 +939,7 @@ class Attack:
 	#				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
 				# use reference, if valid in barier. Use min/10 if we're closer than reference 
 				if min_dist < grasp.reference_dist/10:
-					print('inside outer boundary region')
+					tqdm.write('inside outer boundary region')
 					# dist_loss = -torch.sum(torch.log(relevant_dist - min_dist/10 ))
 					# dist_loss = torch.sum(1/(relevant_dist - min_dist/10 ))
 					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - min_dist/10 )))
@@ -950,7 +951,7 @@ class Attack:
 				# if we only care about closest pair to collision, then no sum needed
 				clamp_dist = torch.clamp(min_dist, max=4*grasp.reference_dist)
 				if min_dist < grasp.reference_dist/10:
-					print('inside outer boundary region')
+					tqdm.write('inside outer boundary region')
 					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - min_dist/10 )))
 				else:
 					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - grasp.reference_dist/10)))
@@ -968,7 +969,7 @@ def test_run():
 		device = torch.device("cuda:0")
 		torch.cuda.set_device(device)
 	else:
-		print("cuda not available")
+		tqdm.write("cuda not available")
 		device = torch.device("cpu")
 
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
@@ -998,27 +999,27 @@ def test_run():
 
 	# instantiate Attack class and run prediction
 	run1 = Attack(model=model)
-	print(run1.run(pose0, image0)[0][1].item())
-	print(run1.run(pose1, image1)[0][1].item())
-	print(run1.run(pose2, image2)[0][1].item())	# original barclamp object
-	print(run1.run(pose3, image3)[0][1].item())	# new barclamp object
+	tqdm.write(run1.run(pose0, image0)[0][1].item())
+	tqdm.write(run1.run(pose1, image1)[0][1].item())
+	tqdm.write(run1.run(pose2, image2)[0][1].item())	# original barclamp object
+	tqdm.write(run1.run(pose3, image3)[0][1].item())	# new barclamp object
 
 	# test model with varying batch sizes
 	pose4 = torch.cat([pose1, pose2, pose3], 0)
 	image4 = torch.cat([image1, image2, image3], 0)
-	print("\n")
-	print(pose4.shape, image4.shape)
-	print(run1.run(pose4, image4))
+	tqdm.write("\n")
+	tqdm.write(pose4.shape, image4.shape)
+	tqdm.write(run1.run(pose4, image4))
 
 	pose5 = torch.cat([pose1, pose2, pose2, pose3, pose1, pose3, pose3, pose1, pose2])
 	image5 = torch.cat([image1, image2, image2, image3, image1, image3, image3, image1, image2])
-	print(pose5.shape, image5.shape)
-	print(run1.run(pose5, image5))
+	tqdm.write(pose5.shape, image5.shape)
+	tqdm.write(run1.run(pose5, image5))
 
 	pose6 = torch.cat([pose4, pose5], dim=0)
 	image6 = torch.cat([image4, image5], dim=0)
-	print(pose6.shape, image6.shape)
-	print(run1.run(pose6, image6))
+	tqdm.write(pose6.shape, image6.shape)
+	tqdm.write(run1.run(pose6, image6))
 	
 	Attack.logger.info("Finished test_run.")
 
@@ -1034,7 +1035,7 @@ def test_attack():
 
 	# FIXED GRASP TO ATTACK
 	grasp = GraspTorch.read("grasp-batch.json")[0]
-	print("oracle quality:", grasp.quality.item())
+	tqdm.write("oracle quality:", grasp.quality.item())
 
 	# SET UP ATTACK
 	model = KitModel("weights.npy")
@@ -1044,7 +1045,7 @@ def test_attack():
 	# RUN INITIAL MODEL PREDICTION
 	pose, image = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
 	pred = run1.run(pose, image)
-	print("initial model prediction:", pred[1].item())
+	tqdm.write("initial model prediction:", pred[1].item())
 
 	Attack.logger.info("ATTACK")
 	adv_mesh, final_pic = run1.attack(mesh, grasp, "test-attack", lr=1e-5, momentum=0.0)
@@ -1069,18 +1070,18 @@ def test_run2():
 	poses, images = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=depth_im)
 	out = model.run(poses, images)
 	out = out[:,1:]
-	print(f"prediction: {out.shape} {out.device}\n{out}")
+	tqdm.write(f"prediction: {out.shape} {out.device}\n{out}")
 
 	grasp.prediction = out
 	grasp.save("grasp-batch.json")
 
 	# run model on individual grasps
-	for i, g in enumerate(grasp):
+	for i, g in tqdm(enumerate(grasp),desc='grasps'):
 		pose, image = g.extract_tensors(depth_im)
 		pred = model.run(pose, image)[:, 1:]
-		print(f"\nGrasp {i}: \n\tModel prediction: {pred.item()}\n\tOriginal prediction: {out[i].item()}\n\tOracle quality: {g.quality.item()}")
+		tqdm.write(f"\nGrasp {i}: \n\tModel prediction: {pred.item()}\n\tOriginal prediction: {out[i].item()}\n\tOracle quality: {g.quality.item()}")
 		if not out[i].item() == pred.item():
-			print(f"\tPrediction diff: {torch.sub(pred, out[i]).item()}")
+			tqdm.write(f"\tPrediction diff: {torch.sub(pred, out[i]).item()}")
 
 	Attack.logger.info("Done running test_run2.")
 
@@ -1110,10 +1111,10 @@ if __name__ == "__main__":
 	# 		save = d + ext + "/"
 	# 		lr = random_fuzz_lr[ext]
 	# 		grasp = grasp_dirs[d]
-	# 		print(f"saving to: {save} with learning rate {lr}")
+	# 		tqdm.write(f"saving to: {save} with learning rate {lr}")
 	# 		run1.attack(mesh=mesh, grasp=grasp, dir=save, lr=lr, momentum=None, loss_alpha=None, method="random-fuzz")
 
-	# print("ATTACK SET 1\n")
+	# tqdm.write("ATTACK SET 1\n")
 	graspObj = grasps[1]
 	dir = "test/no-oracle/"
 	run1.attack(mesh=mesh, grasp=graspObj, dir=dir, lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
