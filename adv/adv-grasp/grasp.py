@@ -479,12 +479,13 @@ class GraspTorch(object):
             if hasattr(self, 'object_com'):
                 sliced.object_com = self.object_com
             if hasattr(self, 'contact_mask'):
-                contact_mask = torch.zeros_like(self.contact_mask)
-                contact_inds = torch.nonzero(self.contact_mask.flatten()).squeeze(-1)
-                if len(contact_mask.shape) == 0:
+
+                if torch.numel(self.contact_mask) == 0:
                     # indexing will fail, but scalar can just direct assign
                     contact_mask = self.contact_mask
                 else:
+                    contact_mask = torch.zeros_like(self.contact_mask)
+                    contact_inds = torch.nonzero(self.contact_mask.flatten()).squeeze(-1)
                     contact_mask[contact_inds[key]] = 1
                 sliced.contact_mask = contact_mask
 
