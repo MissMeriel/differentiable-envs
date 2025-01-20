@@ -178,7 +178,7 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         
 
     @staticmethod
-    def extract_tensors(grasp, d_im, scale=1):
+    def extract_tensors(grasp, d_im):
         """
         Use grasp information and depth image to get image and pose tensors in form of GQCNN input
         Parameters
@@ -249,15 +249,15 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
             interpolation=transforms.InterpolationMode.BILINEAR,
             center=(cx, cy)
         )
-        torch_scaled = transforms.functional.affine(
-            torch_rotated,
-            0,
-            translate=(0, 0),
-            scale=scale,
-            shear=0,
-            interpolation=transforms.InterpolationMode.BILINEAR,
-            center=(cx, cy)
-        )
+        # torch_scaled = transforms.functional.affine(
+        #     torch_rotated,
+        #     0,
+        #     translate=(0, 0),
+        #     scale=scale,
+        #     shear=0,
+        #     interpolation=transforms.InterpolationMode.BILINEAR,
+        #     center=(cx, cy)
+        # )
         # torch_rotated2 = transforms.functional.affine(
         # 	translated_only,
         # 	theta,
@@ -280,7 +280,7 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         # )
 
         # 3 - crop image to size (32, 32)
-        torch_cropped = transforms.functional.crop(torch_scaled, cy-17, cx-17, 32, 32)
+        torch_cropped = transforms.functional.crop(torch_rotated, cy-17, cx-17, 32, 32)
         image_tensor = torch_cropped.unsqueeze(0)
 
         return pose_tensor, image_tensor
