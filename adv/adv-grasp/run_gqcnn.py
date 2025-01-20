@@ -8,7 +8,7 @@ from tqdm import tqdm
 from pytorch3d.io import save_obj
 from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
 from enum import Enum
-from scipy.spatial.qhull import QhullError
+from scipy.spatial import QhullError
 
 
 from pytorch3d_ext import Renderer, mesh_properties
@@ -177,7 +177,7 @@ class Attack:
 		cur_pred = out[:,1:].to(adv_mesh.device)
 		eps_check = False
 
-		dist_loss = self.eval_self_collision_dist(grasp, adv_mesh_clone)
+		dist_loss, min_dist = self.eval_self_collision_dist(grasp, adv_mesh_clone)
 		oracle_pred = self.oracle_eval(grasp, adv_mesh_clone, renderer=self.renderer)
 
 		# initialize to 0, so we can optionally add to it
@@ -250,6 +250,7 @@ class Attack:
 		self.track_qual["minWeight quality"].append(minweight_pred.item())
 		self.track_qual["dist loss"].append(dist_loss.item())
 		self.track_qual["did hit object"].append(torch.any(grasp.contact_mask.flatten()).item())
+		self.track_qual["min dist"].append(min_dist.item())
 		#self.track_qual["index"].append(index)
 
 		return loss_dict, eps_check
@@ -340,9 +341,12 @@ class Attack:
 			"oracle quality": [],
 			"minWeight quality": [],
 			"dist loss": [],
-			"did hit object": []
+			"did hit object": [],
+			"min dist": []
 			#"index": []
 		}
+
+		self.reference_dist = None
 
 	def attack_random_fuzz(self, mesh, grasp, dir, lr):
 		"""Run an attack on the model using random mesh perturbations with step size of lr"""
@@ -452,9 +456,7 @@ class Attack:
 		# initialize stack of known feasible meshes, for reverting during optimization
 		param_safe=[param.detach().clone()]
 		
-		if  hasattr(grasp,'reference_dist'):
-			delattr(grasp,'reference_dist')
-
+		
 		collision_loss_scale =  1e4
 		collision_loss_sat = 1
 		backoff = 2
@@ -512,6 +514,7 @@ class Attack:
 								else:
 									tqdm.write(f'found inf grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
 									fail = True or fail
+									param.grad.zero_()
 									break
 							else:
 								tqdm.write(f'found None grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
@@ -607,8 +610,8 @@ class Attack:
 
 
 			curr_loss = torch.sum(self.loss_mag[-1][0,other_indices]).item()
-			self.qual_measures_raw.append(torch.zeros((1,5), device=mesh.device))
-			self.qual_measures_raw[-1][0,0],self.qual_measures_raw[-1][0,1],self.qual_measures_raw[-1][0,2],self.qual_measures_raw[-1][0,3],self.qual_measures_raw[-1][0,4] = self.track_qual["gqcnn prediction"][-1],self.track_qual["minWeight quality"][-1], self.track_qual["oracle quality"][-1], self.track_qual["dist loss"][-1], self.track_qual["did hit object"][-1]
+			self.qual_measures_raw.append(torch.zeros((1,6), device=mesh.device))
+			self.qual_measures_raw[-1][0,0],self.qual_measures_raw[-1][0,1],self.qual_measures_raw[-1][0,2],self.qual_measures_raw[-1][0,3],self.qual_measures_raw[-1][0,4],self.qual_measures_raw[-1][0,5] = self.track_qual["gqcnn prediction"][-1],self.track_qual["minWeight quality"][-1], self.track_qual["oracle quality"][-1], self.track_qual["dist loss"][-1], self.track_qual["did hit object"][-1], self.track_qual["min dist"][-1],
 
 
 			if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
@@ -924,41 +927,41 @@ class Attack:
 		# self.last_all_dist = all_dist.numpy(force=True)
 		# self.last_coords = coords.numpy(force=True)
 		# store a reference distance if it doesn't exist, should be first time we reach here per grasp
-		if not hasattr(grasp,'reference_dist'):
+		if not hasattr(self,'reference_dist') or self.reference_dist is None:
 			if use_energy:
-				grasp.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach().item()
+				self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach().item()
 			else:
-				grasp.reference_dist = min_dist.item()
+				self.reference_dist = min_dist.item()
 
 		if use_energy:
 			# repulsive shell formula
-			dist_loss = torch.square(grasp.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+			dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
 		else:
 			if use_all_in_min:
 				# allows for us to have a distance threshold, above which we ignore in gradient
-				relevant_dist = all_dist[torch.logical_and(torch.isfinite(all_dist), all_dist < 4*grasp.reference_dist)]
+				relevant_dist = all_dist[torch.logical_and(torch.isfinite(all_dist), all_dist < 4*self.reference_dist)]
 	#				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
 				# use reference, if valid in barier. Use min/10 if we're closer than reference 
-				if min_dist < grasp.reference_dist/10:
+				if min_dist < self.reference_dist/10:
 					tqdm.write('inside outer boundary region')
 					# dist_loss = -torch.sum(torch.log(relevant_dist - min_dist/10 ))
 					# dist_loss = torch.sum(1/(relevant_dist - min_dist/10 ))
 					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - min_dist/10 )))
 				else:
 					# dist_loss = -torch.sum(1/(relevant_dist - self.reference_dist/10 ))
-					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - grasp.reference_dist/10)))
+					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - self.reference_dist/10)))
 			
 			else:
 				# if we only care about closest pair to collision, then no sum needed
-				clamp_dist = torch.clamp(min_dist, max=4*grasp.reference_dist)
-				if min_dist < grasp.reference_dist/10:
+				clamp_dist = torch.clamp(min_dist, max=4*self.reference_dist)
+				if min_dist < self.reference_dist/10:
 					tqdm.write('inside outer boundary region')
 					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - min_dist/10 )))
 				else:
-					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - grasp.reference_dist/10)))
+					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - self.reference_dist/10)))
 		dist_loss.requires_grad_(True)
 
-		return dist_loss
+		return dist_loss, min_dist
 
 
 def test_run():
