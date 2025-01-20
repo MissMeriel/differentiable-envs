@@ -64,19 +64,19 @@ if __name__ == "__main__":
     }
     mom=0
     lr0 = 1e-4
-    n_consider = 35
-    n_attack = 3
+    n_consider = 50
+    n_attack = 1
     cf = qf.CannyFerrariQualityFunction(config_dict,min_quality=1)
     rcf = qf.RobustCannyFerrariQualityFunction(config_dict,min_quality=1)
     datasets = db.data_['datasets']
     print(datasets.keys())
     adv_grasp_dir = 'adv/adv-grasp/'
-    exp_root_dir = 'exp-10-plots-fix-qp-feasible-january-paper'
+    exp_root_dir = 'exp-25-plots-fix-qp-feasible-fix-ref-dist-january-paper'
     #exp_root_dir = 'throwaway-debug'
 
     model = KitModel(os.path.join(adv_grasp_dir,"weights.npy"),device=device)
     model.eval()
-    run1 = Attack(num_plots=10, steps_per_plot=25, model=model, renderer=r, oracle_method="pytorch")
+    run1 = Attack(num_plots=25, steps_per_plot=10, model=model, renderer=r, oracle_method="pytorch")
 
     if not os.path.isdir(f'{exp_root_dir}'):
         os.mkdir(f'{exp_root_dir}')
@@ -148,7 +148,7 @@ if __name__ == "__main__":
                             graspObj = graspObj.apply_to_mesh(mesh, is_watertight=mesh_props.is_watertight, 
                                                             is_inverted=mesh_props.is_inverted, use_dexnet_normal=False)
                             dim = r.mesh_to_depth_im(mesh, display=False)
-                            pose, image = qf.GQCNNQualityFunction.extract_tensors(grasp=graspObj, d_im=dim,scale=1.0)
+                            pose, image = qf.GQCNNQualityFunction.extract_tensors_batch(grasp=graspObj, d_ims=dim)
                             out = model(pose, image)
                             if graspObj.count_misses == 0:
                                 gqcnn_val = out[:,1:2].item()
