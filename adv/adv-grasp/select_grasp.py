@@ -21,12 +21,6 @@ from matplotlib.ticker import MaxNLocator
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 EPS = 0.00001
 
-if torch.cuda.is_available():
-	device = torch.device("cuda:0")
-	torch.cuda.set_device(device)
-else:
-	print("cuda not available")
-	device = torch.device("cpu")
 
 class Grasp:
 
@@ -40,7 +34,7 @@ class Grasp:
 		ch.setFormatter(formatter)
 		logger.addHandler(ch)
 
-	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, prediction=None, oracle_method="pytorch", oracle_robust=None, objf=None):
+	def __init__(self, depth=None, im_center=None, im_angle=None, im_axis=None, world_center=None, world_axis=None, c0=None, c1=None, quality=None, prediction=None, oracle_method="pytorch", oracle_robust=None, objf=None, device=None,):
 		"""
 		Initialize a Grasp object
 		Paramters
@@ -77,72 +71,81 @@ class Grasp:
 		-------
 		None
 		"""
+		if device is None:
+			# set PyTorch device, use cuda if available
+			if torch.cuda.is_available():
+				device = torch.device("cuda:0")
+				torch.cuda.set_device(device)
+			else:
+				print("cuda not available")
+				device = torch.device("cpu")
+		self.device = device
 
 		self.im_center = im_center
 		if isinstance(im_center, list):
-			self.im_center = torch.from_numpy(np.array(im_center)).to(device).float()
+			self.im_center = torch.from_numpy(np.array(im_center)).to(self.device).float()
 		if self.im_center != None and self.im_center.dim() == 1:
 			self.im_center = self.im_center.unsqueeze(0)
 
 		self.im_axis = im_axis
 		if isinstance(im_axis, list):
-			self.im_axis = torch.from_numpy(np.array(im_axis)).to(device).float()
+			self.im_axis = torch.from_numpy(np.array(im_axis)).to(self.device).float()
 		if self.im_axis != None and self.im_axis.dim() == 1:
 			self.im_axis = self.im_axis.unsqueeze(0)
 
 		self.world_center = world_center
 		if isinstance(world_center, list):
-			self.world_center = torch.from_numpy(np.array(world_center)).to(device).float()
+			self.world_center = torch.from_numpy(np.array(world_center)).to(self.device).float()
 		if self.world_center != None and self.world_center.dim() == 1:
 			self.world_center = self.world_center.unsqueeze(0)
 
 		self.world_axis = world_axis
 		if isinstance(world_axis, list):
-			self.world_axis = torch.from_numpy(np.array(world_axis)).to(device).float()
+			self.world_axis = torch.from_numpy(np.array(world_axis)).to(self.device).float()
 		if self.world_axis != None and self.world_axis.dim() == 1:
 			self.world_axis = self.world_axis.unsqueeze(0)
 
 		self.c0 = c0
 		if isinstance(c0, list):
-			self.c0 = torch.from_numpy(np.array(c0)).to(device).float()
+			self.c0 = torch.from_numpy(np.array(c0)).to(self.device).float()
 		if self.c0 != None and self.c0.dim() == 1:
 			self.c0 = self.c0.unsqueeze(0)
 
 		self.c1 = c1
 		if isinstance(c1, list):
-			self.c1 = torch.from_numpy(np.array(c1)).to(device).float()
+			self.c1 = torch.from_numpy(np.array(c1)).to(self.device).float()
 		if self.c1 != None and self.c1.dim() == 1:
 			self.c1 = self.c1.unsqueeze(0)
 
 		self.depth = depth
 		if isinstance(depth, float):
-			self.depth = torch.tensor([depth]).to(device).float().unsqueeze(0)
+			self.depth = torch.tensor([depth]).to(self.device).float().unsqueeze(0)
 		elif isinstance(depth, list):
-			self.depth = torch.from_numpy(np.array(depth)).to(device).float()
+			self.depth = torch.from_numpy(np.array(depth)).to(self.device).float()
 		if self.depth != None and self.depth.dim() == 1:
 			self.depth = self.depth.unsqueeze(0)
 
 		self.im_angle = im_angle
 		if isinstance(im_angle, float):
-			self.im_angle = torch.tensor([im_angle]).to(device).float().unsqueeze(0)
+			self.im_angle = torch.tensor([im_angle]).to(self.device).float().unsqueeze(0)
 		elif isinstance(im_angle, list):
-			self.im_angle = torch.from_numpy(np.array(im_angle)).to(device).float()
+			self.im_angle = torch.from_numpy(np.array(im_angle)).to(self.device).float()
 		if self.im_angle != None and self.im_angle.dim() == 1:
 			self.im_angle = self.im_angle.unsqueeze(0)
 
 		self.quality = quality
 		if isinstance(quality, float):
-			self.quality = torch.tensor([quality]).to(device).float().unsqueeze(0)
+			self.quality = torch.tensor([quality]).to(self.device).float().unsqueeze(0)
 		elif isinstance(quality, list):
-			self.quality = torch.from_numpy(np.array(quality)).to(device).float()
+			self.quality = torch.from_numpy(np.array(quality)).to(self.device).float()
 		if self.quality != None and self.quality.dim() == 1:
 			self.qualilty = self.quality.unsqueeze(0)
 
 		self.prediction = prediction
 		if isinstance(prediction, float):
-			self.prediction = torch.tensor([prediction]).to(device).float().unsqueeze(0)
+			self.prediction = torch.tensor([prediction]).to(self.device).float().unsqueeze(0)
 		elif isinstance(prediction, list):
-			self.prediction = torch.from_numpy(np.array(prediction)).to(device).float()
+			self.prediction = torch.from_numpy(np.array(prediction)).to(self.device).float()
 		if self.prediction != None and self.prediction.dim() == 1:
 			self.prediction = self.prediction.unsqueeze(0)
 
@@ -157,7 +160,7 @@ class Grasp:
 		self.objf = objf
 
 	@classmethod
-	def init_from_dict(cls, dict):
+	def init_from_dict(cls, dict, device=None):
 		"""Initialize grasp object from a dictionary"""
 		init_keys = ["depth", "im_center", "im_angle", "im_axis", "world_center", "world_axis", "c0", "c1", "quality"]
 		dict_keys = dict.keys()
@@ -173,12 +176,18 @@ class Grasp:
 		if "objf" not in dict_keys:
 			dict["objf"] = None
 
-		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], prediction=dict["prediction"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"], objf=dict["objf"])
+		return Grasp(depth=dict["depth"], im_center=dict["im_center"], im_angle=dict["im_angle"], im_axis=dict["im_axis"], world_center=dict["world_center"], world_axis=dict["world_axis"], c0=dict["c0"], c1=dict["c1"], quality=dict["quality"], prediction=dict["prediction"], oracle_method=dict["oracle_method"], oracle_robust=dict["oracle_robust"], objf=dict["objf"], device=device)
 
 	@classmethod
-	def read(cls, fname):
+	def read(cls, fname, device=None):
 		"""Reads a JSON file fname with saved grasp information and initializes"""
-
+		if device is None:
+			if torch.cuda.is_available():
+				device = torch.device(f"cuda:0")
+				torch.cuda.set_device(device)
+			else:
+				print("cuda not available")
+				device = torch.device("cpu")
 		# read file
 		with open(fname) as f:
 			dictionary = json.load(f)
@@ -208,10 +217,18 @@ class Grasp:
 			# else:
 			dictionary["quality"] = torch.from_numpy(np.array(dictionary["quality"])).to(device).float()
 
-		return cls.init_from_dict(dictionary)
+		return cls.init_from_dict(dictionary,device=device)
 
 	@classmethod
-	def read_batch(cls, fnames):
+	def read_batch(cls, fnames, device=None):
+
+		if device is None:
+			if torch.cuda.is_available():
+				device = torch.device(f"cuda:0")
+				torch.cuda.set_device(device)
+			else:
+				print("cuda not available")
+				device = torch.device("cpu")
 
 		dict_list = []
 		batch_dict = {}
@@ -248,7 +265,7 @@ class Grasp:
 					continue
 			batch_dict["objf"] = o
 
-		return cls.init_from_dict(batch_dict)
+		return cls.init_from_dict(batch_dict,device=device)
 
 	def __iter__(self):
 		"""Make Grasp class iterable"""
@@ -278,7 +295,7 @@ class Grasp:
 			con1 = self.c1[key] if self.c1 is not None else None
 			qual = self.quality[key] if self.quality is not None else None
 			pred = self.prediction[key] if self.prediction is not None else None
-			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust)
+			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust,device=self.device)
 		elif isinstance(key, int):
 			length = self.num_grasps()
 			if key < 0:
@@ -295,7 +312,7 @@ class Grasp:
 			con1 = self.c1[key] if self.c1 is not None else None
 			qual = self.quality[key] if self.quality is not None else None
 			pred = self.prediction[key] if self.prediction is not None else None
-			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust)
+			return Grasp(depth=dep, im_center=imc, im_angle=angle, im_axis=imax, world_center=wc, world_axis=wax, c0=con0, c1=con1, quality=qual, prediction=pred, oracle_method=self.oracle_method, oracle_robust=self.oracle_robust,device=self.device)
 		else:
 			raise TypeError("Invalid argument type for accessing a Grasp object.")
 
@@ -555,9 +572,9 @@ class Grasp:
 
 			# temporary dictionary for candidate grasps
 			temp_dict = {"world_axis": world_axes.detach().cpu().numpy().tolist(), "world_center": world_centers.detach().cpu().numpy().tolist(), "c0": c0.detach().cpu().numpy().tolist(), "c1": c1.detach().cpu().numpy().tolist()}
-			temp_qual = torch.zeros(world_centers.shape[0], 1, dtype=torch.float64, device="cuda:0")
+			temp_qual = torch.zeros(world_centers.shape[0], 1, dtype=torch.float64, device=renderer.device)
 
-			cand_grasps = Grasp.init_from_dict(temp_dict)
+			cand_grasps = Grasp.init_from_dict(temp_dict,device=renderer.device)
 			for i, g in enumerate(cand_grasps):
 				if i % 100 == 0:
 					cls.logger.info(f"Checking grasp {i} of {world_centers.shape[0]} in iteration {it}.")
@@ -582,7 +599,7 @@ class Grasp:
 			cls.logger.info(f"# successful grasps on iteration {it}: {torch.sum(mask)}")
   
 		# sort in descending order of quality
-		grasp = Grasp.init_from_dict(grasp_dict)
+		grasp = Grasp.init_from_dict(grasp_dict,device=renderer.device)
 		if kwargs["sort"]:
 			sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
 			grasp.world_center = torch.index_select(grasp.world_center, 0, sort_indices)
@@ -644,11 +661,11 @@ class Grasp:
 				# match sizes for batches of world centers and axes
 				diff = world_centers_batch.shape[1] - world_centers_add.shape[0]
 				if diff > 0:
-					world_centers_add = torch.cat((world_centers_add, torch.zeros(diff, 3, device=device)), 0)
-					world_axes_add = torch.cat((world_axes_add, torch.zeros(diff, 3, device=device)), 0)
+					world_centers_add = torch.cat((world_centers_add, torch.zeros(diff, 3, device=self.device)), 0)
+					world_axes_add = torch.cat((world_axes_add, torch.zeros(diff, 3, device=self.device)), 0)
 				elif diff < 0:
-					world_centers_batch = torch.cat((world_centers_batch, torch.zeros(world_centers_batch.shape[0], -1*diff, 3, device=device)), 1)
-					world_axes_batch = torch.cat((world_axes_batch, torch.zeros(world_axes_batch.shape[0], -1*diff, 3, device=device)), 1)
+					world_centers_batch = torch.cat((world_centers_batch, torch.zeros(world_centers_batch.shape[0], -1*diff, 3, device=self.device)), 1)
+					world_axes_batch = torch.cat((world_axes_batch, torch.zeros(world_axes_batch.shape[0], -1*diff, 3, device=self.device)), 1)
 
 				world_centers_batch = torch.cat((world_centers_batch, world_centers_add.unsqueeze(0)), 0)
 				world_axes_batch = torch.cat((world_axes_batch, world_axes_add.unsqueeze(0)), 0)
@@ -684,7 +701,7 @@ class Grasp:
 					grasp_dict[key] = torch.tensor(grasp_dict[key]).to(renderer.device).float()
 					# print("key:", key, "\tshape:", grasp_dict[key].shape)
 
-				grasp = cls.init_from_dict(grasp_dict)
+				grasp = cls.init_from_dict(grasp_dict,device=renderer.device)
 
 				if kwargs["sort"]:
 					sort_indices = torch.argsort(grasp.quality, 0, descending=True).squeeze()
@@ -794,7 +811,7 @@ class Grasp:
 
 		# check type of input_dim
 		if isinstance(d_im, np.ndarray):
-			torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1).to(device)
+			torch_dim = torch.tensor(d_im, dtype=torch.float32).permute(2, 0, 1).to(self.device)
 		else:
 			torch_dim = d_im
 
@@ -880,7 +897,7 @@ class Grasp:
 
 	def extract_tensors_batch(self, dims):
 
-		r = Renderer()
+		# r = Renderer()
 
 		# check type of input_dim
 		if isinstance(dims, np.ndarray):
@@ -915,14 +932,14 @@ class Grasp:
 		# 	translation matrix
 		dim_cx = dims.shape[3] // 2	# 320
 		dim_cy = dims.shape[2] // 2	# 240
-		dim_cx_tens = torch.tensor([dim_cx]).expand(batch_size).to(device)
-		dim_cy_tens = torch.tensor([dim_cy]).expand(batch_size).to(device)
+		dim_cx_tens = torch.tensor([dim_cx]).expand(batch_size).to(self.device)
+		dim_cy_tens = torch.tensor([dim_cy]).expand(batch_size).to(self.device)
 
 		u = (2 * ((dim_cx_tens - self.im_center[..., 0])/3) / (dims_resized.shape[3])).float()	# not in pixels, but normalized on (image size * 2)
 		v = (2 * ((dim_cy_tens - self.im_center[..., 1])/3) / (dims_resized.shape[2])).float()
 
 		translate = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]])
-		translate = translate.expand(batch_size, -1, -1).to(device).float()
+		translate = translate.expand(batch_size, -1, -1).to(self.device).float()
 		indices = torch.arange(batch_size)
 		translate[indices, 0, 2] = u
 		translate[indices, 1, 2] = v
@@ -932,7 +949,7 @@ class Grasp:
 		cos = torch.cos(theta)
 		sin = torch.sin(theta)
 
-		rotation = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]]).expand(batch_size, -1, -1).to(device).float()
+		rotation = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]]).expand(batch_size, -1, -1).to(self.device).float()
 		rotation[indices, 0, 0] = cos
 		rotation[indices, 1, 1] = cos
 		rotation[indices, 0, 1] = -1 * sin
@@ -960,7 +977,7 @@ class Grasp:
 
 		return pose_tensor, dims_transformed
 
-	def oracle_eval(self, obj_file, oracle_method=None, robust=None, renderer=None, grad=True):
+	def oracle_eval(self, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual'):
 		"""
 		Get a final oracle evalution of a mesh object according to oracle_method
 
@@ -997,7 +1014,7 @@ class Grasp:
 			if not renderer:
 				Grasp.logger.error("oracle_eval - pytorch oracle requires renderer argument")
 			else:
-				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad)
+				return self.oracle_eval_pytorch(obj_file, renderer, grad=grad, robust=robust, mode=mode)
 
 	def oracle_eval_dexnet(self, obj_file, robust=True):
 		"""
@@ -1035,12 +1052,50 @@ class Grasp:
 
 		return self.quality
 
-	def oracle_eval_pytorch(self, obj, renderer, grad=True):
+	def write_grasp_pytorch(self, obj, renderer, path):
+		"""
+			Save a colored mesh of the grasp points for the current object using pytorch version of dexnet library
+		"""
+		if (self.world_center == None or self.world_axis == None):
+			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
+			return None
+
+		config_dict = {
+			"torque_scaling":1000,
+			"soft_fingers":1,
+			"friction_coef": 0.8,
+			"antipodality_pctile": 1.0 
+    	}
+
+		if isinstance(obj, Meshes): mesh = obj
+		else: mesh, _ = renderer.render_object(obj, display=False)
+
+		if self.num_grasps() == 1:
+			self.quality = torch.zeros_like(self.depth)
+			# for i, g in enumerate(self):
+			g = self[0]
+			if g.c0 is not None and g.c1 is not None: contact_points = torch.stack((g.c0, g.c1), 0)
+			else: contact_points = None
+			
+			width = torch.tensor([[0.05]], device=self.device)
+			grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+			
+			if contact_points == None:
+				grasp_torch = grasp_torch.apply_to_mesh(mesh)
+
+			grasp_torch.write_obj(path, include_coordinate=True, include_line_o_action=True)
+
+	def oracle_eval_pytorch(self, obj, renderer, grad=True, robust=True, mode='actual'):
 		"""
 		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
 
 		Refer to `oracle_eval` method documentation for details on parameters and return values.
 		"""
+
+		if robust:
+			qual_class = RobustCannyFerrariQualityFunction
+		else:
+			qual_class = CannyFerrariQualityFunction
 
 		if (self.world_center == None or self.world_axis == None):
 			Grasp.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
@@ -1056,18 +1111,26 @@ class Grasp:
 		if isinstance(obj, Meshes): mesh = obj
 		else: mesh, _ = renderer.render_object(obj, display=False)
 
+		# store a graph of mesh connections if it doesn't exist, 
+		# should be first time we reach here per grasp
+		if not hasattr(self, 'mesh_properties'):
+			self.mesh_properties = mesh_properties(mesh)
+
 		if self.num_grasps() > 1:
 			self.quality = torch.zeros_like(self.depth)
 			for i, g in enumerate(self):
 				if g.c0 is not None and g.c1 is not None: contact_points = torch.stack((g.c0, g.c1), 0)
 				else: contact_points = None
 				
-				width = torch.tensor([[0.05]], device=device)
-				grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+				width = torch.tensor([[0.05]], device=self.device)
+				grasp_torch = GraspTorch(center=g.world_center, axis3D=g.world_axis, width=width, 
+							 camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, 
+							 friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 				
 				try:
-					com_qual_func = CannyFerrariQualityFunction(config_dict)
-					quality = com_qual_func.quality(mesh, grasp_torch).float().item()
+					com_qual_func = qual_class(config_dict)
+					quality = com_qual_func.quality(mesh, grasp_torch, 
+									 is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().item()
 				except QhullError:
 					quality =  0.0
 
@@ -1078,14 +1141,14 @@ class Grasp:
 			if self.c0 is not None and self.c1 is not None: contact_points = torch.stack((self.c0, self.c1), 0)
 			else: contact_points = None
 			
-			width = torch.tensor([[0.05]], device=device)
+			width = torch.tensor([[0.05]], device=self.device)
 			grasp_torch = GraspTorch(center=self.world_center, axis3D=self.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, contact_points=contact_points, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
 			
 			try:
-				com_qual_func = CannyFerrariQualityFunction(config_dict)
+				com_qual_func = qual_class(config_dict)
 				self.quality = com_qual_func.quality(mesh, grasp_torch).float().to(self.world_center.device)
 			except QhullError:
-				self.quality = torch.tensor([0.0]).to(device)
+				self.quality = torch.tensor([0.0]).to(self.device)
 
 		if grad:
 			self.quality.requires_grad_(True)
@@ -1093,6 +1156,59 @@ class Grasp:
 			self.quality.requires_grad_(False)
 
 		return self.quality
+
+	def eval_self_collision_dist(self, obj):
+		# computes a self collision loss, either comparing minimum distance directly OR computing the distance
+		# energy, https://www.cs.cmu.edu/~kmcrane/Projects/RepulsiveShells/index.html
+		
+		# store a graph of mesh connections if it doesn't exist, 
+		# should be first time we reach here per grasp
+		if not hasattr(self, 'mesh_properties'):
+			self.mesh_properties = mesh_properties(obj)
+
+		# configuration. TODO, test and maybe expose
+		use_energy = False
+		use_all_in_min = True
+		# only process full vector if needed
+		if use_energy or use_all_in_min:
+			all_dist, coords = self_collision(obj, self.mesh_properties)
+			min_dist = torch.min(all_dist)
+		else:
+			# only handle minimum distance if we don't need full
+			min_dist = self_collision_min(obj, self.mesh_properties)
+
+		# store a reference distance if it doesn't exist, should be first time we reach here per grasp
+		if not hasattr(self,'reference_dist'):
+			if use_energy:
+				self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach()
+			else: 	
+				self.reference_dist = min_dist.item()
+
+		if use_energy:
+			# repulsive shell formula
+			dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+		else:
+			if use_all_in_min:
+				# allows for us to have a distance threshold, above which we ignore in gradient
+				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
+				# use reference, if valid in barier. Use min/10 if we're closer than reference 
+				if min_dist < self.reference_dist/10:
+					print('inside outer boundary region')
+					dist_loss = -torch.sum(torch.log(clamp_dist - min_dist/10 ))
+				else:
+					dist_loss = -torch.sum(torch.log(clamp_dist - self.reference_dist/10))
+			
+			else:
+				# if we only care about closest pair to collision, then no sum needed
+				clamp_dist = torch.clamp(min_dist, max=2*self.reference_dist)
+				if min_dist < self.reference_dist/10:
+					print('inside outer boundary region')
+					dist_loss = -torch.sum(torch.log(clamp_dist - min_dist/10 ))
+				else:
+					dist_loss = -torch.sum(torch.log(clamp_dist - self.reference_dist/10))
+		dist_loss.requires_grad_(True)
+
+		return dist_loss
 
 
 	def vis_grasp_dataset(self, obj_file, directory, renderer):
@@ -1233,6 +1349,13 @@ def test_select_grasp():
 def test_select_grasp_pytorch():
 	Grasp.logger.info("Testing grasp sampling with pytorch - test_select_grasp_pytorch")
 
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	fname, num = "temp_0.json", 1
 	while os.path.isfile(fname):
 		fname = "temp_" + str(num) + ".json"
@@ -1244,7 +1367,7 @@ def test_select_grasp_pytorch():
 	qual = g.quality
 	g.save(fname)
 
-	g = Grasp.read(fname)
+	g = Grasp.read(fname,device=device)
 	os.remove(fname)
 	assert torch.max(torch.sub(qual, g.quality)).item() == 0
 
@@ -1260,28 +1383,35 @@ def test_select_grasp_pytorch():
 def test_save_and_load_grasps():
 	Grasp.logger.info("Running test_save_and_load_grasps...")
 
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	r = Renderer()
 	fixed_grasp = {
-		"quality": torch.tensor([0.00039880830039262474], device='cuda:0'),
-		"depth": torch.tensor([0.5824155807495117], device='cuda:0'),
-		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
-		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
-		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
-		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
+		"quality": torch.tensor([0.00039880830039262474], device=device),
+		"depth": torch.tensor([0.5824155807495117], device=device),
+		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device=device),
+		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device=device),
+		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device=device),
+		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device=device)
 	}
 
 	fixed_grasp2 = {
 		"quality": 0.00039880830039262474,
 		"depth": 0.5824155807495117,
-		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device='cuda:0'),
-		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device='cuda:0'),
-		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device='cuda:0'),
-		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device='cuda:0')
+		'world_center': torch.tensor([ 2.7602e-02,  1.7584e-02, -9.2734e-05], device=device),
+		'world_axis': torch.tensor([-0.9385,  0.2661, -0.2201], device=device),
+		'c0': torch.tensor([0.0441, 0.0129, 0.0038], device=device),
+		'c1': torch.tensor([ 0.0112,  0.0222, -0.0039], device=device)
 	}
 
 	fixed_grasp3 = {
 		"quality": [0.00039880830039262474],
-		"depth": torch.tensor([0.5824155807495117], device='cuda:0'),
+		"depth": torch.tensor([0.5824155807495117], device=device),
 		'world_center': [2.7602e-02,  1.7584e-02, -9.2734e-05],
 		'world_axis': [-0.9385,  0.2661, -0.2201],
 		'c0': [0.0441, 0.0129, 0.0038],
@@ -1292,9 +1422,9 @@ def test_save_and_load_grasps():
 	# Test init_from_dict with tensors vs init_from_dict with lists vs init_from_dict with floats vs read from json
 	g = Grasp.init_from_dict(fixed_grasp)	# from tensors
 
-	g2 = Grasp.init_from_dict(fixed_grasp2)	# from floats
+	g2 = Grasp.init_from_dict(fixed_grasp2,device=device)	# from floats
 
-	g3 = Grasp.init_from_dict(fixed_grasp3)	# from lists
+	g3 = Grasp.init_from_dict(fixed_grasp3,device=device)	# from lists
 
 	print("Equal when using init_from_dict with tensors vs floats vs lists?", g == g2 == g3)
 	assert g == g2
@@ -1302,7 +1432,7 @@ def test_save_and_load_grasps():
 	
 	# Test with init_from_dict vs read from json
 	g.save("test-grasp.json")
-	g4 = Grasp.read("test-grasp.json")
+	g4 = Grasp.read("test-grasp.json",device=device)
 	print("Equal when using init_from_dict and read?", g == g4)
 	assert g == g4
 
@@ -1319,7 +1449,7 @@ def test_save_and_load_grasps():
 	# Test equality before and after saving after using trans_world_to_im
 	g.save('test-grasp.json')
 
-	g5 = Grasp.read("test-grasp.json")
+	g5 = Grasp.read("test-grasp.json",device=device)
 	print("Equal after reading after trans_world_to_im?", g==g5, "\n")
 	assert g == g5
 
@@ -1349,6 +1479,13 @@ def test_save_and_load_grasps():
 	Grasp.logger.info("Finished running test_save_and_load_grasps.")
 	
 def test_trans_world_to_im():
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	Grasp.logger.info("Running test_trans_world_to_im...")
 	display_images = []
 	display_titles = []
@@ -1357,7 +1494,7 @@ def test_trans_world_to_im():
 	mesh, _ = r.render_object("data/bar_clamp.obj", display=False)
 	dim = r.mesh_to_depth_im(mesh, display=False)
 
-	grasp = Grasp.read("experiment-results/ex00/grasp.json")
+	grasp = Grasp.read("experiment-results/ex00/grasp.json",device=device)
 	grasp.trans_world_to_im(camera=r.camera)
 
 	pose, image = grasp.extract_tensors(dim)
@@ -1389,6 +1526,13 @@ def test_trans_world_to_im():
 
 def test_batching():
 
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	Grasp.logger.info("Running test_batching. Expecting 4 errors...")
 	
 	# try loading a batch of grasps from json files
@@ -1405,12 +1549,12 @@ def test_batching():
 
 	# try saving a batch of grasps and reading from one file
 	gb.save("test-batch.json")
-	gb_read = Grasp.read("test-batch.json")
+	gb_read = Grasp.read("test-batch.json",device=device)
 	assert gb_read.depth.shape == torch.Size([4,1])
 	assert gb_read.im_center.shape == torch.Size([4,2])
 
 	# test trans_world_to_im in a batch
-	r = Renderer()
+	r = Renderer(device=device)
 	gb2_test = Grasp.read_batch(files2)
 	gb2.trans_world_to_im(r.camera)
 	assert torch.max(gb2_test.im_center - gb2.im_center).item() < EPS
@@ -1418,11 +1562,11 @@ def test_batching():
 	assert torch.max(gb2_test.im_angle - gb2.im_angle).item() < EPS
 
 	gb.trans_world_to_im(r.camera)
-	g0 = Grasp.read("example-grasps/grasp_0.json")
+	g0 = Grasp.read("example-grasps/grasp_0.json",device=device)
 	assert g0.num_grasps() == 1
-	g1 = Grasp.read("example-grasps/grasp_1.json")
-	g2 = Grasp.read("example-grasps/grasp_2.json")
-	g3 = Grasp.read("example-grasps/grasp_3.json")
+	g1 = Grasp.read("example-grasps/grasp_1.json",device=device)
+	g2 = Grasp.read("example-grasps/grasp_2.json",device=device)
+	g3 = Grasp.read("example-grasps/grasp_3.json",device=device)
 	check_grasps = [g0, g1, g2, g3]
 	for i in range(4):
 		message = "iteration " + str(i)
@@ -1464,13 +1608,20 @@ def test_batching():
 def test_slicing():
 	Grasp.logger.info("Running test_slicing...")
 	
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+	
 	# try loading a batch of grasps from json files
 	files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
 	gb = Grasp.read_batch(files)
 	assert gb.depth.shape == torch.Size([4,1])
 	assert gb.im_center.shape == torch.Size([4,2])
 	assert gb.num_grasps() == 4
-	g0 = Grasp.read("example-grasps/grasp_0.json")
+	g0 = Grasp.read("example-grasps/grasp_0.json",device=device)
 	assert g0.num_grasps() == 1
 	files2 = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json"]
 	gb2 = Grasp.read_batch(files2)
@@ -1481,7 +1632,7 @@ def test_slicing():
 	assert gb == gb
 	assert g0 == g0
 	assert gb2 == gb2
-	g0_dup = Grasp.read("example-grasps/grasp_0.json")
+	g0_dup = Grasp.read("example-grasps/grasp_0.json",device=device)
 	assert g0 == g0_dup
 	g0_dup.depth[0][0] = 45.4
 	assert g0 != g0_dup
@@ -1502,11 +1653,18 @@ def test_slicing():
 def test_oracle_check(iteration):
 	Grasp.logger.info(f"Running oracle volatility check {iteration}...")
 
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	grasp_files = ["example-grasps/grasp_0.json", "example-grasps/grasp_1.json", "example-grasps/grasp_2.json", "example-grasps/grasp_3.json"]
 	files = [str_ for str_ in grasp_files for _ in range(16)]
 	assert len(files) == 64
 
-	gb = Grasp.read_batch(files)
+	gb = Grasp.read_batch(files,device=device)
 	start1 = time.time()
 	oracle_quals = gb.oracle_eval("data/new_barclamp.obj", oracle_method="dexnet")
 	end1 = time.time()
@@ -1552,12 +1710,19 @@ def test_oracle_check(iteration):
 	# plt.savefig(filesave)
 
 def test_random_grasps():
+	if torch.cuda.is_available():
+		device = torch.device(f"cuda:0")
+		torch.cuda.set_device(device)
+	else:
+		print("cuda not available")
+		device = torch.device("cpu")
+
 	Grasp.logger.info("Testing random_grasps...")
-	r = Renderer()
+	r = Renderer(device=device)
 
 	# randomize grasp from file
-	g_orig = Grasp.read("example-grasps/grasp_0.json")
-	g = Grasp.read("example-grasps/grasp_0.json")
+	g_orig = Grasp.read("example-grasps/grasp_0.json",device=device)
+	g = Grasp.read("example-grasps/grasp_0.json",device=device)
 	g.random_grasps(num_samples=10, camera=r.camera)
 	assert g.num_grasps() == 10
 	g.oracle_eval("data/new_barclamp.obj", renderer=r)
@@ -1621,7 +1786,7 @@ def test_pytorch_oracle():
 	Grasp.logger.info("PyTorch oracle evaluation on batched grasps.")
 	# files = ["example-grasps/grasp_" + str(i) + ".json" for i in range(5)]
 	# grasps = Grasp.read_batch(files)
-	grasps = Grasp.read("grasp-dataset/grasp-batch.json")
+	grasps = Grasp.read("grasp-dataset/grasp-batch.json",device=device)
 	grasps.trans_world_to_im(camera=r.camera)
 	batch_qual = grasps.oracle_eval("data/new_barclamp.obj", oracle_method="pytorch", renderer=r)
 	for i, grasp in enumerate(grasps):

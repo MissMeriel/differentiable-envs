@@ -4,56 +4,55 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import pickle
-
-_weights_dict = dict()
-
-def load_weights(weight_file):
-    if weight_file == None:
-        return
-
-    try:
-        weights_dict = np.load(weight_file, allow_pickle=True).item()
-    except:
-        weights_dict = np.load(weight_file, allow_pickle=True, encoding='bytes').item()
-
-    return weights_dict
-
-def normalize_input(im_arr, pose_arr):
-    """Normalize input before passing to the model"""
-
-    # load in normalization files
-    im_mean = torch.from_numpy(np.load('normalization/mean.npy')).float()
-    im_std = torch.from_numpy(np.load('normalization/std.npy')).float()
-    pose_mean = torch.from_numpy(np.load('normalization/pose_mean.npy')).float()
-    pose_std = torch.from_numpy(np.load('normalization/pose_std.npy')).float()
-
-    im_arr = (im_arr - im_mean) / im_std
-    pose_arr = (pose_arr - pose_mean) / pose_std
-
-    return im_arr, pose_arr
-
+import os
 
 class KitModel(nn.Module):
 
-    
-    def __init__(self, weight_file):
+    def __load_weights(self, weight_file):
+        if weight_file == None:
+            return
+
+        try:
+            weights_dict = np.load(weight_file, allow_pickle=True).item()
+        except:
+            weights_dict = np.load(weight_file, allow_pickle=True, encoding='bytes').item()
+
+        self._weights_dict=weights_dict
+
+    def __normalize_input(self, im_arr, pose_arr):
+        """Normalize input before passing to the model"""
+
+        im_arr = (im_arr - self.im_mean) / self.im_std
+        pose_arr = (pose_arr - self.pose_mean) / self.pose_std
+
+        return im_arr, pose_arr
+        
+    def __init__(self, weight_file, device=None):
+        if device is None:
+			# set PyTorch device, use cuda if available
+            if torch.cuda.is_available():
+                device = torch.device("cuda:0")
+                torch.cuda.set_device(self.device)
+            else:
+                print("cuda not available")
+                device = torch.device("cpu")
         super(KitModel, self).__init__()
-        global _weights_dict
-        _weights_dict = load_weights(weight_file)
+
+        self.__load_weights(weight_file)
+        parent = os.path.dirname(weight_file)
+
+        # load in normalization files
+        self.im_mean = torch.from_numpy(np.load(os.path.join(parent,'normalization/mean.npy'))).float()
+        self.im_std = torch.from_numpy(np.load(os.path.join(parent,'normalization/std.npy'))).float()
+        self.pose_mean = torch.from_numpy(np.load(os.path.join(parent,'normalization/pose_mean.npy'))).float()
+        self.pose_std = torch.from_numpy(np.load(os.path.join(parent,'normalization/pose_std.npy'))).float()
 
         # get other saved weights
         names = ["pc1b", "fc4W_pose", "fc3b", "fc4b", "fc5W", "fc5b", "fc3W", "fc4W_im", "conv1_2b", "conv2_1b", "conv2_2b", "conv2_2W", "conv1_1b", "pc1W"]
         global _other_weights
-        with open('variables.pkl', 'rb') as file:
+        with open(os.path.join(parent,'variables.pkl'), 'rb') as file:
             variables_to_load = pickle.load(file)
         _other_weights = {name: torch.from_numpy(var) for name, var in zip(names, variables_to_load)}
-
-        if torch.cuda.is_available():
-            device = torch.device("cuda:0")
-            torch.cuda.set_device(device)
-        else:
-            print("cuda not available")
-            device = torch.device("cpu")
 
         # make sizes compatible with PyTorch
         _other_weights["conv1_1b"] = _other_weights["conv1_1b"].unsqueeze(0).unsqueeze(2).unsqueeze(3).to(device)
@@ -71,7 +70,7 @@ class KitModel(nn.Module):
 
     def forward(self, x1, x2):
         # x1 is pose_arr and x2 is im_arr
-        x2, x1 = normalize_input(x2, x1)
+        x2, x1 = self.__normalize_input(x2, x1)
         MatMul_1        = torch.matmul(x1, _other_weights["pc1W"].to(x1.device))      # x1 - step 0; input: 64 x 1
         add_5           = MatMul_1 + _other_weights["pc1b"] .to(x1.device)            # x1 - step 1; MatMul_1 + pc1b/read
         Relu_5          = F.relu(add_5)                                 # x1 - step 2
@@ -108,30 +107,29 @@ class KitModel(nn.Module):
         return Softmax
 
 
-    @staticmethod
-    def __conv(dim, name, **kwargs):
+    def __conv(self, dim, name, **kwargs):
         if   dim == 1:  layer = nn.Conv1d(**kwargs)
         elif dim == 2:  layer = nn.Conv2d(**kwargs)
         elif dim == 3:  layer = nn.Conv3d(**kwargs)
         else:           raise NotImplementedError()
 
-        temp = torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).to(kwargs.get("device"))
+        temp = torch.permute(torch.from_numpy(self._weights_dict[name]['weights']), (2,3,1,0)).to(kwargs.get("device"))
         # print("\nname:", name)
         # print("weights:", torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)).shape)
         # print(torch.permute(torch.from_numpy(_weights_dict[name]['weights']), (2,3,1,0)))
         # print("conv1_1b:", _other_weights["conv1_1b"])
             
-        layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']).to(kwargs.get("device")))
-        if 'bias' in _weights_dict[name]:
-            layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']).to(kwargs.get("device")))
+        layer.state_dict()['weight'].copy_(torch.from_numpy(self._weights_dict[name]['weights']).to(kwargs.get("device")))
+        if 'bias' in self._weights_dict[name]:
+            layer.state_dict()['bias'].copy_(torch.from_numpy(self._weights_dict[name]['bias']).to(kwargs.get("device")))
             # print("bias:", torch.from_numpy(_weights_dict[name]['bias']))
         return layer
 
-    @staticmethod
-    def __dense(name, **kwargs):
-        layer = nn.Linear(**kwargs)
-        layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']))
-        if 'bias' in _weights_dict[name]:
-            layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
-        return layer
+    # @staticmethod
+    # def __dense(name, **kwargs):
+    #     layer = nn.Linear(**kwargs)
+    #     layer.state_dict()['weight'].copy_(torch.from_numpy(_weights_dict[name]['weights']))
+    #     if 'bias' in _weights_dict[name]:
+    #         layer.state_dict()['bias'].copy_(torch.from_numpy(_weights_dict[name]['bias']))
+    #     return layer
 
