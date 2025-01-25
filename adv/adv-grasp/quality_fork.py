@@ -237,9 +237,8 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
             scale=1,	# no scale
             shear=0,	# no shear 
             interpolation=transforms.InterpolationMode.BILINEAR,
-            center=(cx, cy)	
+            #center=(cx, cy)	
         )
-
         torch_rotated = transforms.functional.affine(
             translated_only,
             theta,
@@ -247,8 +246,9 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
             scale=1,
             shear=0,
             interpolation=transforms.InterpolationMode.BILINEAR,
-            center=(cx, cy)
+            #center=(cx, cy)
         )
+
         # torch_scaled = transforms.functional.affine(
         #     torch_rotated,
         #     0,
@@ -276,7 +276,7 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         # 	scale=1,
         # 	shear=0,
         # 	interpolation=transforms.InterpolationMode.BILINEAR,
-        # 	center=(cx, cy)
+        # 	# center=(cx, cy)
         # )
 
         # 3 - crop image to size (32, 32)
@@ -287,7 +287,18 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         # return pose_tensor, torch_image_tensor, translated_only, rotated_only, torch_rotated, image_tensor, torch_rotated2
     @staticmethod
     def extract_tensors_batch(grasp, d_ims):
-
+        """
+        Use grasp information and depth image to get image and pose tensors in form of GQCNN input
+        Parameters
+        ----------
+        d_ims: torch tensor of depth images (n_batch, height, width)
+            Numpy array depth image of object being grasped
+        Returns
+        -------
+        torch.tensor: pose_tensor, torch.tensor: image_tensor
+            pose_tensor: 1 x 1 tensor of grasp pose
+            image_tensor: 1 x 1 x 32 x 32 tensor of depth image processed for grasp
+        """
         # r = Renderer()
 
         # check type of input_dim
@@ -318,7 +329,6 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
 
         torch_transform = transforms.Resize(out_shape, antialias=False) 
         dims_resized = torch_transform(d_ims)		# shape: [batch_size, 1, 160, 213] = [batch_size, channels, H, W]
-
         # 2 - translation wrt to grasp angle and grasp center
         # 	translation matrix
         dim_cx = d_ims.shape[3] // 2	# 320
@@ -326,14 +336,19 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         dim_cx_tens = torch.tensor([dim_cx]).expand(batch_size).to(d_ims.device)
         dim_cy_tens = torch.tensor([dim_cy]).expand(batch_size).to(d_ims.device)
 
-        u = (2 * ((dim_cx_tens - grasp.im_center[..., 0])/3) / (dims_resized.shape[3])).float()	# not in pixels, but normalized on (image size * 2)
-        v = (2 * ((dim_cy_tens - grasp.im_center[..., 1])/3) / (dims_resized.shape[2])).float()
+        u = (2* ((dim_cx_tens - grasp.im_center[..., 0])/3) / (dims_resized.shape[3])).float()	# not in pixels, but normalized on (image size * 2)
+        v = (2* ((dim_cy_tens - grasp.im_center[..., 1])/3) / (dims_resized.shape[2])).float()
 
-        translate = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]])
-        translate = translate.expand(batch_size, -1, -1).to(d_ims.device).float()
+        def generate_translation_mat(delta_u, delta_v, batch_size, indices):
+            trans_mat = torch.eye(3, device=delta_u.device, dtype=delta_u.dtype).unsqueeze(0).expand(batch_size, -1, -1)
+            trans_mat[indices, 0, 2] = delta_u
+            trans_mat[indices, 1, 2] = delta_v
+            return(trans_mat)
+
         indices = torch.arange(batch_size)
-        translate[indices, 0, 2] = u
-        translate[indices, 1, 2] = v
+
+
+        translate = generate_translation_mat(u, v, batch_size=batch_size, indices=indices)
 
         #	rotation matrix
         theta = grasp.im_angle.squeeze()	# no -1 for counter-clockwise, stay in radians
@@ -343,29 +358,27 @@ class GQCNNQualityFunction(ParallelJawQualityFunction):
         rotation = torch.tensor([[[1, 0, 0], [0, 1, 0], [0, 0, 1]]]).expand(batch_size, -1, -1).to(d_ims.device).float()
         rotation[indices, 0, 0] = cos
         rotation[indices, 1, 1] = cos
-        rotation[indices, 0, 1] = -1 * sin
-        rotation[indices, 1, 0] = sin
+        rotation[indices, 0, 1] = -1 * sin * dim_cy/dim_cx
+        rotation[indices, 1, 0] = sin * dim_cx/dim_cy
 
         #	apply transformations
         translate_mat = translate[:, :2, :]
         rotation_mat = rotation[:, :2, :]
         
         # 	translation only
-        trans_grid = torch.nn.functional.affine_grid(translate_mat, dims_resized.shape)
-        trans_only = torch.nn.functional.grid_sample(dims_resized, trans_grid)
+        trans_grid = torch.nn.functional.affine_grid(translate_mat, dims_resized.shape, align_corners=False)
+        trans_only = torch.nn.functional.grid_sample(dims_resized, trans_grid, align_corners=False)
 
         # 	rotation only
-        rot_grid = torch.nn.functional.affine_grid(rotation_mat, dims_resized.shape)
-        rot_only = torch.nn.functional.grid_sample(dims_resized, rot_grid)
+        rot_grid = torch.nn.functional.affine_grid(rotation_mat, dims_resized.shape, align_corners=False)
 
         # 	translation then rotation (applied separately)
-        trans_then_rot = torch.nn.functional.grid_sample(trans_only, rot_grid)
+        trans_then_rot = torch.nn.functional.grid_sample(trans_only, rot_grid, align_corners=False)
 
         # 3 - crop images to 32x32 pixels
         top = dims_resized.shape[2] // 2 - 17	# 63
         left = dims_resized.shape[3] // 2 - 17	# 89
         dims_transformed = trans_then_rot[:, :, top:top+32, left:left+32]	# [:, :, 63:95, 89:121]
-
         return pose_tensor, dims_transformed
 
 class minWeightQualityFunction(ParallelJawQualityFunction):
