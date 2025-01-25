@@ -100,7 +100,7 @@ if __name__ == "__main__":
                             # if not torch.any(graspObj.contact_mask):
                             #     continue
                             dim = r.mesh_to_depth_im(mesh, display=False)
-                            pose, image = qf.GQCNNQualityFunction.extract_tensors(grasp=graspObj, d_im=dim,scale=1.0)
+                            pose, image = qf.GQCNNQualityFunction.extract_tensors_batch(grasp=graspObj, d_ims=dim)
                             out = model(pose, image)
                             gqcnn_val = out[:,1:2].to(mesh.device)
                             cf_val = cf(mesh, graspObj)
