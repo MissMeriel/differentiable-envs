@@ -50,11 +50,18 @@ if __name__ == "__main__":
     r = re.Renderer(device=device)
 
     objects_skip_file = 'bad_objs.txt'
+    objects_white_list = 'badStack.txt'
     if objects_skip_file is not None:
         with open(objects_skip_file) as file:
             objects_skip = set([line.rstrip() for line in file])
     else:
         objects_skip = set([])
+
+    if objects_white_list is not None:
+        with open(objects_white_list) as file:
+            objects_allow = set([line.rstrip() for line in file])
+    else:
+        objects_allow = None
 
     config_dict = {
         "torque_scaling":1000,
@@ -83,7 +90,10 @@ if __name__ == "__main__":
         os.mkdir(f'{exp_root_dir}/debug_mesh_attack')
 
     for dataset in datasets:
-        object_list = list(set(db.data_['datasets'][dataset]['objects']).difference(objects_skip))
+        object_list = list(db.data_['datasets'][dataset]['objects'])
+        object_list = list(set(object_list).difference(objects_skip))
+        if objects_allow is not None:
+            object_list = list(set(object_list).intersection(objects_allow))
         random.shuffle(object_list)
         for object in tqdm(object_list,desc=f'from {dataset}',leave=False):
             inner = db.data_['datasets'][dataset]['objects'][object]
