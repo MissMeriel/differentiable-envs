@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import torch
 import pytorch3d
+import cv2
 from tqdm import tqdm
 from pytorch3d.io import save_obj
 from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
@@ -699,8 +700,10 @@ class Attack:
 		self.renderer.display(images=[image, processed_dim, depth_diff], shape=(1,3), title=title, save=fname)
 		
 		# store renders for creating a .gif animation
-		if hasattr(self, 'renders_list'):
-			self.renders_list += [imageio.imread(fname)]
+		if hasattr(self, 'renders_list') and len(self.renders_list) > 0:
+			loaded = imageio.imread(fname)
+			size = (self.renders_list[0].shape[1],self.renders_list[0].shape[0])
+			self.renders_list += [cv2.resize(loaded, dsize=size, interpolation=cv2.INTER_CUBIC)]
 		else:
 			self.renders_list = [imageio.imread(fname)]
 		tqdm.write(f"save: {fname}")
