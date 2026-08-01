@@ -49,8 +49,8 @@ if __name__ == "__main__":
 
     r = re.Renderer(device=device)
 
-    objects_skip_file = 'bad_objs.txt'
-    objects_white_list = 'badStack.txt'
+    objects_skip_file = None
+    objects_white_list = None
     if objects_skip_file is not None:
         with open(objects_skip_file) as file:
             objects_skip = set([line.rstrip() for line in file])
@@ -78,12 +78,14 @@ if __name__ == "__main__":
     datasets = db.data_['datasets']
     print(datasets.keys())
     adv_grasp_dir = 'adv/adv-grasp/'
-    exp_root_dir = 'exp-25-plots-fix-qp-feasible-fix-ref-dist-january-paper'
-    #exp_root_dir = 'throwaway-debug'
+    #exp_root_dir = 'exp-25-plots-fix-qp-feasible-fix-ref-dist-january-paper'
+    # filter datasets by gpu
+    #datasets = [list(datasets)[gpu_id]]
+    exp_root_dir = f'Sep-experiments-gpu-split-{gpu_id}-mine-play-with-constraint-prune-vert-0'#-{datasets[0]}'
 
     model = KitModel(os.path.join(adv_grasp_dir,"weights.npy"),device=device)
     model.eval()
-    run1 = Attack(num_plots=25, steps_per_plot=10, model=model, renderer=r, oracle_method="pytorch")
+    run1 = Attack(num_plots=20, steps_per_plot=5, model=model, renderer=r, oracle_method="pytorch")
 
     if not os.path.isdir(f'{exp_root_dir}'):
         os.mkdir(f'{exp_root_dir}')
@@ -94,7 +96,14 @@ if __name__ == "__main__":
         object_list = list(set(object_list).difference(objects_skip))
         if objects_allow is not None:
             object_list = list(set(object_list).intersection(objects_allow))
-        random.shuffle(object_list)
+        object_list.sort
+        ##### DO NOT LEAVE
+        # if 'Co' in object_list:
+        #     object_list = ['Co']
+        # else:
+        #     object_list = []
+        ##################
+        # object_list = object_list[gpu_id::2]
         for object in tqdm(object_list,desc=f'from {dataset}',leave=False):
             inner = db.data_['datasets'][dataset]['objects'][object]
             for name in db.data_['datasets'][dataset]['objects'][object]['grasps']:
@@ -196,25 +205,41 @@ if __name__ == "__main__":
                             #run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-mw-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.MW_UP,AttackMethod.SELF_COLLISION_UP])
                                     
                             #run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-GQCNN-DIFF-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_CF_DIFF,AttackMethod.SELF_COLLISION_UP])
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_UP])
-                            if attack_failed is not None:
-                                raise Exception(attack_failed)
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-GQCNN-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_UP])
+                            for mode in [0,1,2,3]:
+                                _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-UP-GQCNN-DOWN-coll-up-{mode}/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_UP,AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_LOSS_DOWN])
+                                if attack_failed is not None:
+                                    raise Exception(attack_failed)
+                                _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-DOWN-GQCNN-UP-coll-up-{mode}/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_DOWN,AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_LOSS_DOWN])
+                                
+                                _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-mw-UP-coll-up-{mode}/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.MW_UP,AttackMethod.SELF_COLLISION_LOSS_DOWN])
+                                _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-mw-DOWN-coll-up-{mode}/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.MW_DOWN,AttackMethod.SELF_COLLISION_LOSS_DOWN])
+                                
+                                _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-DOWN-coll-up-{mode}/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_LOSS_DOWN])
+                                _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-UP-coll-up-{mode}/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_LOSS_DOWN])
 
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.GQCNN_DOWN])
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-GQCNN-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.GQCNN_UP])
+                            # _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/Random_Fuzz/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.RANDOM_FUZZ])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-DOWN-GQCNN-UP-laplace-down/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_DOWN,AttackMethod.GQCNN_UP,AttackMethod.LAPLACIAN_SMOOTHING_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-UP-GQCNN-DOWN-laplace-down/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_UP,AttackMethod.GQCNN_DOWN,AttackMethod.LAPLACIAN_SMOOTHING_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-DOWN-GQCNN-UP-l2-down/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_DOWN,AttackMethod.GQCNN_UP,AttackMethod.L2_NORM_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-UP-GQCNN-DOWN-l2-down/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_UP,AttackMethod.GQCNN_DOWN,AttackMethod.L2_NORM_DOWN])
 
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-DOWN-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_DOWN,AttackMethod.SELF_COLLISION_UP])
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-UP-coll-up/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_UP,AttackMethod.SELF_COLLISION_UP])
 
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_DOWN])
-                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=[AttackMethod.GQCNN_UP])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-UP-GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_UP,AttackMethod.GQCNN_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-sig-DOWN-GQCNN-UP/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_SIG_DOWN,AttackMethod.GQCNN_UP])
+
+
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-DOWN/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.GQCNN_DOWN])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/GQCNN-UP/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.GQCNN_UP])
+
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-DOWN-mw-UP/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_DOWN,AttackMethod.MW_UP])
+                            _,attack_failed = run1.attack(mesh=mesh, grasp=graspObj, dir=f"{exp_root_dir}/{object}/cf-UP-mw-DOWN/{grasp_name}", lr=lr0, momentum=mom,prune_vertex_gradients_mode = mode, loss_alpha=None, method=[AttackMethod.CF_UP,AttackMethod.MW_DOWN])
+
                             torch.cuda.synchronize()
-                                # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT)
-                                # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_DOWN)
-                                # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_UP)
-                                # tqdm.write(f'cf: db: {cf_db:.4f} ours: {cf_val.item():.4f} rcf: db: {rcf_db:.4f}, ours: {rcf_val.item():.4f}')
-                                # f.write(f'{object}, {grasp_name}, 0, {cf_db:.8f}, {cf_val.item():.8f}, {rcf_db:.8f}, {rcf_val.item():.8f}, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
+                                    # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT)
+                                    # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-DOWN/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_DOWN)
+                                    # run1.attack(mesh=mesh, grasp=grasp_h, dir=f"{exp_root_dir}/{object}/minweight-grad-UP/{grasp_name}", lr=lr0, momentum=mom, loss_alpha=None, method=AttackMethod.MINWEIGHT_UP)
+                                    # tqdm.write(f'cf: db: {cf_db:.4f} ours: {cf_val.item():.4f} rcf: db: {rcf_db:.4f}, ours: {rcf_val.item():.4f}')
+                                    # f.write(f'{object}, {grasp_name}, 0, {cf_db:.8f}, {cf_val.item():.8f}, {rcf_db:.8f}, {rcf_val.item():.8f}, {mesh_props.is_watertight}, {mesh_props.is_inverted}\n')
 
                     except Exception as e:
                         tqdm.write(str(e))

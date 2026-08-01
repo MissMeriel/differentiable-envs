@@ -1223,9 +1223,7 @@ class GraspTorch(object):
         # # outter product
         # m_o_i_2 = torch.matmul(arc_displacement.unsqueeze(-1), arc_displacement.unsqueeze(-2))
         # # inner product
-        # m_o_i_1 = torch.matmul(arc_displacement.unsqueeze(-2), arc_displacement.unsqueeze(-1)).squeeze(-1)
-        # m_o_i_1 = torch.diag_embed(m_o_i_1.expand(list(m_o_i_1.shape)[:-1]+[3]))
-        # moment_of_inertia_global = moment_of_inertia_local_aligned + m_o_i_1 - m_o_i_2
+        # m_o_i_1 = torch.matmul(arc_d12 = moment_of_inertia_local_aligned + m_o_i_1 - 1
         # moment_of_inertia_global[torch.logical_not(mid_point_in_tri)] = 0
 
         # moment_of_inertia_total = torch.sum(moment_of_inertia_global,dim=(-4,-3))

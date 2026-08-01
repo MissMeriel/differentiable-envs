@@ -479,17 +479,18 @@ class CannyFerrariQualityFunction(ParallelJawQualityFunction):
         # for this quality, we can store the convex hull as well
         if other_items is None:
             other_items = {}
-        original_shape = self.G.shape
-        G_unwrapped = self.G.view((original_shape[0]*original_shape[1], -1, 6))
-        simplices_list = np.zeros((G_unwrapped.shape[1],), dtype=object)
-        equations_list = np.zeros((G_unwrapped.shape[1],), dtype=object)
-        for batch_idx in range(G_unwrapped.shape[1]):
-            miniG = G_unwrapped[:,batch_idx,:]
-            simplices,equations = qHullTorch.apply(miniG.cpu())
-            simplices_list[batch_idx] = simplices.numpy(force=True)
-            equations_list[batch_idx] = equations.numpy(force=True)
-        other_items['hull_simplices'] = simplices_list
-        other_items['hull_equations'] = equations_list
+        if hasattr(self,'G'):
+            original_shape = self.G.shape
+            G_unwrapped = self.G.view((original_shape[0]*original_shape[1], -1, 6))
+            simplices_list = np.zeros((G_unwrapped.shape[1],), dtype=object)
+            equations_list = np.zeros((G_unwrapped.shape[1],), dtype=object)
+            for batch_idx in range(G_unwrapped.shape[1]):
+                miniG = G_unwrapped[:,batch_idx,:]
+                simplices,equations = qHullTorch.apply(miniG.cpu())
+                simplices_list[batch_idx] = simplices.numpy(force=True)
+                equations_list[batch_idx] = equations.numpy(force=True)
+            other_items['hull_simplices'] = simplices_list
+            other_items['hull_equations'] = equations_list
         super().savemat(path, other_items=other_items)
 
     def quality(self, state, actions, is_watertight=True, is_inverted=False):
@@ -1355,7 +1356,7 @@ def test_quality():
 
 def test_dist():
     if torch.cuda.is_available():
-        device = torch.device("cuda:0")
+        device = torch.device("cuda:1")
         torch.cuda.set_device(device)
 
     with record_function("load_obj"):
@@ -1363,34 +1364,56 @@ def test_dist():
     faces = faces_idx.verts_idx
     verts_rgb = torch.ones_like(verts)[None]
     textures = TexturesVertex(verts_features=verts_rgb.to(device))
-
     mesh = Meshes(
         verts=[verts.to(device)],
         faces=[faces.to(device)],
         textures=textures
     )
-    with record_function("test_compilation"):
-        unconnectivity = torch.jit.script(mp(mesh,forceNormalDist=False))
+    ref_dist = 6.5000449e-09
+
+    unconnectivity = mp(mesh,forceNormalDist=True, far_dist=1e-6)
     verts = mesh.verts_packed()
     verts.requires_grad_(True)
     distances,barys = unconnectivity( verts )
-    print(distances)
-    distances,barys = unconnectivity( verts )
-    print(distances)
+    valid_distances = mp.make_invalid_dist_inf(distances, barys)
+    simple_loss = torch.sum(torch.log(valid_distances[valid_distances<ref_dist/10]))
+    simple_loss.backward()
+    
+    print(f'sphere dist {torch.min(valid_distances.flatten())}, loss {simple_loss}, {torch.all(torch.isfinite(verts.grad))}')
 
-    with record_function("test_compiled"):
+    with record_function("test_sphere"):
         for i in range(20):
             distances,barys = unconnectivity( verts )
             print(distances)
 
-    with record_function("test_construction"):
-        unconnectivity = mp(mesh,forceNormalDist=False)
+    unconnectivity = mp(mesh,forceNormalDist=True)
     verts = mesh.verts_packed()
     verts.requires_grad_(True)
-    with record_function("test_regular"):
+    distances_no,barys_no = unconnectivity( verts )
+    valid_distances_no = mp.make_invalid_dist_inf(distances_no, barys_no)
+    print(f'no sphere dist {torch.min(valid_distances_no.flatten())}, loss {simple_loss}, {torch.all(torch.isfinite(verts.grad))}')
+
+    with record_function("test_no_sphere"):
         for i in range(20):
             distances,barys = unconnectivity( verts )
             print(distances)
+
+
+
+
+    # with record_function("test_compiled"):
+    #     for i in range(20):
+    #         distances,barys = unconnectivity( verts )
+    #         print(distances)
+
+    # with record_function("test_construction"):
+    #     unconnectivity = mp(mesh,forceNormalDist=False)
+    # verts = mesh.verts_packed()
+    # verts.requires_grad_(True)
+    # with record_function("test_regular"):
+    #     for i in range(20):
+    #         distances,barys = unconnectivity( verts )
+    #         print(distances)
 
 if __name__ == "__main__":
     #minHull.apply(torch.tensor(dict['G']).transpose(0,1).reshape((20,1,1,6)))
@@ -1405,4 +1428,4 @@ if __name__ == "__main__":
                 test_dist()
                 
     print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=50))
-    prof.export_chrome_trace("trace-solve.json")
+    # prof.export_chrome_trace("trace-solve.json")

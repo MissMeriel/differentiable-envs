@@ -1,14 +1,20 @@
 % bar = readObj('data/new_barclamp.obj')
-base = '/mnt/array/Home/Data/HPSTA/differentiable-envs/dexnet-loop-flip-gqcnn-sign/4e301737d057917e25c70fb1df3f879b';
+%base = '/mnt/array/Home/Data/HPSTA/differentiable-envs/dexnet-loop-flip-gqcnn-sign/4e301737d057917e25c70fb1df3f879b';
+base = '/mnt/array/Home/Data/HPSTA/differentiable-envs/march-experiments-gpu-split-0/Co';
 experiment_setup = '';
 title(experiment_setup,Interpreter="none")
-%experiments = {'cf-DOWN-mw-UP-coll-up','cf-UP-mw-DOWN-coll-up'};
-experiments = {'cf-DOWN-GQCNN-UP-coll-up','cf-UP-GQCNN-DOWN-coll-up'};
-iter_ids = {'it-25','it-50','it-75','it-100','it-125','it-150','it-175','it-200','it-225','it-250','it-275','it-300','it-325','it-350','it-375','it-400','it-425','it-450','it-475'};
-%grasps = {'grasp0'};
+experiments = {'cf-DOWN-mw-UP-coll-up','cf-UP-mw-UP-coll-up',...
+    'cf-DOWN-mw-UP','cf-UP-mw-UP'};
+% experiments = {'cf-UP-GQCNN-DOWN-coll-up','cf-DOWN-GQCNN-UP-coll-up',...
+%     'cf-DOWN-GQCNN-UP', 'cf-UP-GQCNN-DOWN',...
+%     'GQCNN-DOWN', 'GQCNN-UP', 'GQCNN-DOWN-coll-up', 'GQCNN-UP-coll-up',...
+%     'Random_Fuzz', 'cf-UP-GQCNN-DOWN-l2-down','cf-DOWN-GQCNN-UP-l2-down',...
+%     'cf-UP-GQCNN-DOWN-laplace-down','cf-DOWN-GQCNN-UP-laplace-down'};
+      
+grasps = {'grasp_24'};
 %post_path = 'lr-0';
 post_path = '';
-grasps = {'grasp_92'};
+%grasps = {'grasp_92'};
 Manualview1 = struct();
 % grasp0
 % cpos = [0.0151    0.4299    0.1000];
@@ -52,21 +58,36 @@ Manualview1.CameraPosition = cpos;
 Manualview1.PositionConstraint = 'innerposition';
 %Manualview1.CameraUpVector = [0     0     1];
 Manualview1.CameraViewAngle = cva/3;
+
 figure;
 for exp_ind = 1:numel(experiments)
     for grasp_ind = 1:numel(grasps)
+
+
         im = {};
         output_gif = fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path,'matlab.gif');
+        iter_ids = {dir(fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path,'it-*-grasp.mat')).name};
+        [it_int,order] = sort(cellfun(@(s)sscanf(s, 'it-%f-grasp.mat'),iter_ids));
+        iter_ids = sprintfc('it-%i',it_int);
         for iter_idx = 1:numel(iter_ids)
             iter_id = iter_ids{iter_idx};
-            full_path = fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path,strcat(iter_id,'.obj'));
-            bar = readObj(full_path);
-            %
 
-            
-            hold on;
-            trisurf(bar.f.v,bar.v(:,1),bar.v(:,2),bar.v(:,3))
-            alpha 0.5
+            if iter_idx == 1
+                mat_path = fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path,strcat(iter_id,'-grasp.mat'));
+                torch_struct = load(mat_path);
+                Manualview1.cameraTarget=mean(torch_struct.center3D);
+            end
+            folder_path =  fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path);
+            display_grasp(folder_path, iter_id)
+            text(-0.0044,    -0.0211,   -0.0518,iter_id)
+            % full_path = fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path,strcat(iter_id,'.obj'));
+            % bar = readObj(full_path);
+            % %
+            % 
+            % 
+            % hold on;
+            % trisurf(bar.f.v,bar.v(:,1),bar.v(:,2),bar.v(:,3))
+            % alpha 0.5
             % triangleCenter = zeros(size(bar.f.v));
             % for i = 1:size(bar.f.v,1)
             %     triangle = bar.v(bar.f.v(i,:)',:);
@@ -79,35 +100,46 @@ for exp_ind = 1:numel(experiments)
             %     % normal = cross(dir1,dir2)*0.05/2;
             %     % quiver3(triangleCenter(i,1),triangleCenter(i,2),triangleCenter(i,3),normal(1),normal(2),normal(3),'b','LineWidth',1,'AutoScale','off' ,'MaxHeadSize',1)
             % end
-            xlabel('x')
-            ylabel('y')
-            zlabel('z')
+            % xlabel('x')
+            % ylabel('y')
+            % zlabel('z')
             %pcshow(bar.v(:,1:3))
-            mat_path = fullfile(base,experiment_setup,experiments{exp_ind},grasps{grasp_ind},post_path,strcat(iter_id,'-grasp.mat'));
-            torch_struct = load(mat_path);
-            
-            for grasp_index = 1:size(torch_struct.endpoints3D,2)
-                ray_o = squeeze(torch_struct.endpoints3D(:,grasp_index,:));
-                ray_d = squeeze(torch_struct.contact_points(:,grasp_index,:)) - ray_o;
-                quiver3(ray_o(:,1),ray_o(:,2),ray_o(:,3),...
-                    ray_d(:,1),ray_d(:,2),ray_d(:,3),'c','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
-                ray_o = squeeze(torch_struct.contact_points(:,grasp_index,:));
-                ray_d = squeeze(torch_struct.contact_normals(:,grasp_index,:))/100;
-                quiver3(ray_o(:,1),ray_o(:,2),ray_o(:,3),...
-                    ray_d(:,1),ray_d(:,2),ray_d(:,3),'m','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
-            end
 
-            %
-            %
-            %
-           
-            grad_tensor = torch_struct.param_grad;
-            grad_tensor = -grad_tensor ./ reshape(vecnorm(reshape(grad_tensor, [3,3*size(bar.v,1)]),2,2),[3,1,1])/100;
-            hold on;
-            quiver3(squeeze(bar.v(:,1)),squeeze(bar.v(:,2)),squeeze(bar.v(:,3)),squeeze(grad_tensor(1,:,1))',squeeze(grad_tensor(1,:,2))',squeeze(grad_tensor(1,:,3))','r','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
-            quiver3(squeeze(bar.v(:,1)),squeeze(bar.v(:,2)),squeeze(bar.v(:,3)),squeeze(grad_tensor(2,:,1))',squeeze(grad_tensor(2,:,2))',squeeze(grad_tensor(2,:,3))','g','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
-            quiver3(squeeze(bar.v(:,1)),squeeze(bar.v(:,2)),squeeze(bar.v(:,3)),squeeze(grad_tensor(3,:,1))',squeeze(grad_tensor(3,:,2))',squeeze(grad_tensor(3,:,3))','b','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
-            text(-0.0044,    -0.0211,   -0.0518,iter_id)
+
+
+            
+            % for grasp_index = 1:size(torch_struct.endpoints3D,2)
+            %     ray_o = squeeze(torch_struct.endpoints3D(:,grasp_index,:));
+            %     ray_d = squeeze(torch_struct.contact_points(:,grasp_index,:)) - ray_o;
+            %     quiver3(ray_o(:,1),ray_o(:,2),ray_o(:,3),...
+            %         ray_d(:,1),ray_d(:,2),ray_d(:,3),'c','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
+            %     ray_o = squeeze(torch_struct.contact_points(:,grasp_index,:));
+            %     ray_d = squeeze(torch_struct.contact_normals(:,grasp_index,:))/100;
+            %     quiver3(ray_o(:,1),ray_o(:,2),ray_o(:,3),...
+            %         ray_d(:,1),ray_d(:,2),ray_d(:,3),'m','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
+            % end
+            % 
+            % %
+            % %
+            % %
+            % 
+            % if isfield(torch_struct, 'param_grad') & ~strcmp(iter_id, 'it-0')
+            % 
+            %     grad_tensor = torch_struct.param_grad;
+            %     num_objectives = size(grad_tensor,1);
+            %     grad_tensor = -grad_tensor ./ reshape(vecnorm(reshape(grad_tensor, [num_objectives,3*size(bar.v,1)]),2,2),[num_objectives,1,1])/100;
+            %     hold on;
+            %     quiver3(squeeze(bar.v(:,1)),squeeze(bar.v(:,2)),squeeze(bar.v(:,3)),squeeze(grad_tensor(1,:,1))',squeeze(grad_tensor(1,:,2))',squeeze(grad_tensor(1,:,3))','r','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
+            %     if num_objectives > 1
+            %         quiver3(squeeze(bar.v(:,1)),squeeze(bar.v(:,2)),squeeze(bar.v(:,3)),squeeze(grad_tensor(2,:,1))',squeeze(grad_tensor(2,:,2))',squeeze(grad_tensor(2,:,3))','g','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
+            %         if num_objectives > 2
+            %             quiver3(squeeze(bar.v(:,1)),squeeze(bar.v(:,2)),squeeze(bar.v(:,3)),squeeze(grad_tensor(3,:,1))',squeeze(grad_tensor(3,:,2))',squeeze(grad_tensor(3,:,3))','b','LineWidth',2,'AutoScale','off' ,'MaxHeadSize',1)
+            %         end
+            %     end
+            % end
+            % text(-0.0044,    -0.0211,   -0.0518,iter_id)
+            % axis equal
+            % set(gca,'Clipping',"off")
             set(gca,Manualview1)
             drawnow
             gif_name = output_gif;

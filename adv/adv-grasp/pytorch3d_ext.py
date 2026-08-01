@@ -472,7 +472,7 @@ class Renderer:
 
 
 class mesh_properties(nn.Module):
-    def __init__(self, mesh, forceNormalDist=True) -> None:
+    def __init__(self, mesh, forceNormalDist=True, far_dist:float=0) -> None:
         """Find properties of a mesh, including topology, watertightness, and handedness
            topology is all pairs of non-neighbor triangles, edges, and vertices in a mesh"""
         # on initilization creates lists of indices to compare, including
@@ -495,6 +495,7 @@ class mesh_properties(nn.Module):
         # initially set using a manifold check during connectivity. This also checks for self collision, but that is very expensive for large meshes
         # self.is_watertight = self.is_watertight and self_collision_min(mesh.detach(), self, forceNormalDist=0) > 0
 
+        self.far_dist = far_dist
 
         if self.is_watertight:
             volume = self.compute_mesh_volume(mesh, ignore_backface_check=False)
@@ -516,7 +517,7 @@ class mesh_properties(nn.Module):
                 inverseFaceMap[faces[rowInd,ind]].append((rowInd, ind))
             
         # find mapping between edges and all faces they're part of
-        edges_per_face = mesh.faces_packed_to_edges_packed()
+        edges_per_face =mesh.faces_packed_to_edges_packed()
         inverseFaceEdgeMap = [[] for _ in range(mesh.num_edges_per_mesh())]
         for rowInd in range(edges_per_face.shape[0]):
             for ind in range(3):
@@ -568,18 +569,27 @@ class mesh_properties(nn.Module):
         self.faces = torch.nn.Parameter(faces,requires_grad=False)
         self.edges = torch.nn.Parameter(mesh.edges_packed(),requires_grad=False)
         self.face_indices = torch.nn.Parameter(multi_indexing(faces.view(*faces.shape[:-2], -1), mesh.verts_packed().shape, -2),requires_grad=False)
-        self.face_size = tuple(self.faces.shape + (3,))
+        self.face_size = tuple(self.faces.shape + (-1,))
+        self.face_size_sphere = tuple(self.faces.shape + (4,))
 
         self.edge_indices = torch.nn.Parameter(multi_indexing(self.edges.view(*self.edges.shape[:-2], -1), mesh.verts_packed().shape, -2),requires_grad=False)
-        self.edge_size = tuple(self.edges.shape + (3,))
+        self.edge_size = tuple(self.edges.shape + (-1,))
 
+        self.face_edge_indices_4 = torch.nn.Parameter(multi_indexing(edges_per_face.reshape(*edges_per_face.shape[:-2], -1), (mesh.edges_packed().shape[0],4), -2),requires_grad=False)
+        self.face_edge_indices_3 = torch.nn.Parameter(multi_indexing(edges_per_face.reshape(*edges_per_face.shape[:-2], -1), (mesh.edges_packed().shape[0],3), -2),requires_grad=False)
 
     def _gather_faces(self, verts):
         return verts.gather(-2, self.face_indices).reshape(self.face_size)
 
     def _gather_edges(self, verts):
         return verts.gather(-2, self.edge_indices).reshape(self.edge_size)
-            
+    
+    def _gather_face_edges_4(self, edges):
+        return edges.gather(-2, self.face_edge_indices_4).reshape(self.face_size)
+
+    def _gather_face_edges_3(self, edges):
+        return edges.gather(-2, self.face_edge_indices_3).reshape(self.face_size)
+
     @staticmethod
     def compute_mesh_tri_areas(mesh):
         """Compute the area of each mesh triangle, using mean as 4th point. Used in CoM/Volume for non-watertight"""
@@ -587,11 +597,7 @@ class mesh_properties(nn.Module):
         verts_tri = multi_gather_tris(mesh.verts_packed(), mesh.faces_packed())
         com_per_triangle = torch.mean(verts_tri, 1) 
 
-        verts = mesh.verts_packed()
-        verts.requires_grad_(True)
-        # compute all edge vectors
-        edges_tri = multi_gather_tris(verts, mesh.faces_packed()) # n_faces, edge, xyz
-        area_per_triangle = torch.linalg.norm(torch.linalg.cross(edges_tri[:,0,:],edges_tri[:,1,:]),dim=-1,keepdim=True)/2
+        area_per_triangle = mesh_face_areas_normals(mesh.verts_packed(), mesh.faces_packed())[0].unsqueeze(-1)
 
         return area_per_triangle, com_per_triangle
 
@@ -708,7 +714,10 @@ class mesh_properties(nn.Module):
     
         # since forceNormalDist is not symmetric, we need to duplicate the list of pairs, with the order swapped
 
-        quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri = self._assemble_quad_terms(input)
+        quadratic_term_tri, linear_term_tri, const_term_tri, \
+            quadratic_term_edg, linear_term_edg, const_term_edg, \
+                quadratic_term_vtx, linear_term_vtx, const_term_vtx, \
+                    equality_A_tri, equality_b_tri, dist_spheres = self._perform_triangle_comparisons(input)
         # build inequality constraints: solution falls in triangle (or along edge)
 
         # modified barycentric, 0,0,0 is center and 2/3, -1/3, -1/3  is corner0 
@@ -758,10 +767,60 @@ class mesh_properties(nn.Module):
         dist_all = torch.cat((dist_all_tri,dist_all_edg,dist_all_vtx),dim=0)
         bary_coords_corrected = torch.cat((bary_coords_tri_corrected, bary_coords_edg_corrected, bary_coords_vtx_corrected),dim=0)
 
-        return dist_all, bary_coords_corrected
+        if self.far_dist > 0:
+            triangle_dist = dist_spheres < self.far_dist
+            dist_return = dist_spheres
+            dist_return[triangle_dist] = dist_all
+            bary_return = torch.full_like(dist_return.unsqueeze(1).expand([-1,4]),float('Inf'))
+            bary_return[triangle_dist] = bary_coords_corrected
+            
+        else:
+            dist_return = dist_all
+            bary_return = bary_coords_corrected
+
+        return dist_return, bary_return
+    
+    @torch.jit.export
+    def _compute_sphere(self, edges_unwrapped, E_edge, tris, face_areas):
+        edge_sphere_diagonal_sq = torch.sum(torch.square(E_edge),dim=-1,keepdim=True)
+        edge_spheres = self._compute_sphere_edge(edges_unwrapped, squared_diameter=edge_sphere_diagonal_sq)
+        face_edge_spheres = self._gather_face_edges_4(edge_spheres) # ..., 3 edges in face, 4( radius + xyz center )
+        face_edge_sphere_diagonal_sq = edge_sphere_diagonal_sq[self.face_edge_indices_4[...,0]].reshape([-1,3])
+        square_length_longest, indices_big_edge = torch.max(face_edge_sphere_diagonal_sq, dim=-1)
+        is_tri_not_obtuse = 0 < torch.sum(face_edge_sphere_diagonal_sq, dim=-1) - 2 * square_length_longest
+        face_edge_E = self._gather_face_edges_3(E_edge)
+
+        
+        # gather? on indices
+        tri_spheres = face_edge_spheres.gather(-2, indices_big_edge.unsqueeze(-1).unsqueeze(-1).expand((-1,-1,4))).reshape((self.face_size[0],-1))
+
+        # compute full triangle with all remaining
+        tri_spheres[is_tri_not_obtuse] = self._compute_sphere_tri(tris[is_tri_not_obtuse], face_edge_spheres[...,0][is_tri_not_obtuse]*2, face_edge_E[is_tri_not_obtuse], face_areas[is_tri_not_obtuse])
+        return tri_spheres, edge_spheres
 
     @torch.jit.export
-    def _assemble_quad_terms(self, verts):   
+    def _compute_sphere_edge(self,edges, squared_diameter):
+        radius = torch.sqrt(squared_diameter)/2
+        center = torch.mean(edges, dim=-2)
+        return torch.cat((radius, center), dim=-1)
+
+    @torch.jit.export
+    def _compute_sphere_tri(self, tris, face_edge_lengths, E_edge, face_areas):
+        # https://en.wikipedia.org/wiki/Circumcircle#Cartesian_coordinates_from_cross-_and_dot-products
+        radius = torch.prod(face_edge_lengths, dim=-1) / face_areas * 4
+        outer = torch.linalg.matmul(E_edge, torch.transpose(E_edge,-1,-2))
+        weights = (torch.cat((outer[...,0,:1]*outer[...,1,2:],outer[...,1,1:2]*outer[...,0,2:],outer[...,2,2:]*outer[...,0,1:2]),dim=1) \
+            / (torch.square(face_areas * 2).unsqueeze(1)*2)).unsqueeze(-1)
+        center = torch.sum( weights * tris, dim=-2)
+        return torch.cat((radius.unsqueeze(-1), center), dim=-1)
+
+    @torch.jit.export
+    def _sphere_sphere_distance(self, sphere1, sphere2):
+        # assume radius, center
+        return torch.linalg.vector_norm(sphere1[...,1:]-sphere2[...,1:],dim=1) - sphere1[...,0] - sphere2[...,0]
+
+    @torch.jit.export
+    def _perform_triangle_comparisons(self, verts):   
 
         # compute all edge vectors
         # NOTE minor repeated calcs with shared edges
@@ -773,32 +832,54 @@ class mesh_properties(nn.Module):
 
         edges = self._gather_edges(verts) # n_edges, end, xyz
 
-        E_edge = edges[:, 1] - edges[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
 
-        # reference vectors between comparisons, since origins are centered in our modified barycentric
+        E_edge = edges[:, 1] - edges[:, 0]  # vector of edge 1 on triangle (n_faces, 3)
+        if self.forceNormalDist or self.far_dist > 0:
+            face_areas, face_normals = self._normal_wrapper(verts, self.faces)
+        else:
+            face_areas = None
+
+        if self.far_dist > 0:
+            tri_spheres, edge_spheres = self._compute_sphere( edges, E_edge, tris, face_areas)
+            vert_spheres = torch.nn.functional.pad(verts, (1,0))
+            tri_tri_dist_sphere = self._sphere_sphere_distance(tri_spheres[self.tri_unconnectivity[0]],tri_spheres[self.tri_unconnectivity[1]])
+            tri_edge_dist_sphere = self._sphere_sphere_distance(tri_spheres[self.edge_unconnectivity[0]],edge_spheres[self.edge_unconnectivity[1]])
+            tri_vert_dist_sphere = self._sphere_sphere_distance(tri_spheres[self.vert_unconnectivity[0]],vert_spheres[self.vert_unconnectivity[1]])
+            sphere_dist = torch.cat((tri_tri_dist_sphere,tri_edge_dist_sphere,tri_vert_dist_sphere),dim=0)
+            tri_unconnectivity = self.tri_unconnectivity[:,tri_tri_dist_sphere < self.far_dist]
+            edge_unconnectivity = self.edge_unconnectivity[:,tri_edge_dist_sphere < self.far_dist]
+            vert_unconnectivity = self.vert_unconnectivity[:,tri_vert_dist_sphere < self.far_dist]
+        else:
+            tri_unconnectivity = self.tri_unconnectivity
+            edge_unconnectivity = self.edge_unconnectivity
+            vert_unconnectivity = self.vert_unconnectivity
+            sphere_dist = None
+
+        
+
 
         # triangle center to triangle center, when no vertices or edges are shared
-        w_diff_vec_tri = torch.mean(tris[self.tri_unconnectivity[1]],dim=1) - torch.mean(tris[self.tri_unconnectivity[0]],dim=1)  # n_tri_unconnect, xyz
+        w_diff_vec_tri = torch.mean(tris[tri_unconnectivity[1]],dim=1) - torch.mean(tris[tri_unconnectivity[0]],dim=1)  # n_tri_unconnect, xyz
 
         # triangle center to (non-neighbor) edge center, when vertex is shared
-        w_diff_vec_edg = torch.mean(edges[self.edge_unconnectivity[1]],dim=1) - torch.mean(tris[self.edge_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
+        w_diff_vec_edg = torch.mean(edges[edge_unconnectivity[1]],dim=1) - torch.mean(tris[edge_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
 
         # triangle center to (non-neighbor) vertex, when edge is shared
-        w_diff_vec_vtx = verts[self.vert_unconnectivity[1]] - torch.mean(tris[self.vert_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
+        w_diff_vec_vtx = verts[vert_unconnectivity[1]] - torch.mean(tris[vert_unconnectivity[0]],dim=1) # n_edg_unconnect, xyz
 
         # expand edge vector directions to full size (per face or edge they appear in) for linear and quadratic terms
-        TR1_E1_full_tri = E1[self.tri_unconnectivity[0]]
-        TR1_E2_full_tri = E2[self.tri_unconnectivity[0]]
-        TR2_E1_full_tri = E1[self.tri_unconnectivity[1]]
-        TR2_E2_full_tri = E2[self.tri_unconnectivity[1]]
+        TR1_E1_full_tri = E1[tri_unconnectivity[0]]
+        TR1_E2_full_tri = E2[tri_unconnectivity[0]]
+        TR2_E1_full_tri = E1[tri_unconnectivity[1]]
+        TR2_E2_full_tri = E2[tri_unconnectivity[1]]
 
-        TR1_E1_full_edg = E1[self.edge_unconnectivity[0]]
-        TR1_E2_full_edg = E2[self.edge_unconnectivity[0]]
+        TR1_E1_full_edg = E1[edge_unconnectivity[0]]
+        TR1_E2_full_edg = E2[edge_unconnectivity[0]]
 
-        TR2_E_full_edg = E_edge[self.edge_unconnectivity[1]]
+        TR2_E_full_edg = E_edge[edge_unconnectivity[1]]
 
-        TR1_E1_full_vtx = E1[self.vert_unconnectivity[0]]
-        TR1_E2_full_vtx = E2[self.vert_unconnectivity[0]]
+        TR1_E1_full_vtx = E1[vert_unconnectivity[0]]
+        TR1_E2_full_vtx = E2[vert_unconnectivity[0]]
 
         # linear terms, 
 
@@ -851,34 +932,34 @@ class mesh_properties(nn.Module):
 
         # within "first" edges
         E1_E1 = torch.linalg.vecdot(E1,E1)
-        TR1_TR1_E1_E1_full_tri = E1_E1[self.tri_unconnectivity[0]].unsqueeze(1)
-        TR2_TR2_E1_E1_full_tri = E1_E1[self.tri_unconnectivity[1]].unsqueeze(1)
+        TR1_TR1_E1_E1_full_tri = E1_E1[tri_unconnectivity[0]].unsqueeze(1)
+        TR2_TR2_E1_E1_full_tri = E1_E1[tri_unconnectivity[1]].unsqueeze(1)
 
-        TR1_TR1_E1_E1_full_edg = E1_E1[self.edge_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E1_full_edg = E1_E1[edge_unconnectivity[0]].unsqueeze(1)
 
-        TR1_TR1_E1_E1_full_vtx = E1_E1[self.vert_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E1_full_vtx = E1_E1[vert_unconnectivity[0]].unsqueeze(1)
 
         # within "second" edges
         E2_E2 = torch.linalg.vecdot(E2,E2)
-        TR1_TR1_E2_E2_full_tri = E2_E2[self.tri_unconnectivity[0]].unsqueeze(1)
-        TR2_TR2_E2_E2_full_tri = E2_E2[self.tri_unconnectivity[1]].unsqueeze(1)
+        TR1_TR1_E2_E2_full_tri = E2_E2[tri_unconnectivity[0]].unsqueeze(1)
+        TR2_TR2_E2_E2_full_tri = E2_E2[tri_unconnectivity[1]].unsqueeze(1)
 
-        TR1_TR1_E2_E2_full_edg = E2_E2[self.edge_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E2_E2_full_edg = E2_E2[edge_unconnectivity[0]].unsqueeze(1)
 
-        TR1_TR1_E2_E2_full_vtx = E2_E2[self.vert_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E2_E2_full_vtx = E2_E2[vert_unconnectivity[0]].unsqueeze(1)
 
         # between "first" edges and "second edges"
         E1_E2 = torch.linalg.vecdot(E1,E2)
-        TR1_TR1_E1_E2_full_tri = E1_E2[self.tri_unconnectivity[0]].unsqueeze(1)
-        TR2_TR2_E1_E2_full_tri = E1_E2[self.tri_unconnectivity[1]].unsqueeze(1)
+        TR1_TR1_E1_E2_full_tri = E1_E2[tri_unconnectivity[0]].unsqueeze(1)
+        TR2_TR2_E1_E2_full_tri = E1_E2[tri_unconnectivity[1]].unsqueeze(1)
 
-        TR1_TR1_E1_E2_full_edg = E1_E2[self.edge_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E2_full_edg = E1_E2[edge_unconnectivity[0]].unsqueeze(1)
 
-        TR1_TR1_E1_E2_full_vtx = E1_E2[self.vert_unconnectivity[0]].unsqueeze(1)
+        TR1_TR1_E1_E2_full_vtx = E1_E2[vert_unconnectivity[0]].unsqueeze(1)
 
         # single edge terms, can be 1st, 2nd, or even 3rd edge
         E_E = torch.linalg.vecdot(E_edge,E_edge)
-        TR2_TR2_E_E_full_edg = E_E[self.edge_unconnectivity[1]].unsqueeze(1)
+        TR2_TR2_E_E_full_edg = E_E[edge_unconnectivity[1]].unsqueeze(1)
 
         # between triangle terms, use expanded version, repeated calcs when forceNormalDist is true
         # TODO, detect forceNormalDist and share computation
@@ -910,15 +991,15 @@ class mesh_properties(nn.Module):
         if self.forceNormalDist:
             # need additional constraint that solution is in normal direction of 1st triangle
             # encoded as an equality constraint in the optimization
-            normals = self._normal_wrapper(verts, self.faces)[1]
-            normal_vecs_tri = normals[self.tri_unconnectivity[0]]
+            
+            normal_vecs_tri = face_normals[tri_unconnectivity[0]]
 
-            TR_1_N_tri = normals[self.tri_unconnectivity[0]]
+            TR_1_N_tri = face_normals[tri_unconnectivity[0]]
 
             # compute projection of edge vectors to containing triangle normal.
             # perform only once per triangle and expand later
-            TR_1_E1_N = torch.linalg.vecdot( normals , E1)
-            TR_1_E2_N = torch.linalg.vecdot( normals , E2)
+            TR_1_E1_N = torch.linalg.vecdot( face_normals , E1)
+            TR_1_E2_N = torch.linalg.vecdot( face_normals , E2)
 
             # compute projection of second triangle edge vectors onto first triangle normal
             TR_2_E1_N_tri = torch.linalg.vecdot( TR_1_N_tri , TR2_E1_full_tri)
@@ -926,12 +1007,12 @@ class mesh_properties(nn.Module):
 
             # use projection of edge onto normal to compute rejection of normal from vector
             # perform only once per triangle, expand later
-            vec_reject_TR1_E1 = (E1 - TR_1_E1_N.unsqueeze(1) * normals)
-            vec_reject_TR1_E2 = (E2 - TR_1_E2_N.unsqueeze(1) * normals)
+            vec_reject_TR1_E1 = (E1 - TR_1_E1_N.unsqueeze(1) * face_normals)
+            vec_reject_TR1_E2 = (E2 - TR_1_E2_N.unsqueeze(1) * face_normals)
 
             equality_A_tri = torch.cat(
-                        (vec_reject_TR1_E1[self.tri_unconnectivity[0]].unsqueeze(-1),
-                        vec_reject_TR1_E2[self.tri_unconnectivity[0]].unsqueeze(-1),
+                        (vec_reject_TR1_E1[tri_unconnectivity[0]].unsqueeze(-1),
+                        vec_reject_TR1_E2[tri_unconnectivity[0]].unsqueeze(-1),
                         ((TR_2_E1_N_tri.unsqueeze(1) * TR_1_N_tri) - TR2_E1_full_tri).unsqueeze(-1) ,
                         ((TR_2_E2_N_tri.unsqueeze(1) * TR_1_N_tri) - TR2_E2_full_tri).unsqueeze(-1)),dim=-1)
             
@@ -964,7 +1045,8 @@ class mesh_properties(nn.Module):
             equality_b_tri = torch.zeros((0),device=verts.device)
 
         
-        return quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri
+        return quadratic_term_tri, linear_term_tri, const_term_tri, quadratic_term_edg, linear_term_edg, \
+    const_term_edg, quadratic_term_vtx, linear_term_vtx, const_term_vtx, equality_A_tri, equality_b_tri, sphere_dist
 
     @torch.jit.ignore
     def _normal_wrapper(self, verts, faces):
@@ -1059,8 +1141,8 @@ class mesh_properties(nn.Module):
             else:
                 equality_A_filt = equality_A[valid_bary]
                 equality_b_filt = equality_b[valid_bary]
-            bary_coords = float('Inf') * torch.ones_like(bary_coords)
-            dist_all = float('Inf') * torch.ones_like(const_term)
+            bary_coords =  torch.full_like(bary_coords,float('Inf'))
+            dist_all = torch.full_like(const_term,float('Inf'))
             if torch.any(valid_bary):
                 mesh_properties._blockPrint()
                 bary_coords_feasible = qp(quadratic_term[valid_bary], linear_term[valid_bary].squeeze(2), # optimization
