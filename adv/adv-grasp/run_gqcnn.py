@@ -2,21 +2,68 @@ import os
 import json
 import logging
 import numpy as np
+import torch
+import pytorch3d
+import cv2
+from tqdm import tqdm
 from pytorch3d.io import save_obj
 from pytorch3d.loss import mesh_edge_loss, mesh_normal_consistency, mesh_laplacian_smoothing
 from enum import Enum
+from scipy.spatial import QhullError
 
-from render import *
+
+from pytorch3d_ext import Renderer, mesh_properties
 from gqcnn_pytorch import KitModel
-from select_grasp import *
+import matplotlib.pyplot as plt
+from grasp import GraspTorch
+import select_grasp as sg
+import quality_fork as quality
+import math
+from quality_fork import (
+    GQCNNQualityFunction, 
+    RobustCannyFerrariQualityFunction,
+    RobustMinWeightQualityFunction,
+    minWeightQualityFunction,
+    CannyFerrariQualityFunction,
+    pytorch_setup
+)
+
+# from ll4ma_opt.problems.problem import Problem
+# #from ll4ma_opt.problems import SteinWrapper
+from ll4ma_opt.solvers import GradientDescent,BFGSMethod
+from ll4ma_opt.solvers.penalty_method import PenaltyMethod
+from ll4ma_opt.solvers.penalty_method import AugmentedLagranMethod
+import imageio
+
+from ll4ma_opt.problems import CircleEquality
 
 SHARED_DIR = "/home/hmitchell/pytorch3d/dex_shared_dir"
 
 class AttackMethod(Enum):
 	RANDOM_FUZZ = 1
-	NO_ORACLE = 2
-	NO_ORACLE_GRAD = 3
-	ORACLE_GRAD = 4
+	GQCNN_DOWN = 2
+	GQCNN_CF_DIFF_NO_CF_GRAD = 3
+	GQCNN_CF_DIFF = 4
+	GQCNN_DOWN_CF_UP = 5
+	GQCNN_UP_CF_DOWN = 6
+	GQCNN_MINWEIGHT_DIFF = 7
+	GQCNN_DOWN_MINWEIGHT_UP = 8
+	GQCNN_UP_MINWEIGHT_DOWN = 9
+	NO_GQCNN_GRAD = 10
+	SELF_COLLISION_LOSS_DOWN = 11
+	GQCNN_UP = 12
+	CF_UP = 13
+	CF_DOWN = 14
+	MW_UP = 15
+	MW_DOWN = 16
+	LAPLACIAN_SMOOTHING_DOWN = 17
+	L2_NORM_DOWN = 18
+	MIN_DIST_COLL = 19
+	REF_DIST_COLL = 20
+	CF_SIG_UP = 21
+	CF_SIG_DOWN = 22
+
+import ll4ma_opt_wrappers
 
 class Attack: 
 
@@ -92,11 +139,14 @@ class Attack:
 	def plot_losses(losses, dir):
 		fig = plt.figure(figsize=(7, 5))
 		ax = fig.gca()
-		for k, l in losses.items():
-			ax.plot(l, label=k + " loss")
-		ax.legend(fontsize="16")
+		ax2 = ax.twinx()
+		ax2.plot(losses['dist'], label="dist loss",color='tab:blue')
+		index = [0] + (np.nonzero(np.diff(losses['index']))[0]+1).tolist() + [len(losses['index'])-1]
+		ax.vlines(index,ymin=0,ymax=1,color='tab:green')
+		ax.plot(losses['prediction'], label="prediction loss",color='tab:red')
 		ax.set_xlabel("Iteration", fontsize="16")
 		ax.set_ylabel("Loss", fontsize="16")
+		ax2.set_ylabel("Dist", fontsize="16")
 		ax.set_title("Loss vs iterations", fontsize="18")
 		plt.savefig(dir+"losses.png")
 		plt.close()
@@ -112,11 +162,11 @@ class Attack:
 		ax.set_xlabel("Iteration", fontsize="16")
 		ax.set_ylabel("Quality (Scaled)", fontsize="16")
 		ax.set_title("Oracle and GQCNN Quality Over Time", fontsize="18")
-		ax.set_ylim(0, 1.1)
+		#ax.set_ylim(0, 1.1)
 		plt.savefig(dir+"qual.png")
 		plt.close()
 
-	def calc_loss(self, adv_mesh, grasp, method):
+	def calc_loss(self, adv_mesh, grasp, method, index, param):
 		"""
 		Calculates loss for the adversarial attack to maximize difference between oracle and model prediction
 
@@ -124,65 +174,126 @@ class Attack:
 		----------
 		adv_mesh:
 		grasp:
+		index:
 		Returns
 		-------
-		float: calculated loss
+		Tensor: calculated loss
+		float: "is close" boolean comparing two qualities
+		Tensor: component of loss from self collision distance
+		Tensor: component of loss from adv attack
 		"""
+		if  isinstance(method, AttackMethod):
+			method = [method]
+		method = set(method)
 
 		adv_mesh_clone = adv_mesh.clone()
 		dim = self.renderer.mesh_to_depth_im(adv_mesh_clone, display=False)
-		pose, image = grasp.extract_tensors_batch(dim)
+		pose, image = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
 		out = self.run(pose, image)
-		cur_pred = out[:,0:1].to(adv_mesh.device)
+		cur_pred = out[:,1:].to(adv_mesh.device)
 		eps_check = False
 
+		dist_loss, min_dist, all_dist = self.eval_self_collision_dist(grasp, adv_mesh_clone)
+
+		oracle_pred = self.oracle_eval(grasp, adv_mesh_clone, renderer=self.renderer)
+
+		# initialize to 0, so we can optionally add to it
+		adv_loss = torch.zeros([len(adv_mesh),grasp.num_grasps()],device=adv_mesh.device)
+		minweight_pred = self.oracle_eval(grasp, adv_mesh_clone, renderer=self.renderer,mode='minweight')
+
+		l2 = torch.linalg.norm(param.flatten())
+		laplacian = pytorch3d.loss.mesh_laplacian_smoothing(adv_mesh_clone)
+		
+		loss_dict = {}
+
+
+		if AttackMethod.SELF_COLLISION_LOSS_DOWN in method:
+			loss_dict[AttackMethod.SELF_COLLISION_LOSS_DOWN] = dist_loss
+			#loss_dict[AttackMethod.MIN_DIST_COLL] = min_dist
+			loss_dict[AttackMethod.MIN_DIST_COLL] = -torch.logsumexp(-self.softmin_t*all_dist[torch.isfinite(all_dist)],0)/(self.softmin_t * 2)
+			loss_dict[AttackMethod.REF_DIST_COLL] = self.reference_dist
+		
+		if AttackMethod.CF_UP in method:
+			loss_dict[AttackMethod.CF_UP] = -oracle_pred
+		
+		if AttackMethod.CF_DOWN in method:
+			loss_dict[AttackMethod.CF_DOWN] = oracle_pred
+
+		if AttackMethod.CF_SIG_UP in method:
+			loss_dict[AttackMethod.CF_SIG_UP] = -(torch.sigmoid(oracle_pred)-0.5)*2
+		
+		if AttackMethod.CF_SIG_DOWN in method:
+			loss_dict[AttackMethod.CF_SIG_DOWN] = (torch.sigmoid(oracle_pred)-0.5)*2
+
+		if AttackMethod.MW_UP in method:
+			loss_dict[AttackMethod.MW_UP] =  -minweight_pred
+		
+		if AttackMethod.MW_DOWN in method:
+			loss_dict[AttackMethod.MW_DOWN] =  minweight_pred
+
+		if AttackMethod.NO_GQCNN_GRAD in method:
+			cur_pred= cur_pred.detach()
+
 		# NO ORACLE
-		if method == AttackMethod.NO_ORACLE:
-			loss = cur_pred
-			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
-			oracle_pred = self.scale_oracle(oracle_pred)
+		if AttackMethod.GQCNN_DOWN in method:
+			loss_dict[AttackMethod.GQCNN_DOWN] = cur_pred
+		
+		if AttackMethod.GQCNN_UP in method:
+			loss_dict[AttackMethod.GQCNN_UP] = -cur_pred
+
+		if AttackMethod.L2_NORM_DOWN in method:
+			loss_dict[AttackMethod.L2_NORM_DOWN] = l2
+
+		if AttackMethod.LAPLACIAN_SMOOTHING_DOWN in method:
+			loss_dict[AttackMethod.LAPLACIAN_SMOOTHING_DOWN] = laplacian
 
 		# NO ORACLE GRADIENT - check current model prediction
-		elif method == AttackMethod.NO_ORACLE_GRAD:
-			oracle_pred = Attack.scale_oracle(grasp.quality)
+		elif AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD in method:
+			other_methods = method - {AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD}
+			if len(other_methods) > 0:
+				tqdm.write(f'NO_ORACLE_GRAD may have unknown effects alongside {AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD.name}')
+			oracle_pred = oracle_pred.detach()
 			abs_diff = torch.abs(torch.sub(cur_pred, oracle_pred))
-			loss = torch.sub(1.0, abs_diff)
+			adv_loss = torch.sub(1.0, abs_diff)
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 	
 		# ORACLE GRADIENT
-		elif method == AttackMethod.ORACLE_GRAD:
-			oracle_pred = grasp.oracle_eval(adv_mesh_clone, renderer=self.renderer)
-			oracle_pred = self.scale_oracle(oracle_pred)
-			if self.loss_alpha is not None:
-				abs_diff = torch.abs(torch.sub((self.loss_alpha * oracle_pred), ((1.0 - self.loss_alpha) * cur_pred)))
-				loss = torch.sub(1.0, abs_diff)		# use means for batches
-			else:
-				abs_diff = torch.abs(torch.sub(oracle_pred, cur_pred))
-				loss = torch.sub(1.0, abs_diff)
+		if len(method & { AttackMethod.GQCNN_CF_DIFF,  AttackMethod.GQCNN_UP_CF_DOWN,  AttackMethod.GQCNN_DOWN_CF_UP}) > 0:
+
+			# since there is a threshold in robust canny-ferrari, we need
+			# a two different modes to get the gradient we want
+			GQCNN_DOWN_CF_UP = oracle_pred -0.5 - cur_pred
+			GQCNN_UP_CF_DOWN = cur_pred - oracle_pred +0.5
+			if AttackMethod.GQCNN_CF_DIFF in method and oracle_pred > cur_pred:
+				loss_dict[AttackMethod.GQCNN_CF_DIFF]= -GQCNN_DOWN_CF_UP
+			else :
+				loss_dict[AttackMethod.GQCNN_CF_DIFF]= -GQCNN_UP_CF_DOWN
+			loss_dict[AttackMethod.GQCNN_DOWN_CF_UP] = -GQCNN_DOWN_CF_UP
+			loss_dict[AttackMethod.GQCNN_UP_CF_DOWN] = -GQCNN_UP_CF_DOWN
 
 			if self.epsilon is not None and abs_diff >= self.epsilon:
 				eps_check = True
 
 
-		self.losses["prediction"].append(loss.item())
+		self.losses["prediction"].append(adv_loss.item())
+
+
+		self.losses["dist"].append((dist_loss/10000).item())
+		self.losses["index"].append(index)
 		self.track_qual["gqcnn prediction"].append(cur_pred.item())
 		self.track_qual["oracle quality"].append(oracle_pred.item())
+		self.track_qual["minWeight quality"].append(minweight_pred.item())
+		self.track_qual["dist loss"].append(dist_loss.item())
+		self.track_qual["did hit object"].append(torch.any(grasp.contact_mask.flatten()).item())
+		self.track_qual["min dist"].append(min_dist.item())
+		self.track_qual["l2 norm"].append(l2.item())
+		self.track_qual["laplacian smoothing"].append(laplacian.item())
+		#self.track_qual["index"].append(index)
 
-		return loss, eps_check
+		return loss_dict, eps_check
 
-		# ignore regularization losses for now
-		# # WEIGHTED LOSS WITH PYTORCH3D.LOSS FUNCS
-		# edge_loss = mesh_edge_loss(adv_mesh) * self.loss_weights["edge"]
-		# normal_loss = mesh_normal_consistency(adv_mesh) * self.loss_weights["normal"]
-		# smooth_loss = mesh_laplacian_smoothing(adv_mesh) * self.loss_weights["smooth"]
-		# weighted_loss = loss + edge_loss + normal_loss + smooth_loss
-		# self.losses["prediction"].append(loss.item())
-		# self.losses["edge"].append(edge_loss.item())
-		# self.losses["normal"].append(normal_loss.item())
-		# self.losses["smoothing"].append(smooth_loss.item())
-
-	def perturb(self, mesh, param, grasp, method):
+	def perturb(self, mesh, param, grasp:GraspTorch, method, index):
 		"""
 		Perturb the mesh for the adversarial attack
 
@@ -191,6 +302,7 @@ class Attack:
 		mesh: pytorch3d.structures.Meshes
 			Mesh to be perturbed
 		param: torch.tensor
+		index: outer loop index for storing with loss to track successful steps
 		grasp:
 		Returns
 		-------
@@ -200,10 +312,36 @@ class Attack:
 		"""
   
 		# NO ORACLE / NO ORACLE GRADIENT / ORACLE GRADIENT - perturb vertices
-		adv_mesh = mesh.offset_verts(param)
-		loss, eps_check = self.calc_loss(adv_mesh, grasp, method)
+		if param.shape[-1] == 4:
+			# update grasp as 2D
+			angle = grasp.im_angle + param[...,2]
+			depth = grasp.depth + param[...,3]
+			im_center = grasp.im_center + param[...,:2]
+			grasp = GraspTorch(angle=angle, depth=depth,im_center=im_center, friction_coef=grasp.friction_coef,
+					  num_cone_faces=grasp.num_cone_faces, torque_scaling=grasp.torque_scaling, camera_intr=grasp.camera_intr)
+			adv_mesh = mesh
+			updated_obj = grasp
+		elif param.shape[-1] == 6:
+			# update grasp as 3D
+			axis3D = torch.nn.functional.normalize(grasp.world_axis + param[...,:3],dim=-1)
+			center3D = grasp.world_center + param[...,3:]
+			grasp = GraspTorch(world_axis=axis3D, world_center=center3D, friction_coef=grasp.friction_coef,
+					  num_cone_faces=grasp.num_cone_faces, torque_scaling=grasp.torque_scaling, camera_intr=grasp.camera_intr)
+			adv_mesh = mesh
+			updated_obj = grasp
+		elif param.shape[-1] == 3:
+			# update mesh vertices
+			adv_mesh = mesh.offset_verts(param)
+			updated_obj = adv_mesh
 
-		return loss, adv_mesh, eps_check
+		grasp.make2D(camera_intr=self.renderer.camera)
+		grasp = grasp.apply_to_mesh(adv_mesh, is_watertight=self.mesh_properties.is_watertight, 
+                                    is_inverted=self.mesh_properties.is_inverted, use_dexnet_normal=False)
+
+		
+		loss, eps_check = self.calc_loss(adv_mesh, grasp, method, index, param)
+
+		return loss, updated_obj, eps_check 
 
 	def attack_setup(self, dir, logfile, grasp, method):
 		"""Set up attack by saving info and resetting losses"""
@@ -212,13 +350,16 @@ class Attack:
 		if not os.path.exists(dir):
 			os.makedirs(dir)
 		grasp.save(dir+"grasp.json")
-
+		if isinstance(method, AttackMethod):
+			method_string = method.name
+		else:
+			method_string = str([m.name for m in method])
 		data = {
 			"learning_rate": self.learning_rate,
 			"momentum": self.momentum,
 			"optimizer": "SGD",
 			"loss weight (alpha)": self.loss_alpha, 
-			"method": method.name
+			"method": method_string
 		}
 		with open(logfile, "w") as f:
 			json.dump(data, f, indent=4)
@@ -226,6 +367,8 @@ class Attack:
 		# reset loss tracking to plot at the end
 		self.losses = {
 			"prediction": [],
+			"dist": [],
+			"index": []
 			# "edge": [],
 			# "normal": [],
 			# "smoothing": []
@@ -233,40 +376,48 @@ class Attack:
 
 		self.track_qual = {
 			"gqcnn prediction": [],
-			"oracle quality": []
+			"oracle quality": [],
+			"minWeight quality": [],
+			"dist loss": [],
+			"did hit object": [],
+			"min dist": [],
+			"l2 norm": [],
+			"laplacian smoothing": []
 		}
 
-	def attack_random_fuzz(self, mesh, grasp, dir, lr):
-		"""Run an attack on the model using random mesh perturbations with step size of lr"""
-		Attack.logger.info("Running random perturbation attack!")
+		self.reference_dist = None
 
-		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
-		adv_mesh = mesh.clone()
+	# def attack_random_fuzz(self, mesh, grasp, dir, lr):
+	# 	"""Run an attack on the model using random mesh perturbations with step size of lr"""
+	# 	Attack.logger.info("Running random perturbation attack!")
 
-		# ADVERSARIAL LOOP
-		for i in range(1, self.num_steps):
+	# 	param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
+	# 	adv_mesh = mesh.clone()
 
-			# perturb
-			v = torch.normal(0.0, 1.0, param.shape).to(param.device)
-			v = torch.nn.functional.normalize(v)
-			random_step = self.learning_rate * v
-			adv_mesh = mesh.offset_verts(random_step)
+	# 	# ADVERSARIAL LOOP
+	# 	for i in range(1, self.num_steps):
 
-			if i % self.steps_per_plot == 0:
-				# snapshot
-				mesh2 = adv_mesh.clone()
-				self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=self.orig_pdim, logfile=self.logfile, method=AttackMethod.RANDOM_FUZZ)
+	# 		# perturb
+	# 		v = torch.normal(0.0, 1.0, param.shape).to(param.device)
+	# 		v = torch.nn.functional.normalize(v)
+	# 		random_step = self.learning_rate * v
+	# 		adv_mesh = mesh.offset_verts(random_step)
 
-		# plot qualities over time
-		Attack.plot_qual(self.track_qual, dir)
+	# 		if i % self.steps_per_plot == 0:
+	# 			# snapshot
+	# 			mesh2 = adv_mesh.clone()
+	# 			self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=self.orig_pdim, logfile=self.logfile, method=AttackMethod.RANDOM_FUZZ)
 
-		# save final object
-		final_mesh = mesh.offset_verts(param)
-		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=self.orig_pdim, logfile=self.logfile, method=AttackMethod.RANDOM_FUZZ, save_mesh=True)
+	# 	# plot qualities over time
+	# 	Attack.plot_qual(self.track_qual, dir)
 
-		return final_mesh
+	# 	# save final object
+	# 	final_mesh = mesh.offset_verts(param)
+	# 	self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=self.orig_pdim, logfile=self.logfile, method=AttackMethod.RANDOM_FUZZ, final_snapshot=True)
 
-	def attack(self, mesh, grasp, dir, lr, momentum=None, loss_alpha=None, method=AttackMethod.ORACLE_GRAD, epsilon=None):
+	# 	return final_mesh
+
+	def attack(self, mesh, grasp, dir, lr, momentum=None, loss_alpha=None, method=AttackMethod.GQCNN_CF_DIFF, epsilon=None,prune_vertex_gradients_mode = 0):
 		"""
 		Run an attack on the model for number of steps specified in self.num_steps
 
@@ -292,13 +443,18 @@ class Attack:
 		pytorch3d.structures.Meshes: adv_mesh
 			Final adversarial mesh
 		"""
-		Attack.logger.info(f"Running attack with method {method.name}!")
+		if isinstance(method, AttackMethod):
+			Attack.logger.info(f"Running attack with method {method.name}!")
+		else:
+			Attack.logger.info(f"Running attack with methods {[m.name for m in method]}!")
 
+		#self.mesh_properties = torch.jit.script(mesh_properties(mesh)) Not currently faster
+		self.mesh_properties = mesh_properties(mesh, far_dist=1e-6)
 		# set attack parameters
 		self.learning_rate = lr
 		self.momentum = momentum
 		self.loss_alpha = loss_alpha
-		if epsilon is not None and ((method == AttackMethod.NO_ORACLE_GRAD) or (method == AttackMethod.ORACLE_GRAD)):
+		if epsilon is not None and ((method == AttackMethod.GQCNN_CF_DIFF_NO_CF_GRAD) or (method == AttackMethod.GQCNN_CF_DIFF)):
 			self.epsilon = epsilon
 		else:
 			self.epsilon = None
@@ -309,95 +465,579 @@ class Attack:
 		logfile = dir+"logfile.txt"
 		self.attack_setup(dir=dir, logfile=logfile, grasp=grasp, method=method)
 		dim = self.renderer.mesh_to_depth_im(mesh, display=False)
-		_, orig_pdim = grasp.extract_tensors_batch(dim)
+		_, orig_pdim = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
 		self.orig_pdim = orig_pdim
 		self.logfile = logfile
 
 		# snapshot
-		self.snapshot(mesh=mesh, grasp=grasp, dir=dir, iteration=0, orig_pdim=orig_pdim, logfile=logfile, method=method)
+		self.snapshot(mesh=mesh, grasp=grasp, dir=dir, iteration=0, orig_pdim=orig_pdim, logfile=logfile)
 
-		if method == AttackMethod.RANDOM_FUZZ:
-			return self.attack_random_fuzz(mesh, grasp, dir, lr)
+		# if method == AttackMethod.RANDOM_FUZZ:
+		# 	return self.attack_random_fuzz(mesh, grasp, dir, lr)
+		
+		optimize_mesh = True
+		if optimize_mesh:
+			param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
+		else:
+			# TODO, options for size 4
+			# Make this work, currently no gradient computed
+			param = torch.zeros(list(grasp.world_center[...,0].shape) + [6], device=mesh.device, requires_grad=True)
 
-		param = torch.zeros(mesh.verts_packed().shape, device=mesh.device, requires_grad=True)
-		optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
+		# option to use steps of fixed size, inspired by fgsm (https://pytorch.org/tutorials/beginner/fgsm_tutorial.html)
+		# otherwise, will use SGD and scale by gradient magnitude
+		use_fixed_step = True
 
-		adv_mesh = mesh.clone()
+		if not use_fixed_step:
+			optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
 
+		perturbed_by_param = mesh.clone()
+
+		# initialize stack of known feasible meshes, for reverting during optimization
+		param_safe=[param.detach().clone()]
+		
+		
+		collision_loss_scale =  1e4
+		collision_loss_sat = 1
+		backoff = 2
+		
+		# 0 none, 1 freeze vertex, 2 freeze dim, 3 vector rejection
+		prune_vertex_dim_gradients_toward_collision = False
+
+		self_collision_index = None
+		if AttackMethod.SELF_COLLISION_LOSS_DOWN in method:
+			self_collision_index = method.index(AttackMethod.SELF_COLLISION_LOSS_DOWN)
+			other_indices = [i for i in range(len(method)) if i != self_collision_index]
+		else:
+			other_indices = range(len(method))
+		even_weight = 1/len(other_indices)
+
+		# ratio between start and end when doing exponential backoff. 2 will take average, 10 will reduce step by 90%
+		
+		loss_last = 0
 		# ADVERSARIAL LOOP
-		for i in range(1, self.num_steps):
+		# torch.autograd.set_detect_anomaly(True)
+		resets = 0
+		best_loss = float('inf')
+		self.qual_measures_raw = []
+		self.loss_mag = []
+		self.update_scale = []
+		self.optim_status = []
+		mode = 0 # 0 by hand, 1 ll4ma-opt
+		attack_failed = None
+		if mode == 0:
+			for i in tqdm(range(1, self.num_steps),desc='attack outer iterations',leave=False):
+				attempts = 0 # used to decide whether to revert to previous mesh in param_safe
+				if attack_failed is not None:
+					break
+				if not use_fixed_step:
+					optimizer.zero_grad()
+				while True:
+					fail = False
+					param_updated = False
+					self.param_grad_list = []
+					if len(self.loss_mag) > 0:
+						# drop gradient information for last iteration, can release graph
+						self.loss_mag[-1] = self.loss_mag[-1].detach()
+					self.loss_mag.append(torch.zeros((1,len(method)), device=mesh.device))
+					self.update_scale.append(torch.zeros((1,len(method)), device=mesh.device))
+					self.optim_status.append(np.array([[i, len(param_safe), attempts, resets]]))
+				
+				
+					loss_dict, perturbed_by_param, eps_check = self.perturb(mesh, param, grasp, method, i)
+					for ind, method_type in enumerate(method):
+						if method_type is AttackMethod.RANDOM_FUZZ:
+							self.loss_mag[-1][0,ind] = 0
+							self.param_grad_list.append(torch.rand_like(param))
+							continue
+						self.loss_mag[-1][0,ind] = loss_dict[method_type]
+						if torch.isfinite(self.loss_mag[-1][0,ind]).item():
+							param_back = None # clear local cache variable
+							try:
+								self.loss_mag[-1][0,ind].backward(retain_graph=True)
+								if param.grad is not None:
+									if torch.all(torch.isfinite(param.grad).flatten()).item():
+										self.param_grad_list.append(param.grad.detach().clone())
+										param.grad.zero_()
+									else:
+										tqdm.write(f'found inf grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
+										fail = True or fail
+										param.grad.zero_()
+										break
+								else:
+									tqdm.write(f'found None grad value {method_type} ind {ind} val {self.loss_mag[-1]}')
+									self.param_grad_list.append(torch.zeros_like(param))
 
-			optimizer.zero_grad()
-			loss, adv_mesh, eps_check = self.perturb(mesh, param, grasp, method)
-			loss.backward()
-			optimizer.step()
+							except Exception as e:
+								tqdm.write(str(method_type))
+								tqdm.write(str(e))
+								fail=True or fail
+								break
+						else:
+							tqdm.write(str(method_type))
+							tqdm.write('loss mag not finite')
+							fail=True or fail
+							break
+					# check that both loss AND its derivative are finite, otherwise triggering backoff
+					if not fail:
+						param_back = None # clear local cache variable
+						try:
+							
+							self.update_scale[-1][0,other_indices] = even_weight
+							param = param.detach()
+							
+							if self_collision_index is not None:
+								self.update_scale[-1][0,self_collision_index] = torch.minimum(self.loss_mag[-1][0,self_collision_index].detach() / collision_loss_scale, 
+															torch.ones_like(self.loss_mag[-1][0,self_collision_index])*collision_loss_sat)
+								# 
+								# 
+								self.update_scale[-1] = torch.nn.functional.normalize(self.update_scale[-1]) 
+								grad_other = torch.zeros_like(param)
+								update_scale = torch.zeros_like(param[0][0])
+								for grad_ind in other_indices:
+									grad_other += self.param_grad_list[grad_ind]
+									grad_other += torch.nn.functional.normalize(self.param_grad_list[grad_ind].flatten(),dim=0).reshape(param.shape)
+									update_scale += self.update_scale[-1][0,grad_ind]
+								if prune_vertex_gradients_mode == 1:
+									collision_dirs = torch.linalg.vecdot(grad_other,self.param_grad_list[self_collision_index]) < 0
+									grad_other[collision_dirs]  = 0
+								elif prune_vertex_gradients_mode == 2:
+									collision_dirs =grad_other * self.param_grad_list[self_collision_index] < 0
+									grad_other[collision_dirs]  = 0
+								if prune_vertex_gradients_mode == 3:
+									collision_dot = torch.linalg.vecdot(grad_other,self.param_grad_list[self_collision_index])
+									collision_dirs = collision_dot < 0
+									collision_proj = collision_dot[collision_dirs].reshape([-1,1]) * torch.nn.functional.normalize(self.param_grad_list[self_collision_index][collision_dirs],dim=1)
+									grad_other[collision_dirs]  = grad_other[collision_dirs] - collision_proj
+								grad_other = torch.nn.functional.normalize(grad_other.flatten(),dim=0).reshape(grad_other.shape)
+								param -=  lr * grad_other.detach() * update_scale.detach()
+								if self.loss_mag[-1][0,self_collision_index] != 0:
+									param -=  lr * torch.nn.functional.normalize(self.param_grad_list[self_collision_index].detach().flatten(),dim=0).reshape(grad_other.shape) * self.update_scale[-1][0,self_collision_index].detach()
+							else:
+								self.update_scale[-1] = torch.nn.functional.normalize(self.update_scale[-1]) 
+								for method_index in range(len(method)):
+									param -= lr * torch.nn.functional.normalize(self.param_grad_list[method_index].detach().flatten(),dim=0).reshape(param.shape) * self.update_scale[-1][0,method_index].detach() 
+								
+							tqdm.write(f'i_loop {i} o_steps {len(param_safe)} methods: {[m.name for m in method]} loss: {self.loss_mag[-1].numpy(force=True)} update scale: {(self.update_scale[-1]).numpy(force=True)}')
+							param = param.detach()
+							param.requires_grad_(requires_grad=True)
+							param_updated = True
 
-			if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
-				# snapshot
-				mesh2 = adv_mesh.clone()
-				self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, method=method)
+						except Exception as e:
+							tqdm.write(str(method_type))
+							tqdm.write(str(e))
+							fail=True
+							pass
+						else:
+							# and torch.any((param != param_back).flatten()).item()
+							if not fail and torch.all(torch.isfinite(param).flatten()).item():
+								loss_last = self.loss_mag[-1][0,ind].item()
+								param_safe.append(param.detach().clone())
+								if resets > 0:
+									resets -= 0.5
+								# no infs, we can compute loss
+								break
+							
 
-			if eps_check:
-				# model prediction and oracle evaluation are sufficiently different, break loop
-				if i % self.steps_per_plot != 0:
-					mesh2 = adv_mesh.clone()
-					self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, method=method)
-				break
+					tqdm.write(f'reducing param diff by {backoff}, try {attempts} reset counter {resets}')
+					if attempts > 3 or not param_updated or not torch.all(torch.isfinite(param).flatten()).item():
+						if resets > 3:
+							tqdm.write(f'ending after reset {resets} times in a row, unlikely to recover')
+							if i <= 3:
+								attack_failed = f'{i} ending after reset {resets} times in a row, unlikely to recover'
+							break
+						if param_updated or resets < 1:
+							resets += 1
+						attempts = 0
+						for _ in range(math.floor(resets)):
+							param = param_safe.pop(-1)
+						tqdm.write(f'resetting with {len(param_safe)+1}')
+					attempts += 1
+					# apply backoff ratio
+					if len(param_safe) == 0:
+						tqdm.write('attempting to backoff, but param empty')
+						attack_failed = f'{i} attempting to backoff, but param empty'
+						break
+					param = ((param + (param_safe[-1]*(backoff-1)))/backoff).detach()
+					param.requires_grad_(requires_grad=True)
+					if not use_fixed_step:
+						optimizer = torch.optim.SGD([param], lr=lr, momentum=momentum)
+						optimizer.zero_grad()
+			
+
+				curr_loss = torch.sum(self.loss_mag[-1][0,other_indices]).item()
+
+				# self.qual_measures_raw[-1][0,0],self.qual_measures_raw[-1][0,1],self.qual_measures_raw[-1][0,2],self.qual_measures_raw[-1][0,3],self.qual_measures_raw[-1][0,4],self.qual_measures_raw[-1][0,5] = 
+				self.qual_measures_raw.append(torch.tensor(((self.track_qual["gqcnn prediction"][-1],
+												self.track_qual["minWeight quality"][-1], self.track_qual["oracle quality"][-1], 
+												self.track_qual["dist loss"][-1], self.track_qual["did hit object"][-1], 
+												self.track_qual["min dist"][-1], self.track_qual["l2 norm"][-1], self.track_qual["laplacian smoothing"][-1]),) ,
+												device = mesh.device))
+
+				if (i % self.steps_per_plot == 0) or (i+1 == self.num_steps):
+					# snapshot
+					mesh2 = perturbed_by_param.clone()
+					self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile)
+				
+				if curr_loss < best_loss:
+					best_loss = curr_loss
+					mesh2 = perturbed_by_param.clone()
+					self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile, name='best')
+				if eps_check:
+					# model prediction and oracle evaluation are sufficiently different, break loop
+					if i % self.steps_per_plot != 0:
+						mesh2 = perturbed_by_param.clone()
+						self.snapshot(mesh=mesh2, grasp=grasp, dir=dir, iteration=i, orig_pdim=orig_pdim, logfile=logfile)
+					break
+			# save final object
+			final_mesh = mesh.offset_verts(param)
+			self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, logfile=logfile, final_snapshot=True)
+		
+		if mode == 1: # do ll4ma opt
+			lm = ll4ma_opt_wrappers.logging_manager(self, method, grasp, mesh, dir, orig_pdim, logfile)
+
+			params = {'alpha': lr, 'rho': 0.1, 'min_alpha': 1e-30, }
+
+			solver = AugmentedLagranMethod(lm.problem, "gradient descent", params,library=torch,quadratic_update_multiplier=1.05,FP_PRECISION=1e-9,constraint_precision=1e-3,iter_func=lm.update)
+			result = solver.optimize(param.flatten().reshape([-1,1]), max_iterations=self.num_steps, inner_max_iterations=5)
+			i = lm.problem.index
+			tqdm.write(f'iterates: {result.iterates.shape}, index {i}')
+			lm.update(i+1,result.solution,torch.tensor(0),torch.tensor(0),torch.tensor(0),True)
+			final_mesh = mesh.offset_verts(result.solution.reshape([-1,3]))
+			#problem.visufalize_optimization(result.iterates)
 
 		# plot losses/qualities over time
 		Attack.plot_losses(self.losses, dir)
 		Attack.plot_qual(self.track_qual, dir)
 
-		# save final object
-		final_mesh = mesh.offset_verts(param)
-		self.snapshot(mesh=final_mesh, grasp=grasp, dir=dir, iteration=i+1, orig_pdim=orig_pdim, logfile=logfile, method=method, save_mesh=True)
+		delattr(self, 'param_grad_list')
+		return final_mesh, attack_failed
 
-		return final_mesh
-
-	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim, logfile, method, save_mesh=False):
+	def snapshot(self, mesh, grasp, dir, iteration, orig_pdim, logfile, final_snapshot=False, name=None):
 		"""Save information at current point in attack."""
 		# TODO: Implement for batch of grasps in attack
-  
-		mesh_file = dir + f"it-{iteration}.obj"
-		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+
 		image = self.renderer.render_mesh(mesh, display=False)
 
 		dim = self.renderer.mesh_to_depth_im(mesh, display=False)
-		pose, processed_dim = grasp.extract_tensors_batch(dim)
-		model_pred = self.run(pose, processed_dim)[:,0:1]
-		if method == AttackMethod.NO_ORACLE_GRAD:
-			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=False)
+		pose, processed_dim = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
+
+		# store other numpy tensors in the grasp
+		other_dict = {'depth_image':processed_dim.numpy(force=True)}
+		if name is None and hasattr(self, 'param_grad_list') and len(self.param_grad_list) > 0 and len(self.qual_measures_raw) > 0:			
+			other_dict['param_grad'] = torch.cat([grad.unsqueeze(0) for grad in self.param_grad_list],dim=0).numpy(force=True)
+			other_dict['qual_measures_raw'] = torch.cat(self.qual_measures_raw, dim=0).numpy(force=True)
+			other_dict['loss_mag'] = torch.cat(self.loss_mag, dim=0).numpy(force=True)
+			other_dict['gradient_update_scale'] = torch.cat(self.update_scale, dim=0).numpy(force=True)
+			other_dict['optim_status'] = np.concatenate(self.optim_status, axis=0)
+
+			other_dict['model_pred'] = other_dict['qual_measures_raw'][-1,0]
+			other_dict['minWeight'] = other_dict['qual_measures_raw'][-1,1]
+			oracle_qual = other_dict['qual_measures_raw'][-1,2]
+			self.qual_measures_raw = []
+			self.loss_mag = []
+			self.update_scale = []
+			self.optim_status = []
 		else:
-			oracle_qual = grasp.oracle_eval(mesh_file, renderer=self.renderer, grad=True)
-		oracle_qual_scaled = self.scale_oracle(oracle_qual).item()
+			# should only be on first iteration
+			other_dict['model_pred'] = self.run(pose, processed_dim)[:,1:].detach().item()
+			other_dict['minWeight'] = self.oracle_eval(grasp=grasp,obj_file=mesh, renderer=self.renderer, grad=True, mode='minweight').detach().item()
+		if name is None:
+			name = f'it-{iteration}'
+
+		# different mesh volumes for considering change
+		vol_mesh, vol_bounding, vol_hull = mesh_properties.get_volumes(mesh)
+		mesh_file = dir + f"{name}.obj"
+		grasp_file = dir + f"{name}-grasp.obj"
+		quality_files = (dir + f"{name}-cf.obj", dir + f"{name}-mw.obj")
+		# # experimental, creats mesh of active wrenches
+		mat_file = dir + f"{name}-grasp.mat"
+		# other_dict['minWeight'] = self.oracle_eval(grasp=grasp,obj_file=mesh, renderer=self.renderer, grad=True, write_path=mat_file,mode='minweight').detach().item()
+		oracle_qual = self.oracle_eval(grasp=grasp,obj_file=mesh, renderer=self.renderer, grad=True, write_path=mat_file,other_dict=other_dict).detach().item()
+
+		grasp = grasp.apply_to_mesh(mesh, is_watertight=self.mesh_properties.is_watertight, 
+                                    is_inverted=self.mesh_properties.is_inverted, use_dexnet_normal=False)
+
+
+		self.write_grasp_pytorch(grasp=grasp, obj=mesh, renderer=self.renderer, path=grasp_file, quality_path=quality_files)
+		save_obj(mesh_file, verts=mesh.verts_list()[0], faces=mesh.faces_list()[0])
+
+
 		if orig_pdim is not None: depth_diff = orig_pdim - processed_dim
 
-		# RANDOM FUZZ ONLY
-		if method == AttackMethod.RANDOM_FUZZ:
-			self.track_qual["gqcnn prediction"].append(model_pred.item())
-			self.track_qual["oracle quality"].append(oracle_qual_scaled)
-
-		title = f"Iteration {iteration}: oracle quality {oracle_qual_scaled:.4f}, gqcnn prediction {model_pred.item():.4f}"
-		fname = dir + "it-" + str(iteration) + ".png"
+		title = f"Iteration {iteration}: oracle quality {oracle_qual:.4f}, mw prediction {other_dict['minWeight']:.4f}, gqcnn prediction {other_dict['model_pred']:.4f}\n volumes: mesh {vol_mesh}, bb {vol_bounding}, hull {vol_hull}"
+		fname = dir + name + ".png"
 		image = image.squeeze(0)
 		image = image[140:340, 270:370, :]
 		self.renderer.display(images=[image, processed_dim, depth_diff], shape=(1,3), title=title, save=fname)
-		print(f"save: {fname}")
+		
+		# store renders for creating a .gif animation
+		if hasattr(self, 'renders_list') and len(self.renders_list) > 0:
+			loaded = imageio.imread(fname)
+			size = (self.renders_list[0].shape[1],self.renders_list[0].shape[0])
+			self.renders_list += [cv2.resize(loaded, dsize=size, interpolation=cv2.INTER_CUBIC)]
+		else:
+			self.renders_list = [imageio.imread(fname)]
+		tqdm.write(f"save: {fname}")
 
-		if not save_mesh:
-			os.remove(mesh_file)
+		if final_snapshot:
+			imageio.mimsave(dir + f"it.gif", self.renders_list,fps=1,loop=10000)
+			self.renders_list = []
+
+
+		# if not save_mesh:
+		# 	os.remove(mesh_file)
 
 		# add info to logfile
-		oracle_qual = oracle_qual.item()
 		data = {
 			"iteration": iteration,
-			"model prediction": model_pred.item(),
-			"oracle quality raw": oracle_qual,
-			"oracle quality scaled": oracle_qual_scaled,
+			"model prediction": float(other_dict['model_pred']),
+			"min weight raw": float(other_dict['minWeight']) ,
+			"oracle quality raw": float(oracle_qual),
 		}
 		with open(logfile, "a") as f:
 			json.dump(data, f, indent=4)
 			
+
+	def oracle_eval(self, grasp, obj_file, oracle_method=None, robust=True, renderer=None, grad=True, mode='actual',write_path=None, other_dict={}):
+		"""
+		Get a final oracle evalution of a mesh object according to oracle_method
+
+		Parameters
+		----------
+		obj_fil: String
+			The path to the .obj file of the mesh to evaluate
+		oracle_method: String
+			Options: "dexnet" or "pytorch"; defaults to self.oracle_method
+			Indicates to use the dexnet oracle via remote call to docker, or local pytorch implementation
+		robust: Boolean
+			Used only for dex-net oracle method
+			True: uses robust ferrari canny evaluation for oracle quality
+			False: uses (non robust) ferrari canny evaluation for oracle quality
+			defaults to self.oracle_robust
+		renderer:
+		grad: Boolean
+			Used only for pytorch oracle method
+			True: keep gradient information for output tensor
+			False: no gradient information for output tensor
+
+		Returns
+		-------
+		float: quality from ferarri canny evaluation
+
+		"""
+		if oracle_method == "dexnet" or (hasattr(grasp, 'oracle_method') and (grasp.oracle_method == "dexnet")):
+			if isinstance(robust, bool):
+				return oracle_eval_dexnet(obj_file, robust=robust)
+			else:
+				return oracle_eval_dexnet(obj_file, robust=grasp.oracle_robust)
+		
+		else:
+			if not renderer:
+				GraspTorch.logger.error("oracle_eval - pytorch oracle requires renderer argument")
+			else:
+				return self.oracle_eval_pytorch(grasp, obj_file, renderer, grad=grad, robust=robust, mode=mode, write_path=write_path, other_dict=other_dict)
+
+	def oracle_eval_dexnet(self, obj_file, robust=True):
+		"""
+		Get a final oracle evaluation of a mesh object via remote call to docker container.
+
+		Refer to `oracle_eval` method documentation for details on parameters and return values.
+		"""
+
+		tqdm.write("oracle_eval_dexnet robust:", robust)
+
+		# check if object file is already saved in shared directory and copy there if not
+		if not os.path.isfile(obj_file):
+			GraspTorch.logger.error("Object for oracle evaluation does not exist.")
+			return None
+
+		obj_name = obj_file.split("/")[-1]
+		obj_shared = SHARED_DIR + "/" + obj_name
+		if not os.path.isfile(obj_shared):
+			GraspTorch.logger.info("Saving object file to shared directory (%s) for oracle evaluation", SHARED_DIR)
+			shutil.copyfile(obj_file, obj_shared)
+
+		# save grasp info for oracle evaluation
+		Pyro4.config.COMMTIMEOUT = None
+		server = Pyro4.Proxy("PYRO:Server@localhost:5000")
+		# calc_axis = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0))	# ensure grasp axis normalized
+		# calc_axes = (self.c1 - self.c0) / torch.linalg.norm((self.c1 - self.c0), dim=1).unsqueeze(1)
+		calc_axes = self.world_axis / torch.norm(self.world_axis, dim=-1, keepdim=True)
+		save_nparr(self.world_center.detach().cpu().numpy(), "temp_center.npy")
+		save_nparr(calc_axes.detach().cpu().numpy(), "temp_axis.npy")
+		# tqdm.write("\nobj_name:", type(obj_name), obj_name, "\n\n")
+		results = server.final_evals("temp_center.npy", "temp_axis.npy", obj_name, robust=robust)
+
+		# update quality info
+		self.quality = torch.from_numpy(np.array(results)).unsqueeze(1).to(self.world_axis.device).float()
+
+		return self.quality
+
+	def write_grasp_pytorch(self, grasp, obj, renderer, path, quality_path=None, other_dict={}):
+		"""
+			Save a colored mesh of the grasp points for the current object using pytorch version of dexnet library
+		"""
+		if (grasp.world_center == None or grasp.world_axis == None):
+			GraspTorch.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
+			return None
+
+		config_dict = {
+			"torque_scaling":1000,
+			"soft_fingers":1,
+			"friction_coef": 0.8,
+			"antipodality_pctile": 1.0 
+		}
+
+		if isinstance(obj, pytorch3d.structures.Meshes): mesh = obj
+		else: mesh, _ = renderer.render_object(obj, display=False)
+
+		if grasp.num_grasps() == 1:
+			grasp.quality = torch.zeros_like(grasp.depth)
+			# for i, g in enumerate(self):
+			g = grasp[0]
+			if g.contact_points is not None: contact_points = g.contact_points
+			else: contact_points = None
+			
+			width = torch.tensor([[0.05]], device=mesh.device)
+			# grasp_torch = GraspTorch(world_center=g.world_center, world_axis=g.world_axis, width=width, camera_intr=renderer.rasterizer.cameras, friction_coef=config_dict["friction_coef"], torque_scaling=config_dict["torque_scaling"])
+
+			# grasp_torch = grasp_torch.apply_to_mesh(mesh,is_watertight=grasp.mesh_properties.is_watertight, is_inverted=grasp.mesh_properties.is_inverted)
+
+			g.write_obj(path, include_coordinate=True, include_line_o_action=True)
+
+			if quality_path is not None:
+
+				com_qual_func = CannyFerrariQualityFunction(config_dict)
+				com_qual_func.quality(mesh, grasp)
+				com_qual_func.write_obj(quality_path[0])
+
+				com_qual_func = minWeightQualityFunction(config_dict)
+				com_qual_func.quality(mesh, grasp)
+				com_qual_func.write_obj(quality_path[1])
+
+
+	def oracle_eval_pytorch(self, grasp, obj, renderer, grad=True, robust=True, mode='actual',write_path=None, other_dict={}):
+		"""
+		Get a final oracle evaluation of a mesh object via local pytorch oracle implementation.
+
+		Refer to `oracle_eval` method documentation for details on parameters and return values.
+		"""
+		if mode == 'minweight':
+			if robust:
+				qual_class = RobustMinWeightQualityFunction
+			else:
+				qual_class = minWeightQualityFunction
+		else:
+			if robust:
+				qual_class = RobustCannyFerrariQualityFunction
+			else:
+				qual_class = CannyFerrariQualityFunction
+
+
+
+		if (grasp.world_center == None or grasp.world_axis == None):
+			GraspTorch.logger.error("Grasp.oracle_eval_pytorch requires Grasp to have world_center and world_axis.")
+			return None
+
+		config_dict = {
+			"torque_scaling":1000,
+			"soft_fingers":1,
+			"friction_coef": 0.8,
+			"antipodality_pctile": 1.0 
+		}
+
+		if isinstance(obj, pytorch3d.structures.Meshes): mesh = obj
+		else: mesh, _ = renderer.render_object(obj, display=False)
+
+		if grasp.num_grasps() > 1:
+			grasp.quality = torch.zeros_like(grasp.world_axis[...,0:1])
+			for i, g in tqdm(enumerate(grasp),desc='grasps'):
+				
+				try:
+					com_qual_func = qual_class(config_dict)
+					quality = com_qual_func.quality(mesh, g,
+										is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().item()
+
+				except QhullError:
+					quality =  0.0
+
+				g.quality[i] = quality
+
+		else:
+
+			try:
+				com_qual_func = qual_class(config_dict)
+				grasp.quality = com_qual_func.quality(mesh, grasp, 
+										is_watertight=self.mesh_properties.is_watertight, is_inverted=self.mesh_properties.is_inverted).float().to(grasp.world_center.device)
+			except QhullError:
+				grasp.quality = torch.tensor([0.0]).to(grasp.device)
+
+		if grad:
+			grasp.quality.requires_grad_(True)
+		else:
+			grasp.quality.requires_grad_(False)
+
+		if write_path is not None:
+			com_qual_func.savemat(write_path, other_items=other_dict)
+
+		return grasp.quality
+
+	def eval_self_collision_dist(self,grasp, obj):
+		# computes a self collision loss, either comparing minimum distance directly OR computing the distance
+		# energy, https://www.cs.cmu.edu/~kmcrane/Projects/RepulsiveShells/index.html
+		
+		# configuration. TODO, test and maybe expose
+		use_energy = False
+		use_all_in_min = True
+		verts = obj.verts_packed()
+		verts.requires_grad_(True)
+		all_dist, coords = self.mesh_properties(verts)
+		all_dist = mesh_properties.make_invalid_dist_inf(all_dist, coords)
+
+		min_dist = torch.min(all_dist)
+		# hard threshold on distance, we don't trust qpth much lower than this
+		if min_dist < 1e-10:
+			return torch.full_like(min_dist, float('inf')), min_dist, all_dist
+
+		if not hasattr(self,'reference_dist') or self.reference_dist is None:
+			if use_energy:
+				self.reference_dist = torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])).detach().item()
+			else:
+				self.reference_dist = min_dist.item()
+			self.softmin_t = math.log(torch.numel(all_dist))/self.reference_dist
+
+			self.mesh_properties.far_dist = 4 * self.reference_dist
+
+		if use_energy:
+			# repulsive shell formula
+			dist_loss = torch.square(self.reference_dist - torch.sum(torch.log(all_dist[torch.isfinite(all_dist)])))
+		else:
+			if use_all_in_min:
+				# allows for us to have a distance threshold, above which we ignore in gradient
+				relevant_dist = all_dist[torch.logical_and(torch.isfinite(all_dist), all_dist < 4*self.reference_dist)]
+	#				clamp_dist = torch.clamp(all_dist[torch.isfinite(all_dist)], max=2*self.reference_dist)
+				# use reference, if valid in barier. Use min/10 if we're closer than reference 
+				if min_dist < self.reference_dist/10:
+					tqdm.write('inside outer boundary region')
+					# dist_loss = -torch.sum(torch.log(relevant_dist - min_dist/10 ))
+					# dist_loss = torch.sum(1/(relevant_dist - min_dist/10 ))
+					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - min_dist/10 )))
+				else:
+					# dist_loss = -torch.sum(1/(relevant_dist - self.reference_dist/10 ))
+					dist_loss = torch.sum(torch.square(torch.log(relevant_dist - self.reference_dist/10)))
+			
+			else:
+				# if we only care about closest pair to collision, then no sum needed
+				clamp_dist = torch.clamp(min_dist, max=4*self.reference_dist)
+				if min_dist < self.reference_dist/10:
+					tqdm.write('inside outer boundary region')
+					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - min_dist/10 )))
+				else:
+					dist_loss = torch.sum(torch.square(torch.log(clamp_dist - self.reference_dist/10)))
+		dist_loss.requires_grad_(True)
+
+		return dist_loss, min_dist, all_dist
+
 
 def test_run():
 	"""Test prediction of gqcnn_pytorch model"""
@@ -408,40 +1048,40 @@ def test_run():
 		device = torch.device("cuda:0")
 		torch.cuda.set_device(device)
 	else:
-		print("cuda not available")
+		tqdm.write("cuda not available")
 		device = torch.device("cpu")
 
 	depth0 = np.load("/home/hmitchell/pytorch3d/dex_shared_dir/depth_0.npy")
-	grasp = Grasp(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929)
+	grasp = GraspTorch(depth=0.607433762324266, im_center=(416, 286), im_angle=-2.896613990462929, device=device)
 
 	# load input tensors from gqcnn library for prediction
 	pose0 = torch.from_numpy(np.load("data/pose_tensor1_raw.npy")).float().to(device)
 	image0 = torch.from_numpy(np.load("data/image_tensor1_raw.npy")).float().permute(0,3,1,2).to(device)
 
 	# tensors from pytorch extraction
-	pose1, image1 = grasp.extract_tensors(depth0)
+	pose1, image1 = quality.GQCNNQualityFunction.extract_tensors(grasp=grasp,d_im=depth0)
 
 	# tensors from pytorch extraction & pytorch depth image
-	renderer = Renderer()
+	renderer = Renderer(device=device)
 	mesh, _ = renderer.render_object("data/bar_clamp.obj", display=False)
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
-	pose2, image2 = grasp.extract_tensors(dim)
+	pose2, image2 = quality.GQCNNQualityFunction.extract_tensors(grasp=grasp,d_im=dim)
 
 	# testing with new barclamp object
 	mesh2, _ = renderer.render_object("data/new_barclamp.obj", display=False)
 	dim2 = renderer.mesh_to_depth_im(mesh2, display=False)
-	pose3, image3 = grasp.extract_tensors(dim2)
+	pose3, image3 = quality.GQCNNQualityFunction.extract_tensors(grasp=grasp,d_im=dim2)
 
 	# instantiate GQCNN PyTorch model
-	model = KitModel("weights.npy")
+	model = KitModel("weights.npy",device=device)
 	model.eval()
 
 	# instantiate Attack class and run prediction
 	run1 = Attack(model=model)
-	print(run1.run(pose0, image0)[0][0].item())
-	print(run1.run(pose1, image1)[0][0].item())
-	print(run1.run(pose2, image2)[0][0].item())	# original barclamp object
-	print(run1.run(pose3, image3)[0][0].item())	# new barclamp object
+	print(run1.run(pose0, image0)[0][1].item())
+	print(run1.run(pose1, image1)[0][1].item())
+	print(run1.run(pose2, image2)[0][1].item())	# original barclamp object
+	print(run1.run(pose3, image3)[0][1].item())	# new barclamp object
 
 	# test model with varying batch sizes
 	pose4 = torch.cat([pose1, pose2, pose3], 0)
@@ -473,7 +1113,7 @@ def test_attack():
 	dim = renderer.mesh_to_depth_im(mesh, display=False)
 
 	# FIXED GRASP TO ATTACK
-	grasp = Grasp.read("grasp-batch.json")[0]
+	grasp = GraspTorch.read("grasp-batch.json")[0]
 	print("oracle quality:", grasp.quality.item())
 
 	# SET UP ATTACK
@@ -482,9 +1122,9 @@ def test_attack():
 	run1 = Attack(num_plots=10, steps_per_plot=10, model=model, renderer=renderer, oracle_method=grasp.oracle_method)
 
 	# RUN INITIAL MODEL PREDICTION
-	pose, image = grasp.extract_tensors_batch(dim)
+	pose, image = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=dim)
 	pred = run1.run(pose, image)
-	print("initial model prediction:", pred[0].item())
+	print("initial model prediction:", pred[1].item())
 
 	Attack.logger.info("ATTACK")
 	adv_mesh, final_pic = run1.attack(mesh, grasp, "test-attack", lr=1e-5, momentum=0.0)
@@ -504,23 +1144,23 @@ def test_run2():
 	depth_im = r.mesh_to_depth_im(mesh, display=False)
 
 	# run model on batch of grasps
-	grasp = Grasp.read("grasp-batch.json")
+	grasp = GraspTorch.read("grasp-batch.json")
 	grasp.trans_world_to_im(camera=r.camera)
-	poses, images = grasp.extract_tensors_batch(depth_im)
+	poses, images = quality.GQCNNQualityFunction.extract_tensors_batch(grasp=grasp,d_ims=depth_im)
 	out = model.run(poses, images)
-	out = out[:,0:1]
-	print(f"prediction: {out.shape} {out.device}\n{out}")
+	out = out[:,1:]
+	tqdm.write(f"prediction: {out.shape} {out.device}\n{out}")
 
 	grasp.prediction = out
 	grasp.save("grasp-batch.json")
 
 	# run model on individual grasps
-	for i, g in enumerate(grasp):
+	for i, g in tqdm(enumerate(grasp),desc='grasps'):
 		pose, image = g.extract_tensors(depth_im)
-		pred = model.run(pose, image)[:, 0:1]
-		print(f"\nGrasp {i}: \n\tModel prediction: {pred.item()}\n\tOriginal prediction: {out[i].item()}\n\tOracle quality: {g.quality.item()}")
+		pred = model.run(pose, image)[:, 1:]
+		tqdm.write(f"\nGrasp {i}: \n\tModel prediction: {pred.item()}\n\tOriginal prediction: {out[i].item()}\n\tOracle quality: {g.quality.item()}")
 		if not out[i].item() == pred.item():
-			print(f"\tPrediction diff: {torch.sub(pred, out[i]).item()}")
+			tqdm.write(f"\tPrediction diff: {torch.sub(pred, out[i]).item()}")
 
 	Attack.logger.info("Done running test_run2.")
 
@@ -529,7 +1169,7 @@ if __name__ == "__main__":
 
 	r = Renderer()
 	mesh, _ = r.render_object("data/new_barclamp.obj", display=False)
-	g = Grasp.read("grasp-batch.json")
+	g = GraspTorch.read("grasp-batch.json")
 	grasps = [g[0], g[1], g[3], g[4], g[5], g[6]]
 
 	# d = "exp-results/random-fuzz/"
@@ -550,13 +1190,13 @@ if __name__ == "__main__":
 	# 		save = d + ext + "/"
 	# 		lr = random_fuzz_lr[ext]
 	# 		grasp = grasp_dirs[d]
-	# 		print(f"saving to: {save} with learning rate {lr}")
+	# 		tqdm.write(f"saving to: {save} with learning rate {lr}")
 	# 		run1.attack(mesh=mesh, grasp=grasp, dir=save, lr=lr, momentum=None, loss_alpha=None, method="random-fuzz")
 
-	# print("ATTACK SET 1\n")
-	grasp = grasps[1]
+	# tqdm.write("ATTACK SET 1\n")
+	graspObj = grasps[1]
 	dir = "test/no-oracle/"
-	run1.attack(mesh=mesh, grasp=grasp, dir=dir, lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
+	run1.attack(mesh=mesh, grasp=graspObj, dir=dir, lr=1e-5, momentum=0.9, loss_alpha=None, method="no-oracle")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight1/", lr=1e-6, momentum=0.0, loss_alpha=0.3, method="oracle-grad")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight2/", lr=1e-6, momentum=0.0, loss_alpha=0.5, method="oracle-grad")
 	# run1.attack(mesh=mesh, grasp=grasp, dir=d+"lr0-weight3/", lr=1e-6, momentum=0.0, loss_alpha=0.7, method="oracle-grad")

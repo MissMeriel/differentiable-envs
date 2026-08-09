@@ -4,7 +4,7 @@ from select_grasp import *
 
 if __name__ == "__main__":
 
-    Grasp.logger.info("Running oracle_vis.py")
+    GraspTorch.logger.info("Running oracle_vis.py")
 
     files = ["example-grasps/grasp_1.json", "example-grasps/grasp_3.json", "example-grasps/grasp_7.json", "example-grasps/grasp_8.json", ]
     gfiles = [str_ for str_ in files for _ in range(16)]
@@ -24,7 +24,7 @@ if __name__ == "__main__":
     # for i, grasp in enumerate(gb):
     #     print(f"Grasp {i}: quality {grasp.quality.item()}")
 
-    gb = Grasp.read_batch(gfiles)
+    gb = GraspTorch.read_batch(gfiles)
     assert len(gfiles) == gb.num_grasps()
 
     start = time.time()
@@ -85,4 +85,4 @@ if __name__ == "__main__":
     with open("oracle_vis/no-friction-trans-obj.txt", "w") as f:
         json.dump(data_dict, f, indent=4)
 
-    Grasp.logger.info("Done running oracle_vis.py")
+    GraspTorch.logger.info("Done running oracle_vis.py")
